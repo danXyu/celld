@@ -58,10 +58,12 @@ impl LogTransport for PairTransport {
                     &follower.seal(&serde_json::from_slice(&body)?).await?,
                 )?
                 .into()),
-                "/peer/log/tail" => Ok(encode_tail_resp(
-                    &follower.checked_tail(&serde_json::from_slice(&body)?)?,
-                )
-                .into()),
+                "/peer/log/tail" => {
+                    let req: TailWireReq = serde_json::from_slice(&body)?;
+                    Ok(req
+                        .encode_response(&follower.checked_tail(&req.request).await?)?
+                        .into())
+                }
                 _ => panic!("unexpected recovery request {path}"),
             }
         })
@@ -299,7 +301,7 @@ fn a_pair_that_loses_both_disks_records_the_loss_and_recovers() {
             assert_eq!(
                 fleet.transport.followers[PAIR[1 - index]]
                     .load(&format!("{node}/old"))
-                    .sealed_to,
+                    .unwrap().sealed_to,
                 1
             );
         }

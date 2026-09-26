@@ -111,32 +111,33 @@ fn a_seal_for_another_member_is_refused_before_the_seal_mark() {
             seal(None, Some(other)),
         ] {
             assert!(store.seal(&refused).await.is_err());
-            assert_eq!(store.load(LEADER).sealed_to, 0);
+            assert_eq!(store.load(LEADER).unwrap().sealed_to, 0);
         }
         for refused in [
             tail(Some("someone-else"), Some(&own)),
             tail(Some("someone-else"), None),
             tail(None, Some(other)),
         ] {
-            assert!(store.checked_tail(&refused).is_err());
+            assert!(store.checked_tail(&refused).await.is_err());
         }
         // The addressed disk answers, and so does an older caller that
         // names nobody.
-        let entries = store.tail(&tail(None, None)).entries.len();
+        let entries = store.tail(&tail(None, None)).await.unwrap().entries.len();
         assert_eq!(
             store
                 .checked_tail(&tail(Some("member"), Some(&own)))
+                .await
                 .unwrap()
                 .entries
                 .len(),
             entries
         );
         assert_eq!(
-            store.checked_tail(&tail(None, None)).unwrap().entries.len(),
+            store.checked_tail(&tail(None, None)).await.unwrap().entries.len(),
             entries
         );
         store.seal(&seal(Some("member"), Some(&own))).await.unwrap();
-        assert_eq!(store.load(LEADER).sealed_to, 1);
+        assert_eq!(store.load(LEADER).unwrap().sealed_to, 1);
         store.seal(&seal(None, None)).await.unwrap();
     });
 }
@@ -157,6 +158,7 @@ fn the_member_on_a_replacement_disk_answers_conclusively_from_it() {
         assert_ne!(store.incarnation().unwrap(), superseded);
         assert!(store
             .checked_tail(&tail(Some("member"), Some(&superseded)))
+            .await
             .unwrap()
             .entries
             .is_empty());
@@ -169,7 +171,7 @@ fn the_member_on_a_replacement_disk_answers_conclusively_from_it() {
         assert_eq!(sealed.held_fragment_epoch, Some(0));
         // The seal mark is durable like any other: the dead leader's epoch
         // is refused on the replacement disk from here on.
-        assert_eq!(store.load(LEADER).sealed_to, 1);
+        assert_eq!(store.load(LEADER).unwrap().sealed_to, 1);
         // Answering never rewrote this disk's own identity.
         assert_ne!(
             FollowerStore::new(fresh.path(), None, "member")

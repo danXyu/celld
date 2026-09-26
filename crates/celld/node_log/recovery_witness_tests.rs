@@ -47,12 +47,12 @@ impl LogTransport for RetainedWitness {
                     &self.follower.seal(&serde_json::from_slice(&body)?).await?,
                 )?
                 .into()),
-                "/peer/log/tail" => Ok(encode_tail_resp(
-                    &self
-                        .follower
-                        .checked_tail(&serde_json::from_slice(&body)?)?,
-                )
-                .into()),
+                "/peer/log/tail" => {
+                    let req: TailWireReq = serde_json::from_slice(&body)?;
+                    Ok(req
+                        .encode_response(&self.follower.checked_tail(&req.request).await?)?
+                        .into())
+                }
                 _ => panic!("unexpected recovery request {path}"),
             }
         })
@@ -260,7 +260,7 @@ fn expired_unavailable_witness_never_seals_or_cleans_up() {
                         leader: PREDECESSOR.into(),
                         member: None,
                         incarnation: None,
-                    })
+                    }).await.unwrap()
                     .entries[0]
                     .bytes,
                 fixture.acknowledged
@@ -387,7 +387,7 @@ fn a_replacement_disk_under_the_member_name_records_the_loss() {
         assert!(fixture.manager.predecessors_clean.load(Ordering::SeqCst));
         // The replacement disk sealed the epoch like any conclusive member,
         // so a straggling append from the dead leader is refused there too.
-        assert_eq!(fixture.witness.follower.load(PREDECESSOR).sealed_to, 1);
+        assert_eq!(fixture.witness.follower.load(PREDECESSOR).unwrap().sealed_to, 1);
         fixture.stop().await;
     });
 }
@@ -409,7 +409,7 @@ fn another_member_at_the_witness_address_stays_undecided() {
         fixture.assert_undecided().await;
         // The refusal came before the seal mark: the other node's disk
         // carries no trace of a seal it was never entitled to answer.
-        assert_eq!(fixture.witness.follower.load(PREDECESSOR).sealed_to, 0);
+        assert_eq!(fixture.witness.follower.load(PREDECESSOR).unwrap().sealed_to, 0);
         assert_eq!(fixture.witness.attempts.load(Ordering::SeqCst), 1);
         fixture.stop().await;
     });

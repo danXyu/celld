@@ -191,3 +191,37 @@ report which disk it supersedes.
 
 Rollout: no wire or record changes. A follower on an older build still refuses
 a replacement's answer, so upgrade every node before relying on the fix.
+
+## 0.6.0-ewhauser.1 (unreleased)
+
+Based on upstream v0.6.0. It keeps every fork change through
+0.5.1-ewhauser.7.
+
+### Upgrading from 0.5.1-ewhauser builds needs a full stop
+
+Upstream's rule for v0.5.1 to v0.6.0 applies. A fleet with `fleet` durability
+must not roll from any 0.5.1-ewhauser build to this one. Stop every member,
+then start every member on this build. A 0.6.0 node recovers its previous log
+session only from a follower that returns the ranged tail format, and a 0.5.1
+follower returns only the entries-only format, so a restarted member waits
+for a witness the old members cannot give. A fleet with `bucket` durability
+has no followers and can roll.
+
+### How the fork changes sit on upstream v0.6.0
+
+- An unreachable recovery witness stays undecided however long its lease has
+  been expired (0.5.1-ewhauser.3). Upstream v0.6.0 still counts a member that
+  is unreachable with a long-expired lease as conclusive; this build does not.
+  Upstream's own rules also apply: an HTTP error, a legacy entries-only tail
+  or a tail without complete range evidence leaves the member undecided.
+- Seal and tail requests still carry the member name and disk incarnation
+  (0.5.1-ewhauser.5 and .7). The ranged tail endpoint applies the same
+  addressee check as the seal.
+- Folding a quietly stranded cell before it is activated again now follows
+  upstream: an epoch that may have fleet acknowledgements needs a complete
+  follower tail. A log record the bucket already covers (`bucket_complete`)
+  needs none, as before. Each tail request names the member's disk.
+- Disk-removal coverage (`bucket_complete`) now waits for upstream's
+  `all_fragment_rows_tiered`. It follows each stopped cell's retained tail
+  until its uploads land, and replaces the fork's flag that stayed set once
+  any cell had ended with an untiered tail.
