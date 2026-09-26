@@ -319,7 +319,7 @@ mod tests {
                 leader: "leader/g2".into(),
                 member: None,
                 incarnation: None,
-            });
+            }).await.unwrap();
             assert!(reply.ok, "the append polled before freeze must finish");
             assert_eq!(tail.entries.len(), 1);
             let refused = follower.append(append(2)).await;
@@ -331,7 +331,7 @@ mod tests {
                         leader: "leader/g2".into(),
                         member: None,
                         incarnation: None,
-                    })
+                    }).await.unwrap()
                     .entries
                     .len(),
                 tail.entries.len()
