@@ -192,7 +192,7 @@ report which disk it supersedes.
 Rollout: no wire or record changes. A follower on an older build still refuses
 a replacement's answer, so upgrade every node before relying on the fix.
 
-## 0.6.0-ewhauser.1 (unreleased)
+## 0.6.0-ewhauser.1
 
 Based on upstream v0.6.0. It keeps every fork change through
 0.5.1-ewhauser.7.
