@@ -896,55 +896,26 @@ only after it uploads each stopped database position to the bucket. If an upload
 fails, the next process uses the normal recovery path. A release can change this
 API, so keep the operator tooling and the celld release together.
 
-The `/state` response also has a `node_log` object, so an operator can decide
-whether a voluntary disruption can lose a follower copy without its own bucket
-client. It is `null` on a node without a node-log manager (no bucket or no
-runtime):
+The fork retains process identity for operator observations in `/state.shutdown`:
 
 ```json
-"node_log": {
-  "posture": "fleet",
-  "session": "node-a/3f9c...",
-  "own": {"state": "open", "epoch": 7, "ensemble": ["node-b", "node-c"],
-          "bucket_complete": false, "active": true},
-  "shipper_healthy": true,
-  "fleet": {
-    "observed_ms": 1790000000000,
-    "complete": true,
-    "unrecovered": [{"session": "node-d/81ab...", "state": "recovering",
-                     "lease_expires_ms": 1789999990000, "claimant": "node-b"}],
-    "obligations": {"node-b": ["node-a/3f9c...", "node-d/81ab..."],
-                    "node-c": ["node-a/3f9c..."]}
-  }
+"shutdown": {
+  "schema_version": 1,
+  "runtime_generation": "opaque-process-generation",
+  "capabilities": {"strict_disk_removal": false}
 }
 ```
 
-`posture` is `fleet` or `bucket` (`CELLD_DURABILITY`), and `null` until the
-durability stack is installed. `session` is this process's log identity,
-`<node>/<generation>`. `own` is the folded log that this process publishes in
-its lease, or `null` before the session opens a fleet log. `shipper_healthy` is
-true while an active, undegraded ensemble acknowledges writes; a bucket-posture
-node always reports false.
+The generation changes when the process restarts. The `shutdown` name is kept
+for compatibility with existing operator capacity and application readers; it
+no longer exposes an operation or a control-only phase. `POST /shutdown` and
+`POST /shutdown?handoff=preserve` retain their ordinary behavior. Requests with
+a `mode` parameter, including the retired `mode=remove-disk`, return HTTP 400
+without initiating shutdown. Neither an ordinary shutdown response nor process
+exit authorizes disk deletion.
 
-`fleet` is the result of the last dead-leader sweep pass, which runs every 30
-seconds in the fleet posture only. It is `null` in the bucket posture and until
-the first pass completes. `observed_ms` is the wall-clock time at which that
-pass started; the pass read every record at or after it and judged lease expiry
-at it. `complete` is false when the pass could not list `nodes/` or read a
-record, and the two lists then contain only what it read. `unrecovered` lists,
-by session, every log that is not sealed and whose lease has expired, including
-one that another node is recovering now (`state` is `recovering` and
-`claimant` names that node). `obligations` maps each node named in a log's
-current ensemble to the leader sessions that still need its fragment: the log is
-not sealed and its epoch is not `bucket_complete`. Live leaders are included,
-this node's own log among them. This is the same coverage rule that strict disk
-removal applies to its captured obligations.
-
-The whole object comes from memory. `/state` makes no bucket request for it, so
-a consumer must check `observed_ms` for freshness, and must treat a stale or
-incomplete view as unknown. The terminal control-only phase of strict disk
-removal still reports `node_log`, but its maintenance has stopped, so `fleet`
-no longer advances.
+`/state.node_log` reporting has been removed. Background dead-leader recovery,
+log maintenance, and `bucket_complete` recovery proofs remain active.
 
 ## Diagnose a fleet
 

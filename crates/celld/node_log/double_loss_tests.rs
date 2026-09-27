@@ -301,7 +301,8 @@ fn a_pair_that_loses_both_disks_records_the_loss_and_recovers() {
             assert_eq!(
                 fleet.transport.followers[PAIR[1 - index]]
                     .load(&format!("{node}/old"))
-                    .unwrap().sealed_to,
+                    .unwrap()
+                    .sealed_to,
                 1
             );
         }
