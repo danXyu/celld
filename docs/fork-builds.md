@@ -4,7 +4,7 @@ The operator still requires this fork for process identity, recovery safeguards,
 idle-follower failure handling, and preview support. Stock celld v0.6.0 does not
 provide all of these behaviors.
 
-## Unreleased: remove retired operator APIs
+## Retired operator APIs (removed in 0.6.0-ewhauser.2)
 
 Strict disk-removal shutdown and `/state.node_log` reporting have been removed.
 The current operator uses ordinary Kubernetes workload lifecycle operations and
@@ -245,3 +245,37 @@ has no followers and can roll.
   `all_fragment_rows_tiered`. It follows each stopped cell's retained tail
   until its uploads land, and replaces the fork's flag that stayed set once
   any cell had ended with an untiered tail.
+
+## 0.6.0-ewhauser.2
+
+Based on upstream v0.6.0. It keeps every fork change through
+0.6.0-ewhauser.1.
+
+### Retired operator APIs removed
+
+Strict disk-removal shutdown and `/state.node_log` reporting are gone. A
+shutdown request with a `mode` parameter returns HTTP 400 without stopping
+the process. See "Retired operator APIs" above for what `/state.shutdown`
+still reports.
+
+### OTLP metrics
+
+With `CELLD_OTEL` set to a collector URL, celld now exports a metrics signal
+to `/v1/metrics` beside traces and logs:
+
+- node load gauges, read from the same snapshot `/state` serves;
+- `celld.cell.cpu_time`, the thread CPU of each cell that ran JavaScript in
+  the interval;
+- `celld.cell.heap_bytes`, each isolate's V8 heap divided among the cells
+  that share it.
+
+Metrics are on by default with a collector and export every 60 seconds.
+`OTEL_METRICS_EXPORTER=none` turns them off. `OTEL_RESOURCE_ATTRIBUTES` adds
+resource attributes, such as a fleet name, to every OTLP signal. While
+metrics are on, celld reads the thread CPU clock around every cell turn, even
+without a CPU limit. `docs/telemetry.md` lists every metric and the limits of
+the heap average.
+
+Rollout: no record or storage format changes. Follower append responses no
+longer carry `quiesced`, which only strict disk removal set; older nodes read
+its absence as false. Nodes can roll from 0.6.0-ewhauser.1.
