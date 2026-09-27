@@ -582,15 +582,9 @@ pub async fn run(app: crate::actor::AppHandle) {
     let mut shed = 0u64;
     loop {
         ticks.tick().await;
-        // Skipped when `/state` skips it too: in the control-only shutdown
-        // phase the node reports no load, and neither does this.
-        let state = if app.disk_removal.control_only.load(Ordering::SeqCst) {
-            None
-        } else {
-            serde_json::from_str::<serde_json::Value>(&app.snapshot().await)
-                .ok()
-                .filter(|state| state.get("error").is_none())
-        };
+        let state = serde_json::from_str::<serde_json::Value>(&app.snapshot().await)
+            .ok()
+            .filter(|state| state.get("error").is_none());
         let cpu_nanos = cpu.map(CellCpu::take).unwrap_or_default();
         let mut heaps = CellHeaps::default();
         if let Some(runtime) = &app.runtime {
