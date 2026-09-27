@@ -824,6 +824,24 @@ impl Pool {
         }
         census
     }
+
+    /// The heap of each isolate that houses a cell, for the per-cell heap
+    /// metric. Never waits: an isolate a turn holds is skipped and counted,
+    /// by the same gate `census` reads through.
+    pub fn sample_cell_heaps(&self, heaps: &mut crate::metrics::CellHeaps) {
+        let slots = self.slots.read().expect("pool poisoned");
+        heaps.sample(
+            slots
+                .iter()
+                .map(|slot| (slot.observe().cells, &slot.worker)),
+            |worker| {
+                worker
+                    .as_ref()
+                    .and_then(js::Worker::heap_bytes)
+                    .map(|heap| heap.physical + heap.external)
+            },
+        );
+    }
 }
 
 /// The property the whole design rests on: an isolate and everything hanging

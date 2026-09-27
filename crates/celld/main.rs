@@ -4383,6 +4383,11 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     if let (Some(follower), Ownership::Bucket(bucket_ownership)) = (&follower, &actor.ownership) {
         bucket_ownership.set_disk_incarnation(follower.incarnation()?);
     }
+    // Node load and per-cell distributions, sampled through the same
+    // snapshot `/state` serves. Returns at once unless a collector is set.
+    if celld::telemetry::metrics_export().is_some() {
+        tokio::spawn(celld::metrics::run(app.clone()));
+    }
 
     // The in-fleet log tier, v0. The takeover interlock is installed in
     // every posture — a bucket-posture node can take over from a

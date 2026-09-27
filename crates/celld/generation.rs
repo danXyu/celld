@@ -411,6 +411,13 @@ impl Generation {
         }
     }
 
+    /// Sample the heap of every isolate housing this generation's cells.
+    pub(crate) fn sample_cell_heaps(&self, heaps: &mut crate::metrics::CellHeaps) {
+        for pool in self.cell_isolates.values() {
+            pool.sample_cell_heaps(heaps);
+        }
+    }
+
     /// The isolates this generation holds right now, for `/state`.
     pub(crate) fn isolate_census(&self) -> IsolateCensus {
         IsolateCensus {
