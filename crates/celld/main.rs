@@ -2932,46 +2932,16 @@ async fn handle_internal(
     let do_scope = path.strip_prefix("/do/");
     let cell_scope = path.strip_prefix("/cell/");
     let evict_scope = path.strip_prefix("/evict/");
-    if app
-        .disk_removal
-        .control_only
-        .load(std::sync::atomic::Ordering::SeqCst)
-        && !matches!(
-            path.as_str(),
-            "/state"
-                | "/shutdown"
-                | "/peer/log/seal"
-                | "/peer/log/tail"
-                | "/peer/log/append"
-                | "/peer/log/stream"
-        )
-    {
-        return Ok(response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "control-only shutdown phase",
-        ));
-    }
     let result = match path.as_str() {
         "/peer/probe" => internal_probe(request, app).await,
         "/peer/handoff" => internal_handoff(request, app).await,
         _ if path.starts_with("/peer/log/") => internal_log(request, app, path.clone()).await,
         "/state" => {
-            let snapshot = if app
-                .disk_removal
-                .control_only
-                .load(std::sync::atomic::Ordering::SeqCst)
-            {
-                None
-            } else {
-                Some(app.snapshot().await)
-            };
-            let node_log = app.node_log.lock().unwrap().clone();
-            let state = celld::actor::internal_state_json(
-                snapshot.as_deref(),
-                app.disk_removal.snapshot(),
-                celld::node_log::state_json(node_log.as_deref()),
-            );
-            response(StatusCode::OK, state.to_string())
+            let snapshot = app.snapshot().await;
+            match celld::runtime_identity::state_json(&snapshot, &app.process_generation) {
+                Ok(state) => response(StatusCode::OK, state.to_string()),
+                Err(_) => response(StatusCode::INTERNAL_SERVER_ERROR, "invalid actor state"),
+            }
         }
         "/reload" if request.method() != hyper::Method::POST => {
             response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
@@ -2987,76 +2957,27 @@ async fn handle_internal(
             response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
         }
         "/shutdown" => {
-            let query = request.uri().query().unwrap_or("");
-            let strict = query.split('&').any(|p| p == "mode=remove-disk");
-            if query
-                .split('&')
-                .any(|p| p.starts_with("mode=") && p != "mode=remove-disk")
-                || (strict && query.split('&').any(|p| p.starts_with("handoff=")))
-            {
-                response(StatusCode::BAD_REQUEST, "unsupported shutdown mode")
-            } else if strict {
-                if !app.disk_removal.supported {
-                    return Ok(response(
-                        StatusCode::NOT_IMPLEMENTED,
-                        "strict disk removal is unavailable",
-                    ));
-                }
-                #[derive(serde::Deserialize)]
-                #[serde(deny_unknown_fields)]
-                struct StrictRequest {
-                    operation_id: String,
-                    expected_generation: String,
-                }
-                let body = http_body_util::Limited::new(request.into_body(), 4096)
-                    .collect()
-                    .await;
-                let requested = body
-                    .ok()
-                    .and_then(|b| serde_json::from_slice::<StrictRequest>(&b.to_bytes()).ok());
-                let Some(requested) = requested else {
-                    return Ok(response(
-                        StatusCode::BAD_REQUEST,
-                        "invalid strict shutdown request",
-                    ));
-                };
-                let admitted = app
-                    .disk_removal
-                    .control
-                    .lock()
-                    .unwrap()
-                    .request(&requested.operation_id, &requested.expected_generation);
-                match admitted {
-                    Err(error) => response(StatusCode::CONFLICT, error),
-                    Ok(first) => {
-                        if first && shutdown.send(ShutdownMode::Handoff).is_err() {
-                            app.disk_removal
-                                .control
-                                .lock()
-                                .unwrap()
-                                .finish(Err("shutdown task unavailable".into()));
-                        }
-                        response(
-                            StatusCode::ACCEPTED,
-                            app.disk_removal.snapshot().to_string(),
-                        )
-                    }
-                }
-            } else {
-                let mut control = app.disk_removal.control.lock().unwrap();
-                if control.operation.is_some() {
-                    response(StatusCode::CONFLICT, "strict shutdown already started")
-                } else {
-                    control.ordinary_shutdown = true;
-                    let preserve = query.split('&').any(|part| part == "handoff=preserve");
-                    let _ = shutdown.send(if preserve {
-                        ShutdownMode::Preserve
-                    } else {
-                        ShutdownMode::Handoff
-                    });
-                    response(StatusCode::OK, "{\"ok\":true}")
-                }
+            if request.uri().query().is_some_and(|query| {
+                query
+                    .split('&')
+                    .any(|part| part.split('=').next() == Some("mode"))
+            }) {
+                return Ok(response(
+                    StatusCode::BAD_REQUEST,
+                    "unsupported shutdown mode",
+                ));
             }
+            let preserve_ownership = request
+                .uri()
+                .query()
+                .is_some_and(|query| query.split('&').any(|part| part == "handoff=preserve"));
+            let mode = if preserve_ownership {
+                ShutdownMode::Preserve
+            } else {
+                ShutdownMode::Handoff
+            };
+            let _ = shutdown.send(mode);
+            response(StatusCode::OK, "{\"ok\":true}")
         }
         _ if path.starts_with("/peer/abort/") && app.runtime.is_some() => {
             internal_abort(request, app, path).await
@@ -4349,10 +4270,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             .then(|| Arc::new(celld::node_log::FollowerStore::new(&data_dir, None, &node)))
     });
     let app = AppHandle {
-        disk_removal: Arc::new(celld::disk_removal::State::new(
-            process_generation.clone(),
-            settings.bucket.is_some() && follower.is_some(),
-        )),
+        process_generation: process_generation.clone(),
         tx,
         runtime,
         reload: reload_tx.clone(),
@@ -4372,8 +4290,8 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         max_request_body_bytes,
         operation_deadline_ms: celld::actor::operation_deadline_ms()?,
         follower: follower.clone(),
-        node_log: actor.node_log.clone(),
     };
+
     // Every lease this process writes names its disk's follower-store
     // incarnation, so a later replacement disk under this node's name can
     // name the disk it supersedes when recovery asks. The store creates the identity
@@ -4397,7 +4315,6 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         matches!(durability.as_str(), "bucket" | "fleet"),
         "CELLD_DURABILITY must be `bucket` or `fleet`"
     );
-    let mut strict_manager = None;
     let mut durability_owner = DurabilityOwnerSelection::new(follower.clone());
     if let Ownership::Bucket(bucket_ownership) = &actor.ownership {
         if let (Some(replication), Some(spec)) = (
@@ -4430,7 +4347,6 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 celld::node_log::eviction_policy_from_env()?,
             ));
             *actor.node_log.lock().unwrap() = Some(manager.clone());
-            strict_manager = Some(manager.clone());
             // Recovery-before-install is fatal for every posture: the
             // predecessor's folded state lives in the lease record this
             // session is about to replace, and the install writes a fresh
@@ -4525,22 +4441,14 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     // executor models them. Request work, restores, and blocking scans stay on
     // the shared runtime and report their results back as messages.
     let (actor_exit_tx, mut actor_exit_rx) = mpsc::unbounded_channel();
-    let (strict_stop_actor, strict_actor_stopped) = oneshot::channel::<()>();
-    let actor_thread = std::thread::Builder::new()
+    std::thread::Builder::new()
         .name("celld-core".into())
         .spawn(move || {
             let result = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .map_err(|error| error.to_string())
-                .map(|runtime| {
-                    runtime.block_on(async {
-                        celld::asyncrt::select! {
-                            _ = actor.run(rx) => {},
-                            _ = strict_actor_stopped => {},
-                        }
-                    })
-                });
+                .map(|runtime| runtime.block_on(actor.run(rx)));
             let _ = actor_exit_tx.send(result);
         })?;
 
@@ -5054,14 +4962,6 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     // shutdown. Progress can extend only the inner stall deadline. The
     // absolute bound leaves the orchestrator time to observe an orderly exit
     // instead of replacing a progressing donor with SIGKILL.
-    let strict = {
-        let mut control = app.disk_removal.control.lock().unwrap();
-        let strict = control.operation.is_some();
-        if !strict {
-            control.ordinary_shutdown = true;
-        }
-        strict
-    };
     let shutdown_started = tokio::time::Instant::now();
     let process_deadline = shutdown_started + std::time::Duration::from_millis(shutdown_total_ms);
     // A donor normally spends its complete budget making safe handoff
@@ -5131,28 +5031,6 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             shutdown_connection_tx,
         );
     }
-    let strict_obligations = if strict {
-        match (&fleet_bucket, &follower) {
-            (Some(bucket), Some(follower)) => match before_process_deadline(
-                process_deadline,
-                celld::disk_removal::capture(bucket, &clean_reload_node, follower),
-            )
-            .await
-            {
-                Some(Ok(obligations)) => Some(obligations),
-                result => {
-                    let error = result
-                        .map(|r| r.unwrap_err().to_string())
-                        .unwrap_or_else(|| "follower admission deadline".into());
-                    app.disk_removal.control.lock().unwrap().finish(Err(error));
-                    None
-                }
-            },
-            _ => None,
-        }
-    } else {
-        None
-    };
     let mut drain_token_hold: Option<celld::drain_token::Hold> = None;
     let handoff_started = if shutdown_mode == ShutdownMode::Handoff {
         // Serialize donors: claim the fleet drain token beside the
@@ -5340,11 +5218,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             );
         }
         if admitted_drained {
-            let _ = app.tx.send(if strict {
-                Message::ReleaseAllForDiskRemoval
-            } else {
-                Message::ReleaseAll
-            });
+            let _ = app.tx.send(Message::ReleaseAll);
         }
         admitted_drained
     } else {
@@ -5356,7 +5230,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     // deadline. A deadline-cut cell keeps its durable owner record and follows
     // the same lease-expiry recovery path as an abrupt process loss.
     let mut stall_deadline = (tokio::time::Instant::now() + stall_window).min(handoff_deadline);
-    let mut drain_progress = 0;
+    let mut handed_off = 0;
     let mut process_deadline_fired = false;
     let mut handoff = tokio::time::interval(std::time::Duration::from_millis(50));
     let mut containers_reaped = false;
@@ -5380,9 +5254,9 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             .await
             .and_then(Result::ok);
             if shutdown_mode == ShutdownMode::Handoff
-                && status.is_some_and(|status| status.progress > drain_progress)
+                && status.is_some_and(|status| status.handed_off > handed_off)
             {
-                drain_progress = status.expect("checked drain status").progress;
+                handed_off = status.expect("checked drain status").handed_off;
                 stall_deadline = (tokio::time::Instant::now() + stall_window).min(handoff_deadline);
             }
             // A drain that makes progress can outlive the token TTL, so the
@@ -5420,17 +5294,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 ShutdownMode::Preserve => status.activating == 0 && status.evicting == 0,
             });
             let completely_drained = match shutdown_mode {
-                ShutdownMode::Handoff => {
-                    core_drained
-                        && (!strict
-                            || (do_calls.is_empty()
-                                && gate_calls.is_empty()
-                                && service_calls.is_empty()
-                                && queue_calls.is_empty()
-                                && asset_calls.is_empty()
-                                && websockets.is_empty()
-                                && app.public_in_flight() == 0))
-                }
+                ShutdownMode::Handoff => core_drained,
                 ShutdownMode::Preserve => shell_drained && core_drained,
             };
             if completely_drained {
@@ -5746,7 +5610,6 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             ),
         }
     }
-    let mut local_joined = durability_owner.is_none();
     if let Some(owner) = &mut durability_owner {
         let remaining = process_deadline.saturating_duration_since(tokio::time::Instant::now());
         let completed = if remaining.is_zero() {
@@ -5755,7 +5618,6 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         } else {
             owner.shutdown_local_within(remaining).await
         };
-        local_joined = completed;
         if !completed {
             eprintln!("celld local durability shutdown exceeded the process deadline");
         }
@@ -5765,79 +5627,6 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         shutdown_accept_failure_test_active,
         "local durability shutdown finished",
     );
-    if strict {
-        app.disk_removal
-            .control_only
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        let _ = strict_stop_actor.send(());
-        let actor_joined = matches!(
-            before_process_deadline(process_deadline, async {
-                if !matches!(actor_exit_rx.recv().await, Some(Ok(()))) {
-                    return false;
-                }
-                tokio::task::spawn_blocking(move || actor_thread.join().is_ok())
-                    .await
-                    .unwrap_or(false)
-            })
-            .await,
-            Some(true)
-        );
-        let state = app.disk_removal.clone();
-        let proof = match (strict_obligations, fleet_bucket.clone()) {
-            (Some(obligations), Some(bucket))
-                if drained
-                    && local_joined
-                    && actor_joined
-                    && durability_quiesced
-                    && !process_deadline_fired =>
-            {
-                let own_session = format!("{clean_reload_node}/{process_generation}");
-                Some(tokio::spawn(async move {
-                    let result = tokio::time::timeout_at(
-                        process_deadline,
-                        celld::disk_removal::prove(
-                            bucket,
-                            own_session,
-                            obligations,
-                            strict_manager,
-                            state.clone(),
-                        ),
-                    )
-                    .await;
-                    state.control.lock().unwrap().finish(match result {
-                        _ if tokio::time::Instant::now() >= process_deadline => {
-                            Err("disk removal proof deadline".into())
-                        }
-                        Ok(result) => result.map_err(|e| format!("{e:#}")),
-                        Err(_) => Err("disk removal proof deadline".into()),
-                    });
-                }))
-            }
-            _ => {
-                state.control.lock().unwrap().finish(Err(
-                    "application or durability work did not fully join before deadline".into(),
-                ));
-                None
-            }
-        };
-        let _proof = proof;
-        // Keep the exact-operation result observable until the launcher terminates
-        // this process. SIGTERM is termination, never evidence of data safety.
-        let (_terminal_tx, terminal_drain) = watch::channel(false);
-        loop {
-            celld::asyncrt::select! {
-                connection = shutdown_connection_rx.recv() => {
-                    if let Some(connection) = connection {
-                        let _ = connection.received.send(());
-                        drain_connections.push(serve_http_connection(connection.stream, connection.surface, app.clone(), shutdown_tx.clone(), terminal_drain.clone(), connection_grace));
-                    }
-                }
-                Some(_) = drain_connections.next(), if !drain_connections.is_empty() => {}
-                _ = sigterm.recv() => exit_flushed(0),
-                _ = sigint.recv() => exit_flushed(0),
-            }
-        }
-    }
     // Exit without unwinding. Returning from here drops the tokio runtime
     // and the V8 platform underneath tasks and isolates that are still
     // alive -- on a deadline-cut drain that teardown segfaults (status 139

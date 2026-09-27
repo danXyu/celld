@@ -643,9 +643,6 @@ pub struct State {
     /// released, pumped at most `max_releases` at a time. Sticky -- a
     /// draining node never goes back to serving.
     draining: bool,
-    /// A disk-removal drain needs recoverability, not a live successor.
-    disk_removal: bool,
-    disk_removal_released: u64,
     /// Number of cell-table entries inspected by the shutdown release pump.
     /// Instrumentation uses this to enforce a structural work bound instead
     /// of timing a host whose speed is unrelated to the decision.
@@ -839,8 +836,6 @@ impl State {
             config,
             fenced: false,
             draining: false,
-            disk_removal: false,
-            disk_removal_released: 0,
             #[cfg(celld_internal_tests)]
             drain_table_visits: 0,
             quiescing_cells: BTreeSet::new(),
@@ -1246,15 +1241,9 @@ impl State {
             .saturating_add(self.adopting())
     }
 
-    /// Completed drain work, including ownership releases during disk removal.
-    /// This is only progress; the executor's final disk proof remains required.
-    pub fn drain_progress(&self) -> u64 {
-        self.activity
-            .handed_off
-            .saturating_add(self.disk_removal_released)
-    }
-
     /// Completed successor ownership acknowledgements during this process lifetime.
+    /// Shutdown uses this monotonic value to distinguish a slow, advancing
+    /// handoff from one that has stopped making progress.
     pub fn handed_off(&self) -> u64 {
         self.activity.handed_off
     }
@@ -4893,11 +4882,8 @@ impl State {
         let hands_off = self.hands_off(&cell);
         let settled = matches!(result, Ok(CasOutcome::Applied))
             || (hands_off && matches!(result, Ok(CasOutcome::Rejected)));
-        let adoption = (settled && hands_off && !self.disk_removal && released_epoch.is_some())
-            .then(|| self.cell_op(&id));
-        if settled && self.disk_removal && released_epoch.is_some() {
-            self.disk_removal_released = self.disk_removal_released.saturating_add(1);
-        }
+        let adoption =
+            (settled && hands_off && released_epoch.is_some()).then(|| self.cell_op(&id));
         self.releasing_cells.remove(&id);
         if adoption.is_some() {
             self.adopting_cells.insert(id.clone());
@@ -5489,30 +5475,6 @@ impl State {
                 .map_err(EvictError::Refused),
             _ => refuse(EvictRefusal::CellTransitioning),
         }
-    }
-
-    /// Drain all local ownership without requiring another live process.
-    fn release_all_for_disk_removal(&mut self, effects: &mut Vec<Effect>) {
-        self.disk_removal = true;
-        self.draining = true;
-        // A rebalance may already have stopped a runtime and released its
-        // ownership before strict shutdown began. Its only remaining work is
-        // successor adoption; make any later reply stale and return its permit.
-        // The executor still has to stop and join the actor/effects before the
-        // independent disk proof can complete.
-        for id in std::mem::take(&mut self.adopting_cells) {
-            let mut cell = self.cells.remove(&id).expect("adopting cell exists");
-            let Phase::Adopting { op, .. } = cell.phase else {
-                unreachable!("adoption index matches cell phase");
-            };
-            self.cell_ops.remove(&op);
-            cell.handoff = false;
-            set_phase(&mut self.occupied, &mut cell, Phase::Inactive);
-            self.finish_requests(&id, &mut cell, Err(RequestError::NodeUnavailable), effects);
-            self.cells.insert(id, cell);
-            self.disk_removal_released = self.disk_removal_released.saturating_add(1);
-        }
-        self.pump_release(effects);
     }
 
     /// Shutdown handoff: give every resident cell away by releasing its
@@ -6878,7 +6840,6 @@ pub fn on_event(state: &mut State, event: Event) -> Vec<Effect> {
         }
         Event::NodeFenced => state.fence_node(HaltReason::NodeLeaseExpired, &mut effects),
         Event::ReleaseAll => state.release_all(&mut effects),
-        Event::ReleaseAllForDiskRemoval => state.release_all_for_disk_removal(&mut effects),
         Event::Rebalance { cells } => state.rebalance(cells, &mut effects),
     }
     state.pump_activations(&mut effects);
@@ -7056,5 +7017,3 @@ fn runtime_epoch(phase: &Phase) -> Option<Epoch> {
         _ => None,
     }
 }
-
-pub mod disk_removal;

@@ -260,7 +260,9 @@ fn expired_unavailable_witness_never_seals_or_cleans_up() {
                         leader: PREDECESSOR.into(),
                         member: None,
                         incarnation: None,
-                    }).await.unwrap()
+                    })
+                    .await
+                    .unwrap()
                     .entries[0]
                     .bytes,
                 fixture.acknowledged
@@ -387,7 +389,15 @@ fn a_replacement_disk_under_the_member_name_records_the_loss() {
         assert!(fixture.manager.predecessors_clean.load(Ordering::SeqCst));
         // The replacement disk sealed the epoch like any conclusive member,
         // so a straggling append from the dead leader is refused there too.
-        assert_eq!(fixture.witness.follower.load(PREDECESSOR).unwrap().sealed_to, 1);
+        assert_eq!(
+            fixture
+                .witness
+                .follower
+                .load(PREDECESSOR)
+                .unwrap()
+                .sealed_to,
+            1
+        );
         fixture.stop().await;
     });
 }
@@ -409,7 +419,15 @@ fn another_member_at_the_witness_address_stays_undecided() {
         fixture.assert_undecided().await;
         // The refusal came before the seal mark: the other node's disk
         // carries no trace of a seal it was never entitled to answer.
-        assert_eq!(fixture.witness.follower.load(PREDECESSOR).unwrap().sealed_to, 0);
+        assert_eq!(
+            fixture
+                .witness
+                .follower
+                .load(PREDECESSOR)
+                .unwrap()
+                .sealed_to,
+            0
+        );
         assert_eq!(fixture.witness.attempts.load(Ordering::SeqCst), 1);
         fixture.stop().await;
     });
@@ -457,6 +475,49 @@ fn a_matching_incarnation_recovers_the_retained_tail() {
             1
         );
         assert!(fixture.bucket.get(LOSS).await.unwrap().is_none());
+        fixture.stop().await;
+    });
+}
+
+#[test]
+fn dead_leader_sweep_still_recovers_past_an_unreadable_record() {
+    run(async {
+        let fixture = Fixture::new(false, true).await;
+        fixture
+            .bucket
+            .put("nodes/aaa-broken.json", b"not a lease".to_vec())
+            .await
+            .unwrap();
+        fixture
+            .bucket
+            .put(
+                "nodes/dead.json",
+                serde_json::to_vec(&serde_json::json!({
+                    "node": "dead", "expires_ms": 1, "ownership_index_generation": "old",
+                    "log": {"epoch": 1, "state": "open", "tiered": 0,
+                            "ensemble": ["witness"], "active": true, "bucket_complete": true}
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        fixture.manager.sweep_dead_leaders().await.unwrap();
+        assert_eq!(
+            read_record(&fixture.bucket, "dead/old")
+                .await
+                .unwrap()
+                .unwrap()
+                .record
+                .state,
+            LogState::Sealed
+        );
+        assert_eq!(fixture.witness.attempts.load(Ordering::SeqCst), 0);
+        assert!(fixture
+            .bucket
+            .get("log/dead/old.e1.loss.json")
+            .await
+            .unwrap()
+            .is_none());
         fixture.stop().await;
     });
 }

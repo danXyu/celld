@@ -57,7 +57,6 @@ fn incarnation_survives_a_restart_and_is_new_on_an_empty_disk() {
         // left behind, and the peerlog listing still holds no fragment.
         let store = FollowerStore::new(disk.path(), None, "member");
         assert!(store.followed_sessions().is_empty());
-        assert!(store.disk_removal_obligations().unwrap().is_empty());
         assert_eq!(
             store
                 .filesystem
@@ -133,7 +132,12 @@ fn a_seal_for_another_member_is_refused_before_the_seal_mark() {
             entries
         );
         assert_eq!(
-            store.checked_tail(&tail(None, None)).await.unwrap().entries.len(),
+            store
+                .checked_tail(&tail(None, None))
+                .await
+                .unwrap()
+                .entries
+                .len(),
             entries
         );
         store.seal(&seal(Some("member"), Some(&own))).await.unwrap();

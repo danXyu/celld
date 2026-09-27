@@ -597,4 +597,4 @@ pub fn worker_compat(metadata: &serde_json::Value) -> js::Compat {
     }
 }
 
-pub mod disk_removal;
+pub mod runtime_identity;

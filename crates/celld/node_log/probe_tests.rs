@@ -201,7 +201,6 @@ fn an_answered_probe_keeps_a_blipping_follower() {
         let failed = || AppendSend::Failed(anyhow!("connection reset"));
         let answered = || {
             AppendSend::Answered(AppendResp {
-                quiesced: false,
                 ok: true,
                 end: 0,
                 epoch: Some(shipper.epoch),

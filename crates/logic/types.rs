@@ -875,11 +875,6 @@ pub enum Event {
     /// run at most `max_releases` at a time, and a cell that is active when
     /// the drain begins is picked up once its activity finishes.
     ReleaseAll,
-    /// Strict disk removal retains the same durability, runtime-stop, and
-    /// ownership-release barriers, but does not require a live successor to
-    /// adopt released cells. The executor must still prove every node-log and
-    /// follower obligation recoverable without this disk before reporting safe.
-    ReleaseAllForDiskRemoval,
     /// Give up to `cells` idle cells to the fleet through the shutdown
     /// handoff pipeline without draining. The core picks dormant cells
     /// first, then hibernatable residents, and skips any cell with work.
