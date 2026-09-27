@@ -103,6 +103,15 @@ pub struct Config {
     /// Estimated buffered bytes that trigger an early flush. This controls
     /// batching independently of the export delay. One event can exceed it.
     pub flush_bytes: usize,
+    /// `OTEL_METRICS_EXPORTER`: `otlp` (the default) or `none`. Metrics
+    /// ship only to a collector; the bucket sink carries no metrics.
+    pub metrics: bool,
+    /// `OTEL_METRIC_EXPORT_INTERVAL`: the delta window each metrics export
+    /// covers.
+    pub metrics_interval: Duration,
+    /// `OTEL_RESOURCE_ATTRIBUTES`, added to the resource of every OTLP
+    /// signal, e.g. a fleet identifier. celld's own keys win a collision.
+    pub resource_attributes: Vec<(String, String)>,
 }
 
 impl Config {
@@ -199,6 +208,21 @@ impl Config {
         )?
         .unwrap_or(5 * 1024 * 1024);
         let bucket_override = get("CELLD_OTEL_BUCKET")?;
+        let metrics = match get("OTEL_METRICS_EXPORTER")?.as_deref() {
+            None | Some("otlp") => true,
+            Some("none") => false,
+            Some(other) => bail!("unsupported OTEL_METRICS_EXPORTER {other:?}"),
+        };
+        let metrics_interval = crate::env_vars::parse_positive::<u64>(
+            "OTEL_METRIC_EXPORT_INTERVAL",
+            get("OTEL_METRIC_EXPORT_INTERVAL")?,
+        )?
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_secs(60));
+        let resource_attributes = match get("OTEL_RESOURCE_ATTRIBUTES")? {
+            Some(list) => parse_resource_attributes(&list)?,
+            None => Vec::new(),
+        };
         Ok(sink.map(|sink| Config {
             sink,
             bucket_override,
@@ -210,8 +234,29 @@ impl Config {
             retention,
             flush,
             flush_bytes,
+            metrics,
+            metrics_interval,
+            resource_attributes,
         }))
     }
+}
+
+/// `key1=value1,key2=value2`, values percent-decoded, per the otel SDK
+/// environment specification.
+#[doc(hidden)]
+pub fn parse_resource_attributes(list: &str) -> anyhow::Result<Vec<(String, String)>> {
+    let mut attributes = Vec::new();
+    for pair in list.split(',').filter(|pair| !pair.trim().is_empty()) {
+        let (name, value) = pair
+            .split_once('=')
+            .filter(|(name, _)| !name.trim().is_empty())
+            .ok_or_else(|| anyhow!("OTEL_RESOURCE_ATTRIBUTES: {pair:?}"))?;
+        let value = percent_encoding::percent_decode_str(value.trim())
+            .decode_utf8()
+            .map_err(|_| anyhow!("OTEL_RESOURCE_ATTRIBUTES: {pair:?} is not UTF-8"))?;
+        attributes.push((name.trim().to_string(), value.into_owned()));
+    }
+    Ok(attributes)
 }
 
 /// Span kinds, numbered as the OTLP proto numbers them so the later OTLP
@@ -441,6 +486,32 @@ pub fn active() -> bool {
     TELEMETRY.get().is_some()
 }
 
+static RESOURCE_ATTRIBUTES: OnceLock<Vec<(String, String)>> = OnceLock::new();
+
+/// The operator's `OTEL_RESOURCE_ATTRIBUTES`, empty before `init`.
+pub(crate) fn resource_attributes() -> &'static [(String, String)] {
+    RESOURCE_ATTRIBUTES.get().map_or(&[], Vec::as_slice)
+}
+
+/// Where the metrics signal goes. `init` sets it only for a collector sink
+/// with metrics on, so its absence is what keeps metrics off: no sampler
+/// runs and no cell pays for a CPU clock it would not report.
+pub struct MetricsExport {
+    pub(crate) client: reqwest::Client,
+    pub(crate) url: String,
+    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) node: String,
+    pub(crate) region: String,
+    pub(crate) service: String,
+    pub(crate) interval: Duration,
+}
+
+static METRICS_EXPORT: OnceLock<MetricsExport> = OnceLock::new();
+
+pub fn metrics_export() -> Option<&'static MetricsExport> {
+    METRICS_EXPORT.get()
+}
+
 /// Decide a new root trace at its creation. `None` means off or unsampled,
 /// and the caller builds nothing at all.
 pub fn start_trace() -> Option<TraceContext> {
@@ -583,6 +654,12 @@ pub fn init(
     node: String,
     region: String,
 ) -> anyhow::Result<()> {
+    if RESOURCE_ATTRIBUTES
+        .set(config.resource_attributes.clone())
+        .is_err()
+    {
+        panic!("telemetry initialized twice");
+    }
     let sink = match &config.sink {
         SinkChoice::Bucket => {
             let bucket = bucket.expect("the bucket sink needs a bucket");
@@ -604,13 +681,32 @@ pub fn init(
             tracing::info!(
                 endpoint = %endpoint,
                 sample_ratio = config.sample_ratio,
+                metrics = config.metrics,
                 "telemetry on; OTLP to the collector"
             );
+            let client = reqwest::Client::builder()
+                .timeout(config.otlp_timeout)
+                .build()
+                .map_err(|error| anyhow!("otlp client: {error}"))?;
+            if config.metrics {
+                let export = MetricsExport {
+                    client: client.clone(),
+                    url: format!("{endpoint}/v1/metrics"),
+                    headers: config.otlp_headers.clone(),
+                    node: node.clone(),
+                    region: region.clone(),
+                    service: config.service.clone(),
+                    interval: config.metrics_interval,
+                };
+                if METRICS_EXPORT.set(export).is_err() {
+                    panic!("telemetry initialized twice");
+                }
+                // Before any cell event can start, so every event resolves
+                // its CPU account against the same answer.
+                crate::metrics::enable_cell_cpu();
+            }
             SinkRuntime::Otlp {
-                client: reqwest::Client::builder()
-                    .timeout(config.otlp_timeout)
-                    .build()
-                    .map_err(|error| anyhow!("otlp client: {error}"))?,
+                client,
                 traces_url: format!("{endpoint}/v1/traces"),
                 logs_url: format!("{endpoint}/v1/logs"),
                 headers: config.otlp_headers.clone(),
@@ -744,7 +840,7 @@ impl SinkRuntime {
 /// permanently, or the retry budget expires. This future owns only one batch.
 /// While it sleeps, request handling continues and the bounded channel sheds
 /// excess telemetry instead of turning an outage into application backpressure.
-async fn post_otlp(
+pub(crate) async fn post_otlp(
     client: &reqwest::Client,
     url: &str,
     headers: &[(String, String)],

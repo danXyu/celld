@@ -983,6 +983,17 @@ pub(crate) fn storage_identity(scope: &str) -> anyhow::Result<Option<StorageIden
     }))
 }
 
+/// The cell that owns `scope`'s storage: the cell itself, or a facet's root.
+/// `None` for a scope with no open database.
+pub(crate) fn root_scope(scope: &str) -> Option<String> {
+    dbs(|databases| {
+        let databases = databases.borrow();
+        let (StorageBacking::File { root_scope, .. } | StorageBacking::Embedded { root_scope, .. }) =
+            &databases.get(scope)?.backing;
+        Some(root_scope.clone())
+    })
+}
+
 /// The gate an event of `scope` must pass, when `scope` is an embedded facet.
 /// `None` for a cell, which gates against itself.
 pub(crate) fn embedded_root_gate(scope: &str) -> Option<RootGate> {
