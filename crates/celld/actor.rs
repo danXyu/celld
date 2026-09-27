@@ -412,8 +412,6 @@ pub enum Message {
     /// bounded by the drain deadline, so a wedged store still cannot hold
     /// the exit hostage.
     ReleaseAll,
-    /// Use the existing release pipeline without waiting for a live successor.
-    ReleaseAllForDiskRemoval,
     /// Give up to `cells` idle cells to the fleet. The balancing loop sends
     /// this after it has confirmed from the leases that this node is the
     /// densest and a peer has room.
@@ -612,9 +610,6 @@ pub struct DrainStatus {
     /// Monotonic ownership acknowledgements. A progressing handoff can
     /// take longer than one stall interval when the node owns many cells.
     pub handed_off: u64,
-    /// Ordinary successor acknowledgements or strict completed owner releases.
-    /// A progress observation never substitutes for the final disk proof.
-    pub progress: u64,
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -1260,7 +1255,8 @@ pub struct SwapCensus {
 
 #[derive(Clone)]
 pub struct AppHandle {
-    pub disk_removal: Arc<crate::disk_removal::State>,
+    /// Stable identity of this runtime process for operator observations.
+    pub process_generation: String,
     pub tx: mpsc::UnboundedSender<Message>,
     pub runtime: Option<RuntimeManager>,
     #[cfg(all(test, celld_internal_tests))]
@@ -1304,27 +1300,6 @@ pub struct AppHandle {
     /// generation. This is the same operation deadline that bounds the
     /// decision core, so a shell retry cannot outlive its core operation.
     pub operation_deadline_ms: u64,
-    /// The node-log manager, installed once the bucket-backed runtime has
-    /// built it. `/state` reads its in-memory view; `None` without one.
-    pub node_log: Arc<std::sync::Mutex<Option<Arc<crate::node_log::NodeLogManager>>>>,
-}
-
-/// The internal `/state` body: the actor snapshot (absent in the terminal
-/// control-only phase, when the actor has stopped), then the strict-shutdown
-/// status and the node-log view, which both answer from memory in every
-/// phase.
-pub fn internal_state_json(
-    snapshot: Option<&str>,
-    shutdown: serde_json::Value,
-    node_log: serde_json::Value,
-) -> serde_json::Value {
-    let mut state = snapshot
-        .and_then(|snapshot| serde_json::from_str(snapshot).ok())
-        .filter(serde_json::Value::is_object)
-        .unwrap_or_else(|| serde_json::json!({}));
-    state["shutdown"] = shutdown;
-    state["node_log"] = node_log;
-    state
 }
 
 impl AppHandle {
@@ -2647,7 +2622,6 @@ impl Actor {
                 self.drive(Event::WorkerRequest { request }, out);
             }
             Message::ReleaseAll => self.drive(Event::ReleaseAll, out),
-            Message::ReleaseAllForDiskRemoval => self.drive(Event::ReleaseAllForDiskRemoval, out),
             Message::Rebalance { .. } if self.preserving => {}
             Message::Rebalance { cells } => self.drive(Event::Rebalance { cells }, out),
             Message::GenerationChanged {
@@ -2672,7 +2646,6 @@ impl Actor {
                     releasing: self.state.releasing(),
                     adopting: self.state.adopting(),
                     handed_off: self.state.handed_off(),
-                    progress: self.state.drain_progress(),
                 });
             }
             Message::ResidentEpoch { cell, reply } => {

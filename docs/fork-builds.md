@@ -1,8 +1,28 @@
 # Fork builds
 
-The operator's strict disk-removal contract requires this fork. Stock celld
-v0.5.1 does not provide it. The first fork build identifies itself as
-`0.5.1-ewhauser.1`, including in `celld --version`.
+The operator still requires this fork for process identity, recovery safeguards,
+idle-follower failure handling, and preview support. Stock celld v0.6.0 does not
+provide all of these behaviors.
+
+## Unreleased: remove retired operator APIs
+
+Strict disk-removal shutdown and `/state.node_log` reporting have been removed.
+The current operator uses ordinary Kubernetes workload lifecycle operations and
+consumes neither API. Requests with a shutdown `mode` parameter return HTTP 400
+without stopping the process. Ordinary and preserve shutdown remain supported.
+
+The `/state.shutdown` identity envelope retains `schema_version: 1` and
+`runtime_generation` for existing operator readers and advertises
+`strict_disk_removal: false`. It no longer reports an operation or control-only
+phase. Native `bucket_complete` publication and recovery readers remain: ordinary
+ensemble maintenance also uses this proof. Witness handling, member/disk binding,
+actor transaction rollback, previews, and fork release tooling are unchanged.
+
+The old disk-removal API documentation, demo, and qualification fixtures have
+been removed with the implementation. The release history below describes older
+artifacts; it does not imply those retired APIs exist in current source.
+
+## Building fork artifacts
 
 The release workflow builds native Linux x86_64, Linux aarch64 and macOS aarch64
 binaries. Each workflow artifact contains the compressed executable and a JSON
@@ -29,10 +49,10 @@ Fork prereleases never update `latest`. The operator must pin the verified
 manifest digest; per-platform digests can be used for platform-specific tests.
 Do not substitute an upstream image or infer a digest from a tag name.
 
-All members and potential recovery processes must use a compatible fork build
-before removing a last follower: recovery must understand the `bucket_complete`
-proof. Artifact publication alone does not qualify EKS/EBS removal. Validate the
-strict API and launcher handshake against the exact binary/image being used.
+All members and potential recovery processes must use a compatible fork build:
+recovery must understand the `bucket_complete` proof. Artifact publication alone
+does not qualify EKS/EBS behavior. Validate the operator and runtime together
+against the exact binary/image being used.
 
 ## 0.5.1-ewhauser.3: unavailable recovery witnesses
 
@@ -59,8 +79,8 @@ members must run the corrected build before relying on the new behavior.
 
 ### Node-log state in `/state`
 
-The internal `GET /state` response gains a `node_log` object, documented in
-the [README](README.md#shut-down-and-roll-out-a-node). It reports this node's
+This release added a `node_log` object to the internal `GET /state` response.
+That reporting API has since been removed, as described above. It reports this node's
 durability posture, its log session and folded log, whether its shipper is
 healthy, and the result of the last dead-leader sweep. The sweep result lists
 every unsealed log whose lease has expired, and, for each ensemble member, the

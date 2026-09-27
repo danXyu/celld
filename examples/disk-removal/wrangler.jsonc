@@ -1,7 +1,0 @@
-{
-  "name": "disk-removal-demo",
-  "main": "index.js",
-  "compatibility_date": "2026-01-01",
-  "durable_objects": { "bindings": [{ "name": "LEDGER", "class_name": "Ledger" }] },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Ledger"] }]
-}
