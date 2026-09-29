@@ -365,6 +365,7 @@ pub(crate) mod operator_cell;
 #[doc(hidden)]
 pub mod otlp;
 pub mod ownership_store;
+pub mod parquet_batch;
 pub mod peer_auth;
 pub mod peer_probe;
 pub mod pool;

@@ -19,6 +19,8 @@
 //! runs on `spawn_blocking`, the `prune_local_cache` treatment.
 
 use crate::bucket::Bucket;
+use crate::parquet_batch;
+use crate::parquet_batch::text;
 use anyhow::anyhow;
 use anyhow::bail;
 use std::sync::atomic::AtomicU64;
@@ -54,11 +56,6 @@ const CHANNEL_CAPACITY: usize = 8_192;
 const OTLP_MAX_ATTEMPTS: u32 = 5;
 const OTLP_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const OTLP_BACKOFF_MAX: Duration = Duration::from_secs(30);
-
-/// The provider page and the S3 bulk-delete limit are both 1,000. Keeping
-/// them equal lets a sweep delete one page without retaining a second key
-/// collection or splitting one provider page across storage requests.
-const SWEEP_PAGE_SIZE: usize = 1_000;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Retention {
@@ -789,8 +786,8 @@ impl SinkRuntime {
                 ];
                 for (prefix, bytes) in [(TRACES_PREFIX, span_bytes), (LOGS_PREFIX, log_bytes)] {
                     let Some(bytes) = bytes else { continue };
-                    let key = object_key(prefix, node, now_unix_us());
-                    if let Err(error) = bucket.put_with_meta(&key, bytes, &meta).await {
+                    let put = parquet_batch::put(bucket, prefix, node, now_unix_us(), bytes, &meta);
+                    if let Err(parquet_batch::PutError { key, error }) = put.await {
                         tracing::warn!(%error, key, "telemetry batch lost: put failed");
                     }
                 }
@@ -1008,17 +1005,16 @@ async fn pump(
     }
 }
 
-/// `<prefix>/<node>/<yyyy/mm/dd/hh>/<flush_us>-<rand>.parquet`.
-/// Partitioned by arrival at the flush, which is what retention prunes
-/// by; event timestamps stay exact inside the file.
+/// The Parquet object layout and the retention sweep's date arithmetic
+/// live in [`parquet_batch`], shared with change export.
 #[doc(hidden)]
-pub fn object_key(prefix: &str, node: &str, unix_us: i64) -> String {
-    let seconds = unix_us / 1_000_000;
-    let (y, m, d) = civil_from_days(seconds.div_euclid(86_400));
-    let hour = seconds.rem_euclid(86_400) / 3_600;
-    let tag: u32 = rand::random();
-    format!("{prefix}/{node}/{y:04}/{m:02}/{d:02}/{hour:02}/{unix_us}-{tag:08x}.parquet")
-}
+pub use crate::parquet_batch::civil_from_days;
+#[doc(hidden)]
+pub use crate::parquet_batch::cutoff_date;
+#[doc(hidden)]
+pub use crate::parquet_batch::expired;
+#[doc(hidden)]
+pub use crate::parquet_batch::object_key;
 
 /// The retention sweep: celld deletes its own old telemetry, because
 /// an S3 lifecycle rule needs bucket-level permissions the deliberately
@@ -1038,95 +1034,12 @@ async fn sweep_loop(bucket: Bucket, retention_days: u32) {
     }
 }
 
-/// One complete retention pass. A page failure ends only that signal's pass,
-/// while deletions completed from its earlier pages remain effective.
+/// One complete retention pass over both signals. A page failure ends only
+/// that signal's pass, while deletions completed from its earlier pages
+/// remain effective.
 #[doc(hidden)]
 pub async fn sweep_once(bucket: &Bucket, cutoff: (i64, u32, u32)) -> u64 {
-    let mut deleted = 0u64;
-    for prefix in [TRACES_PREFIX, LOGS_PREFIX] {
-        let mut page_token = None;
-        loop {
-            let page = match bucket
-                .objects_page(prefix, page_token, SWEEP_PAGE_SIZE)
-                .await
-            {
-                Ok(page) => page,
-                Err(error) => {
-                    tracing::warn!(%error, prefix, "telemetry sweep could not list");
-                    break;
-                }
-            };
-            let next_page = page.page_token;
-            // Retain only the keys this page proves are expired. Fresh and
-            // unparseable descriptions are released before deletion starts.
-            let expired_keys: Vec<String> = page
-                .objects
-                .into_iter()
-                .filter_map(|object| {
-                    let key = object.location.as_ref();
-                    expired(key, prefix, cutoff).then(|| key.to_string())
-                })
-                .collect();
-            if !expired_keys.is_empty() {
-                deleted += bucket.delete_many(&expired_keys).await.len() as u64;
-            }
-            match next_page {
-                Some(token) => page_token = Some(token),
-                None => break,
-            }
-        }
-    }
-    deleted
-}
-
-/// The newest civil date old enough to delete: strictly before
-/// `retention_days` whole days ago.
-#[doc(hidden)]
-pub fn cutoff_date(now_unix_us: i64, retention_days: u32) -> (i64, u32, u32) {
-    let today = (now_unix_us / 1_000_000).div_euclid(86_400);
-    civil_from_days(today - retention_days as i64)
-}
-
-/// Whether a telemetry object key's day partition is older than the
-/// cutoff. Keys that do not parse as
-/// `<prefix>/<node>/<yyyy>/<mm>/<dd>/...` are never touched: the sweep
-/// deletes only what the layout proves is telemetry with a date.
-#[doc(hidden)]
-pub fn expired(key: &str, prefix: &str, cutoff: (i64, u32, u32)) -> bool {
-    let Some(rest) = key
-        .strip_prefix(prefix)
-        .and_then(|rest| rest.strip_prefix('/'))
-    else {
-        return false;
-    };
-    let mut parts = rest.split('/');
-    let _node = parts.next();
-    let (Some(y), Some(m), Some(d)) = (parts.next(), parts.next(), parts.next()) else {
-        return false;
-    };
-    let (Ok(y), Ok(m), Ok(d)) = (y.parse::<i64>(), m.parse::<u32>(), d.parse::<u32>()) else {
-        return false;
-    };
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
-        return false;
-    }
-    (y, m, d) < cutoff
-}
-
-/// Days since the Unix epoch to a civil date (Howard Hinnant's
-/// `civil_from_days`, public domain construction).
-#[doc(hidden)]
-pub fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (if m <= 2 { y + 1 } else { y }, m, d)
+    parquet_batch::sweep_once(bucket, &[TRACES_PREFIX, LOGS_PREFIX], cutoff).await
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -1175,136 +1088,77 @@ message celld_log {
   required binary body (STRING);
 }";
 
-/// The native column-writer API rather than the arrow one: the schema is
-/// flat primitives, and skipping the `arrow` feature keeps the whole
-/// arrow crate stack out of the binary.
+/// Written through [`parquet_batch::encode`], which owns the writer
+/// properties both signals share.
 #[doc(hidden)]
 pub fn encode_spans(spans: &[Span], node: &str, region: &str) -> anyhow::Result<Vec<u8>> {
-    use parquet::basic::Compression;
-    use parquet::basic::ZstdLevel;
     use parquet::data_type::BoolType;
-    use parquet::data_type::ByteArray;
     use parquet::data_type::ByteArrayType;
     use parquet::data_type::Int32Type;
     use parquet::data_type::Int64Type;
-    use parquet::file::properties::WriterProperties;
-    use parquet::file::writer::SerializedFileWriter;
-    use parquet::schema::parser::parse_message_type;
-    use parquet::schema::types::ColumnPath;
-    use std::sync::Arc;
 
-    let schema = Arc::new(parse_message_type(MESSAGE_TYPE)?);
-    let properties = Arc::new(
-        WriterProperties::builder()
-            .set_compression(Compression::ZSTD(ZstdLevel::default()))
-            // Point lookups by trace id are the one query a
-            // time-partitioned scan is bad at; the bloom filter is what
-            // makes them cheap.
-            .set_column_bloom_filter_enabled(ColumnPath::from("trace_id"), true)
-            .build(),
-    );
-    let mut writer = SerializedFileWriter::new(Vec::new(), schema, properties)?;
-    let mut group = writer.next_row_group()?;
-
-    // Columns are written in schema order; each macro arm consumes the
-    // next one. Optionals carry definition levels (1 present, 0 null)
-    // and pack only the present values, as the format requires.
-    macro_rules! column {
-        ($type:ty, req $values:expr) => {{
-            let mut column = group.next_column()?.expect("schema column");
-            let values = $values;
-            column.typed::<$type>().write_batch(&values, None, None)?;
-            column.close()?;
-        }};
-        ($type:ty, opt $values:expr) => {{
-            let mut column = group.next_column()?.expect("schema column");
-            let options = $values;
-            let levels: Vec<i16> = options.iter().map(|value| value.is_some() as i16).collect();
-            let values: Vec<_> = options.into_iter().flatten().collect();
-            column
-                .typed::<$type>()
-                .write_batch(&values, Some(&levels), None)?;
-            column.close()?;
-        }};
-    }
-    let text = |value: &str| ByteArray::from(value.as_bytes().to_vec());
-    let each = spans.iter();
-
-    column!(ByteArrayType, req each.clone().map(|_| text(node)).collect::<Vec<_>>());
-    column!(ByteArrayType, req each.clone().map(|_| text(region)).collect::<Vec<_>>());
-    column!(ByteArrayType, req each.clone().map(|s| text(&hex(&s.ids.trace_id))).collect::<Vec<_>>());
-    column!(ByteArrayType, req each.clone().map(|s| text(&hex(&s.ids.span_id))).collect::<Vec<_>>());
-    column!(ByteArrayType, opt each.clone().map(|s| s.parent_span_id.map(|id| text(&hex(&id)))).collect::<Vec<_>>());
-    column!(ByteArrayType, req each.clone().map(|s| text(s.name)).collect::<Vec<_>>());
-    column!(Int32Type, req each.clone().map(|s| s.kind as i32).collect::<Vec<_>>());
-    column!(Int64Type, req each.clone().map(|s| s.start_unix_us).collect::<Vec<_>>());
-    column!(Int64Type, req each.clone().map(|s| s.duration_us).collect::<Vec<_>>());
-    column!(BoolType, req each.clone().map(|s| s.ok).collect::<Vec<_>>());
-    column!(ByteArrayType, opt each.clone().map(|s| s.error.as_deref().map(text)).collect::<Vec<_>>());
-    column!(ByteArrayType, opt each.clone().map(|s| s.request_id.as_deref().map(text)).collect::<Vec<_>>());
-    column!(ByteArrayType, opt each.clone().map(|s| s.cell.as_deref().map(text)).collect::<Vec<_>>());
-    column!(Int64Type, opt each.clone().map(|s| s.epoch.map(|v| v as i64)).collect::<Vec<_>>());
-    column!(Int64Type, opt each.clone().map(|s| s.isolate.map(|v| v as i64)).collect::<Vec<_>>());
-    column!(Int64Type, opt each.clone().map(|s| s.queue_wait_us).collect::<Vec<_>>());
-    column!(ByteArrayType, opt each.clone().map(|s| s.url.as_deref().map(text)).collect::<Vec<_>>());
-    column!(Int32Type, opt each.clone().map(|s| s.http_status.map(|v| v as i32)).collect::<Vec<_>>());
-    column!(BoolType, opt each.clone().map(|s| s.parent_remote).collect::<Vec<_>>());
-
-    group.close()?;
-    Ok(writer.into_inner()?)
+    // Point lookups by trace id are the one query a time-partitioned scan
+    // is bad at; the bloom filter is what makes them cheap.
+    parquet_batch::encode(MESSAGE_TYPE, &["trace_id"], |columns| {
+        let each = spans.iter();
+        columns.required::<ByteArrayType>(&each.clone().map(|_| text(node)).collect::<Vec<_>>())?;
+        columns
+            .required::<ByteArrayType>(&each.clone().map(|_| text(region)).collect::<Vec<_>>())?;
+        columns.required::<ByteArrayType>(
+            &each
+                .clone()
+                .map(|s| text(&hex(&s.ids.trace_id)))
+                .collect::<Vec<_>>(),
+        )?;
+        columns.required::<ByteArrayType>(
+            &each
+                .clone()
+                .map(|s| text(&hex(&s.ids.span_id)))
+                .collect::<Vec<_>>(),
+        )?;
+        columns.optional::<ByteArrayType>(
+            each.clone()
+                .map(|s| s.parent_span_id.map(|id| text(&hex(&id)))),
+        )?;
+        columns
+            .required::<ByteArrayType>(&each.clone().map(|s| text(s.name)).collect::<Vec<_>>())?;
+        columns.required::<Int32Type>(&each.clone().map(|s| s.kind as i32).collect::<Vec<_>>())?;
+        columns
+            .required::<Int64Type>(&each.clone().map(|s| s.start_unix_us).collect::<Vec<_>>())?;
+        columns.required::<Int64Type>(&each.clone().map(|s| s.duration_us).collect::<Vec<_>>())?;
+        columns.required::<BoolType>(&each.clone().map(|s| s.ok).collect::<Vec<_>>())?;
+        columns.optional::<ByteArrayType>(each.clone().map(|s| s.error.as_deref().map(text)))?;
+        columns
+            .optional::<ByteArrayType>(each.clone().map(|s| s.request_id.as_deref().map(text)))?;
+        columns.optional::<ByteArrayType>(each.clone().map(|s| s.cell.as_deref().map(text)))?;
+        columns.optional::<Int64Type>(each.clone().map(|s| s.epoch.map(|v| v as i64)))?;
+        columns.optional::<Int64Type>(each.clone().map(|s| s.isolate.map(|v| v as i64)))?;
+        columns.optional::<Int64Type>(each.clone().map(|s| s.queue_wait_us))?;
+        columns.optional::<ByteArrayType>(each.clone().map(|s| s.url.as_deref().map(text)))?;
+        columns.optional::<Int32Type>(each.clone().map(|s| s.http_status.map(|v| v as i32)))?;
+        columns.optional::<BoolType>(each.clone().map(|s| s.parent_remote))?;
+        Ok(())
+    })
 }
 
 #[doc(hidden)]
 pub fn encode_logs(logs: &[Log], node: &str, region: &str) -> anyhow::Result<Vec<u8>> {
-    use parquet::basic::Compression;
-    use parquet::basic::ZstdLevel;
-    use parquet::data_type::ByteArray;
     use parquet::data_type::ByteArrayType;
     use parquet::data_type::Int64Type;
-    use parquet::file::properties::WriterProperties;
-    use parquet::file::writer::SerializedFileWriter;
-    use parquet::schema::parser::parse_message_type;
-    use parquet::schema::types::ColumnPath;
-    use std::sync::Arc;
 
-    let schema = Arc::new(parse_message_type(LOG_MESSAGE_TYPE)?);
-    let properties = Arc::new(
-        WriterProperties::builder()
-            .set_compression(Compression::ZSTD(ZstdLevel::default()))
-            .set_column_bloom_filter_enabled(ColumnPath::from("trace_id"), true)
-            .build(),
-    );
-    let mut writer = SerializedFileWriter::new(Vec::new(), schema, properties)?;
-    let mut group = writer.next_row_group()?;
-
-    macro_rules! column {
-        ($type:ty, req $values:expr) => {{
-            let mut column = group.next_column()?.expect("schema column");
-            let values = $values;
-            column.typed::<$type>().write_batch(&values, None, None)?;
-            column.close()?;
-        }};
-        ($type:ty, opt $values:expr) => {{
-            let mut column = group.next_column()?.expect("schema column");
-            let options = $values;
-            let levels: Vec<i16> = options.iter().map(|value| value.is_some() as i16).collect();
-            let values: Vec<_> = options.into_iter().flatten().collect();
-            column
-                .typed::<$type>()
-                .write_batch(&values, Some(&levels), None)?;
-            column.close()?;
-        }};
-    }
-    let text = |value: &str| ByteArray::from(value.as_bytes().to_vec());
-    let each = logs.iter();
-
-    column!(ByteArrayType, req each.clone().map(|_| text(node)).collect::<Vec<_>>());
-    column!(ByteArrayType, req each.clone().map(|_| text(region)).collect::<Vec<_>>());
-    column!(ByteArrayType, opt each.clone().map(|l| l.trace_id.map(|id| text(&hex(&id)))).collect::<Vec<_>>());
-    column!(ByteArrayType, opt each.clone().map(|l| l.span_id.map(|id| text(&hex(&id)))).collect::<Vec<_>>());
-    column!(Int64Type, req each.clone().map(|l| l.time_unix_us).collect::<Vec<_>>());
-    column!(ByteArrayType, req each.clone().map(|l| text(&l.body)).collect::<Vec<_>>());
-
-    group.close()?;
-    Ok(writer.into_inner()?)
+    parquet_batch::encode(LOG_MESSAGE_TYPE, &["trace_id"], |columns| {
+        let each = logs.iter();
+        columns.required::<ByteArrayType>(&each.clone().map(|_| text(node)).collect::<Vec<_>>())?;
+        columns
+            .required::<ByteArrayType>(&each.clone().map(|_| text(region)).collect::<Vec<_>>())?;
+        columns.optional::<ByteArrayType>(
+            each.clone().map(|l| l.trace_id.map(|id| text(&hex(&id)))),
+        )?;
+        columns
+            .optional::<ByteArrayType>(each.clone().map(|l| l.span_id.map(|id| text(&hex(&id)))))?;
+        columns.required::<Int64Type>(&each.clone().map(|l| l.time_unix_us).collect::<Vec<_>>())?;
+        columns
+            .required::<ByteArrayType>(&each.clone().map(|l| text(&l.body)).collect::<Vec<_>>())?;
+        Ok(())
+    })
 }
