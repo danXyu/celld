@@ -6,7 +6,8 @@
 //! header per statement, so it can be read and run by hand:
 //!
 //! - `tables.sql`: `EXPORT_LANDING`, `CELL_CHANGES`, `CELL_META`,
-//!   `EXPORT_TOMBSTONES`, `EXPORT_RECONCILER_FINDINGS`;
+//!   `EXPORT_TOMBSTONES`, `EXPORT_RECONCILER_FINDINGS`, and the loader's
+//!   `EXPORT_DYNAMIC_TABLES`;
 //! - `load.sql`: the stage, `COPY INTO EXPORT_LANDING` from the files the
 //!   bucket sink writes ([`StageRow`] is their layout), the pipe, and the
 //!   tasks that route landed records past the tombstones into the two tables
@@ -18,12 +19,19 @@
 //!   which [`DynamicTable::render`] fills in from the table's `schema`
 //!   records.
 //!
-//! Pure: this crate renders SQL and runs nothing.
+//! [`loader`] deploys and drives these objects through a [`Warehouse`]: one
+//! statement at a time, so it runs the same against Snowflake and against the
+//! emulator. The `sql-api` feature adds [`sql_api::SqlApi`], a Warehouse on
+//! Snowflake's SQL API, and the `celld-export-loader` binary.
 
 mod dynamic_table;
+pub mod loader;
+#[cfg(feature = "sql-api")]
+pub mod sql_api;
 mod stage;
 
 pub use dynamic_table::{affinity, ColumnType, DynamicTable, ProjectedColumn};
+pub use loader::{Loader, LoaderConfig, Rows, Warehouse, WarehouseError};
 pub use stage::{StageRow, STAGE_COLUMNS};
 
 pub const TABLES_SQL: &str = include_str!("../sql/tables.sql");
@@ -235,7 +243,8 @@ mod tests {
                 "cell_changes",
                 "cell_meta",
                 "export_tombstones",
-                "export_reconciler_findings"
+                "export_reconciler_findings",
+                "export_dynamic_tables"
             ]
         );
         assert_eq!(

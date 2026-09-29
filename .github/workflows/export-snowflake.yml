@@ -1,0 +1,69 @@
+name: Export Snowflake
+
+# The change export's Snowflake side: the crate's Rust (with the loader's
+# `sql-api` feature), then its SQL and the celld-export-loader binary
+# against the Snowflake emulator in crates/export-snowflake/sqltest. The
+# emulator tests need Python and fakesnow, which the main CI job does not
+# install, so they run here, and only when the crates they test change.
+on:
+  pull_request:
+    paths:
+      - crates/export-snowflake/**
+      - crates/export-format/**
+      - .github/workflows/export-snowflake.yml
+  push:
+    branches:
+      - main
+    paths:
+      - crates/export-snowflake/**
+      - crates/export-format/**
+      - .github/workflows/export-snowflake.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: export-snowflake-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_VERSION: 1.97.1
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  test:
+    name: Rust and emulator tests
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy,rustfmt
+          rustup default "$RUST_VERSION"
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
+
+      - name: Format
+        run: cargo fmt -p celld-export-snowflake -p celld-export-format --check
+
+      - name: Clippy
+        run: cargo clippy -p celld-export-snowflake -p celld-export-format --all-targets --all-features --locked -- -D warnings
+
+      - name: Test
+        run: cargo test -p celld-export-snowflake -p celld-export-format --all-features --locked
+
+      # The SQL against synthetic records, and the loader binary end to end
+      # against an SQL API emulator. See the crate's README.
+      - name: Emulator tests
+        run: sh crates/export-snowflake/sqltest/run.sh

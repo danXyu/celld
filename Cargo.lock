@@ -388,10 +388,17 @@ dependencies = [
 name = "celld-export-snowflake"
 version = "0.0.0"
 dependencies = [
+ "base64 0.22.1",
  "celld-export-format",
+ "getrandom 0.3.4",
+ "pkcs8",
+ "rand_chacha 0.3.1",
+ "rsa",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.19",
+ "ureq",
 ]
 
 [[package]]

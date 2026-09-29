@@ -1,8 +1,10 @@
 # The change export's Snowflake side (docs/design/change-export.md#the-snowflake-loader):
 # the tables, the SQL that lands bucket-sink files into them, the views that
 # derive current state, and the Dynamic Table template. Pure: it renders SQL
-# and runs nothing. The loader (celld-export-loader) deploys and runs it; the
-# tests in sqltest/ run it against synthetic records on a Snowflake emulator.
+# and runs nothing, except through the loader module's `Warehouse` trait. The
+# `sql-api` feature adds a Warehouse on Snowflake's SQL API and the
+# celld-export-loader binary that deploys and drives it. The tests in
+# sqltest/ run the SQL and the binary against a Snowflake emulator.
 [package]
 name = "celld-export-snowflake"
 version = "0.0.0"
@@ -16,3 +18,21 @@ celld-export-format.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+base64 = { workspace = true, optional = true }
+getrandom = { workspace = true, optional = true }
+# Encrypted PKCS#8 keys: pkcs8's `encryption` feature.
+pkcs8 = { workspace = true, optional = true }
+rsa = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+ureq = { version = "3.4.0", optional = true }
+
+[features]
+sql-api = ["dep:base64", "dep:getrandom", "dep:pkcs8", "dep:rsa", "dep:sha2", "dep:ureq"]
+
+[dev-dependencies]
+rand_chacha = "0.3"
+
+[[bin]]
+name = "celld-export-loader"
+path = "src/bin/loader.rs"
+required-features = ["sql-api"]
