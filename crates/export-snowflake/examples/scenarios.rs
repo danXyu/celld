@@ -778,28 +778,33 @@ fn deletions() -> Scenario {
             through_incarnation: None,
         }),
     ));
-    // A bounded subtree delete (ordered facet incarnations): the facets
-    // opened before it, at or below the bound, go; the ones recreated after
-    // it, above the bound, stay.
-    let r3 = stream("r3");
-    put(&mut s, &r3, pos(1, 1, 1), 20);
-    let before = [facet("r3", "g", 10), facet("r3", "g/b", 11)];
-    let after = [facet("r3", "g", 30), facet("r3", "g/b", 31)];
-    let unrelated = facet("r3", "gx", 12);
-    for (n, st) in before.iter().chain(&after).chain([&unrelated]).enumerate() {
-        put(&mut s, st, pos(1, 1, 1), 30 + n as i64);
+    // A node's delete bounds incarnations: facets recreated after it, with
+    // larger incarnations, stay.
+    let root3 = stream("r3");
+    let bounded = [
+        (facet("r3", "g", 5), true),
+        (facet("r3", "g/h", 6), true),
+        (facet("r3", "g", 9), false),
+        (facet("r3", "g/h", 10), false),
+        (facet("r3", "k", 3), true),
+        (facet("r3", "k/l", 2), false),
+    ];
+    for (n, (st, _)) in bounded.iter().enumerate() {
+        put(&mut s, st, pos(1, 1, 1), 20 + n as i64);
     }
-    s.emit(record(
-        &r3,
-        pos(1, 2, 2),
-        Origin::Live,
-        Body::Deleted(DeletedBody {
-            facet: Some("g".into()),
-            incarnation: None,
-            subtree: true,
-            through_incarnation: Some(20),
-        }),
-    ));
+    for (path, subtree) in [("g", true), ("k", false)] {
+        s.emit(record(
+            &root3,
+            pos(1, 5, 5),
+            Origin::Live,
+            Body::Deleted(DeletedBody {
+                facet: Some(path.into()),
+                incarnation: None,
+                subtree,
+                through_incarnation: Some(if path == "g" { 6 } else { 3 }),
+            }),
+        ));
+    }
     s
 }
 

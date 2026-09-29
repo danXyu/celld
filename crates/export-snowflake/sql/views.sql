@@ -15,8 +15,7 @@
 -- statement: cell_streams
 -- Every stream seen, with the position a `deleted` record naming the stream
 -- removed it at, and whether it is gone entirely: named by a facet `deleted`
--- record on its root's stream, or erased. A facet `deleted` record never
--- becomes a tombstone.
+-- record on its root's stream, or erased. `facet_deletions` in consumer.rs.
 CREATE OR REPLACE VIEW CELL_STREAMS AS
 WITH streams AS (
     SELECT DISTINCT script, class, cell, facet, incarnation FROM CELL_META
@@ -45,20 +44,19 @@ facet_deleted AS (
     JOIN deletions d
       ON d.script = s.script AND d.class = s.class AND d.cell = s.cell
     WHERE d.target_facet IS NOT NULL
-      AND (
-          -- Facet incarnations are ordered, so a delete that carries
-          -- THROUGH_INCARNATION removes the facet and, for a subtree, the
-          -- facets under it, only up to that bound: one recreated after the
-          -- delete has a higher incarnation and stays.
-          (d.through_incarnation IS NOT NULL
-              AND (s.facet = d.target_facet
-                   OR (d.subtree AND STARTSWITH(s.facet, d.target_facet || '/')))
-              AND s.incarnation <= d.through_incarnation)
-          OR (d.through_incarnation IS NULL
-              AND ((s.facet = d.target_facet
-                       AND (d.target_incarnation IS NULL OR d.target_incarnation = s.incarnation))
-                   OR (d.subtree AND STARTSWITH(s.facet, d.target_facet || '/'))))
-      )
+      AND CASE
+          -- A node's delete bounds the ordered incarnations it removed, at
+          -- the path and, with SUBTREE, below it: a facet recreated after
+          -- the delete has a larger incarnation and stays.
+          WHEN d.through_incarnation IS NOT NULL THEN
+              (s.facet = d.target_facet
+                  OR (d.subtree AND STARTSWITH(s.facet, d.target_facet || '/')))
+              AND s.incarnation <= d.through_incarnation
+          ELSE
+              (s.facet = d.target_facet
+                  AND (d.target_incarnation IS NULL OR d.target_incarnation = s.incarnation))
+              OR (d.subtree AND STARTSWITH(s.facet, d.target_facet || '/'))
+      END
 ),
 erased AS (
     SELECT DISTINCT s.script, s.class, s.cell, s.facet, s.incarnation
@@ -130,7 +128,9 @@ WITH records AS (
             m.position_key, m.kind, m.origin,
             m.body:table::STRING, m.body:generation::STRING,
             m.body:snapshot_id::STRING,
-            m.body:target_facet::STRING, m.body:target_incarnation::STRING
+            m.body:target_facet::STRING,
+            COALESCE(m.body:target_incarnation::STRING, m.body:through_incarnation::STRING),
+            TO_JSON(m.body:tables)
         ORDER BY m.loaded_at, m.file_name
     ) = 1
 )
