@@ -950,11 +950,13 @@ pub(crate) fn embedded_facets(root: &str) -> Vec<String> {
 /// Drop `scope`'s connection (evict) so the replicator can release the
 /// file.
 pub fn close(scope: &str) {
-    // Pull the last writes before the session goes with the connection.
-    export_checkpoint_scope(scope);
     close_sync_list_cursors(scope);
     close_sql_cursors(scope);
     close_sql_statement_cache(scope);
+    // Pull the last writes before the session goes with the connection.
+    // After the cursors: finalizing an unfinished write cursor commits its
+    // implicit transaction.
+    export_checkpoint_scope(scope);
     sql_critical_errors(|errors| errors.borrow_mut().remove(scope));
     cells(|c| c.schema_cookies.borrow_mut().remove(scope));
     dbs(|d| d.borrow_mut().remove(scope));

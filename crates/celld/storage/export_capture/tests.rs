@@ -852,6 +852,23 @@ mod on_the_cell_connection {
     }
 
     #[test]
+    fn close_pulls_the_writes_of_an_unfinished_returning_cursor() {
+        let _cell = open(Some(settings()));
+        exec("CREATE TABLE u (id INTEGER PRIMARY KEY, v TEXT)");
+        let (_, _, first, _, done) = storage::sql_cursor_start(
+            CELL,
+            "INSERT INTO u VALUES (1, 'a'), (2, 'b') RETURNING id",
+            &[],
+        )
+        .unwrap();
+        assert!(first.is_some() && !done);
+        storage::close(CELL);
+        let commits = take();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(table(&commits[0], "u").rows.len(), 2);
+    }
+
+    #[test]
     fn close_pulls_the_last_writes() {
         let _cell = open(Some(settings()));
         exec("CREATE TABLE u (id INTEGER PRIMARY KEY, v TEXT)");
@@ -861,4 +878,120 @@ mod on_the_cell_connection {
         assert_eq!(commits.len(), 1);
         assert_eq!(table(&commits[0], "u").rows.len(), 1);
     }
+}
+
+const NULLABLE: &str = "
+    CREATE TABLE n (id TEXT PRIMARY KEY, v TEXT);
+    CREATE TABLE c (a TEXT, b INTEGER, v TEXT, PRIMARY KEY (a, b));
+    CREATE TABLE s (id TEXT NOT NULL PRIMARY KEY, v TEXT);
+    CREATE TABLE w (id TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID;
+";
+
+fn bulk_tables(commit: &CapturedCommit) -> Vec<&str> {
+    commit.bulk.iter().map(|t| t.table.as_str()).collect()
+}
+
+/// The session skips a row whose declared key holds `NULL`, which a rowid
+/// table allows. A table that holds such a row before or after the writes is
+/// exported as `bulk`, and its partial rows are dropped.
+#[test]
+fn a_null_key_insert_makes_the_table_bulk() {
+    let mut f = Fixture::new(NULLABLE);
+    f.run(
+        "INSERT INTO n VALUES (NULL, 'committed'), ('a', 'x');
+         INSERT INTO c VALUES ('k', NULL, 'committed');
+         INSERT INTO s VALUES ('a', 'x');",
+    );
+    let commit = f.pull();
+    assert_eq!(bulk_tables(&commit), ["n", "c"]);
+    assert_eq!(
+        commit
+            .tables
+            .iter()
+            .map(|t| t.table.as_str())
+            .collect::<Vec<_>>(),
+        ["s"]
+    );
+}
+
+#[test]
+fn updating_or_deleting_a_null_key_row_makes_the_table_bulk() {
+    let mut f = Fixture::new(NULLABLE);
+    f.run("INSERT INTO n VALUES (NULL, 'one');");
+    f.pull();
+    f.run("UPDATE n SET v = 'two' WHERE id IS NULL;");
+    assert_eq!(bulk_tables(&f.pull()), ["n"]);
+    f.run("DELETE FROM n WHERE id IS NULL;");
+    assert_eq!(bulk_tables(&f.pull()), ["n"]);
+    // Once no row has a NULL key, the table is tracked again.
+    f.run("INSERT INTO n VALUES ('a', 'x');");
+    let commit = f.pull();
+    assert!(commit.bulk.is_empty());
+    assert_eq!(table(&commit, "n").rows.len(), 1);
+}
+
+/// A key that is `NULL` only in the middle of the writes leaves no row the
+/// session skipped: moving a key off `NULL` is recorded as an insert of the
+/// new key.
+#[test]
+fn a_key_that_passes_through_null_is_still_captured() {
+    let mut f = Fixture::new(NULLABLE);
+    f.run("INSERT INTO n VALUES ('a', 'x');");
+    f.pull();
+    f.run(
+        "UPDATE n SET v = 'y' WHERE id = 'a';
+         INSERT INTO n VALUES (NULL, 'transient');
+         UPDATE n SET id = 'b' WHERE id IS NULL;
+         UPDATE n SET id = NULL WHERE id = 'a';
+         UPDATE n SET id = 'c' WHERE id IS NULL;",
+    );
+    let commit = f.pull();
+    assert!(commit.bulk.is_empty(), "{commit:?}");
+    let mut rows = table(&commit, "n").rows.clone();
+    rows.sort_by(|a, b| a.key().cmp(b.key()));
+    assert_eq!(
+        rows,
+        [
+            RowChange(Op::Delete, vec![text("a")], vec![text("a"), text("x")]),
+            RowChange(
+                Op::Insert,
+                vec![text("b")],
+                vec![text("b"), text("transient")]
+            ),
+            RowChange(Op::Insert, vec![text("c")], vec![text("c"), text("y")]),
+        ]
+    );
+}
+
+/// The first write the session sees to a table is the deletion of its only
+/// `NULL`-key row, which SQLite may already have removed from the key index
+/// when the filter runs.
+#[test]
+fn deleting_the_only_null_key_row_first_makes_the_table_bulk() {
+    for sql in [
+        "DELETE FROM n WHERE id IS NULL;",
+        "UPDATE n SET id = 'k' WHERE id IS NULL;",
+        "DELETE FROM c WHERE b IS NULL;",
+    ] {
+        let mut f = Fixture::new(NULLABLE);
+        f.run("INSERT INTO n VALUES (NULL, 'one'); INSERT INTO c VALUES ('k', NULL, 'one');");
+        f.pull();
+        f.run(sql);
+        let commit = f.pull();
+        assert_eq!(commit.bulk.len(), 1, "{sql}: {commit:?}");
+        assert!(commit.tables.is_empty(), "{sql}: {commit:?}");
+    }
+}
+
+#[test]
+fn keys_that_cannot_hold_null_are_not_probed() {
+    let mut f = Fixture::new(NULLABLE);
+    f.run("INSERT INTO s VALUES ('a', 'x'); INSERT INTO w VALUES ('a', 'x');");
+    f.pull();
+    assert!(f.capture.filter.traits.borrow()["s"]
+        .nullable_key
+        .is_empty());
+    assert!(f.capture.filter.traits.borrow()["w"]
+        .nullable_key
+        .is_empty());
 }
