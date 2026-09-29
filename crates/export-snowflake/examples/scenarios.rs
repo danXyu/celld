@@ -751,6 +751,7 @@ fn deletions() -> Scenario {
             facet: None,
             incarnation: None,
             subtree: false,
+            through_incarnation: None,
         }),
     ));
     put(&mut s, &root, pos(1, 3, 3), 2);
@@ -774,8 +775,36 @@ fn deletions() -> Scenario {
             facet: Some("f".into()),
             incarnation: Some(70),
             subtree: true,
+            through_incarnation: None,
         }),
     ));
+    // A node's delete bounds incarnations: facets recreated after it, with
+    // larger incarnations, stay.
+    let root3 = stream("r3");
+    let bounded = [
+        (facet("r3", "g", 5), true),
+        (facet("r3", "g/h", 6), true),
+        (facet("r3", "g", 9), false),
+        (facet("r3", "g/h", 10), false),
+        (facet("r3", "k", 3), true),
+        (facet("r3", "k/l", 2), false),
+    ];
+    for (n, (st, _)) in bounded.iter().enumerate() {
+        put(&mut s, st, pos(1, 1, 1), 20 + n as i64);
+    }
+    for (path, subtree) in [("g", true), ("k", false)] {
+        s.emit(record(
+            &root3,
+            pos(1, 5, 5),
+            Origin::Live,
+            Body::Deleted(DeletedBody {
+                facet: Some(path.into()),
+                incarnation: None,
+                subtree,
+                through_incarnation: Some(if path == "g" { 6 } else { 3 }),
+            }),
+        ));
+    }
     s
 }
 
@@ -1219,6 +1248,7 @@ fn random(seed: u64) -> Scenario {
                     facet: Some("f".into()),
                     incarnation: Some(77),
                     subtree: false,
+                    through_incarnation: None,
                 }),
             ));
         }
