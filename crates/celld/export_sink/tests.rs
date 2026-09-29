@@ -152,6 +152,8 @@ fn every_kind() -> Vec<Record> {
         Body::Recovered(RecoveredBody {
             session: "s".into(),
             head: position,
+            loss: false,
+            cells: 1,
         }),
         Body::Deleted(DeletedBody {
             facet: Some("child".into()),
