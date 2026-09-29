@@ -521,8 +521,11 @@ impl Capture {
     ) -> anyhow::Result<Self> {
         let mut denied = denied;
         // The deny list names tables as they are exported.
-        if denied.contains(kv::KV_TABLE) {
+        if denied.remove(kv::KV_TABLE) {
             denied.insert(kv::KV_SOURCE.to_string());
+        }
+        if denied.remove(kv::SQL_KV_TABLE) {
+            denied.insert(kv::KV_TABLE.to_string());
         }
         let filter = Box::new(FilterState {
             scope: scope.to_string(),
@@ -928,11 +931,11 @@ impl Capture {
         let carried: Vec<(TableGen, bool)> = snapshotted
             .map(|t| (t.table_gen(), true))
             .chain(tables.iter().map(|t| (t.table_gen(), false)))
-            .chain(bulk.iter().map(|tg| (tg.clone(), false)))
             .map(|(tg, always)| {
                 let table = self.storage_name(&tg.table).to_string();
                 (TableGen { table, ..tg }, always)
             })
+            .chain(bulk.iter().map(|tg| (tg.clone(), false)))
             .collect();
         for (tg, always) in carried {
             let present = schemas
@@ -972,13 +975,10 @@ impl Capture {
     /// The table in the cell that exported `table` came from: rows of
     /// `_cf_KV` are exported as `kv`.
     fn storage_name<'a>(&self, table: &'a str) -> &'a str {
-        if table == kv::KV_TABLE
-            && self.generations.contains_key(kv::KV_SOURCE)
-            && !self.generations.contains_key(kv::KV_TABLE)
-        {
-            kv::KV_SOURCE
-        } else {
-            table
+        match table {
+            kv::KV_TABLE => kv::KV_SOURCE,
+            kv::SQL_KV_TABLE => kv::KV_TABLE,
+            _ => table,
         }
     }
 
@@ -1432,19 +1432,44 @@ impl Capture {
     /// Take the session's changeset. The session is left as it was; the
     /// caller recreates it.
     fn changeset(&self) -> anyhow::Result<Vec<Change>> {
-        let mut size: c_int = 0;
-        let mut buffer: *mut c_void = ptr::null_mut();
-        // SAFETY: a live session; the buffer is freed below.
-        let rc = unsafe { ffi::sqlite3session_changeset(self.session, &mut size, &mut buffer) };
+        struct Output {
+            bytes: Vec<u8>,
+            limit: usize,
+        }
+        unsafe extern "C" fn write(context: *mut c_void, data: *const c_void, len: c_int) -> c_int {
+            // SQLite calls synchronously with a valid output context and chunk.
+            let out = unsafe { &mut *context.cast::<Output>() };
+            let Ok(len) = usize::try_from(len) else {
+                return ffi::SQLITE_ABORT;
+            };
+            if len > out.limit.saturating_sub(out.bytes.len()) {
+                return ffi::SQLITE_TOOBIG;
+            }
+            out.bytes
+                .extend_from_slice(unsafe { std::slice::from_raw_parts(data.cast::<u8>(), len) });
+            ffi::SQLITE_OK
+        }
+        let mut output = Output {
+            bytes: Vec::new(),
+            limit: self.settings.max_tx_bytes.min(c_int::MAX as u64) as usize,
+        };
+        let rc = unsafe {
+            ffi::sqlite3session_changeset_strm(
+                self.session,
+                Some(write),
+                (&mut output as *mut Output).cast(),
+            )
+        };
         anyhow::ensure!(
             rc == ffi::SQLITE_OK,
             "sqlite3session_changeset failed: {rc}"
         );
-        // SAFETY: `buffer` holds `size` bytes of changeset from SQLite.
-        let changes = unsafe { decode_changeset(size, buffer) };
-        // SAFETY: allocated by SQLite, or null when the changeset is empty.
-        unsafe { ffi::sqlite3_free(buffer) };
-        changes
+        unsafe {
+            decode_changeset(
+                output.bytes.len() as c_int,
+                output.bytes.as_mut_ptr().cast(),
+            )
+        }
     }
 
     /// Turn raw changes into whole-row records. Also returns the tables
@@ -1475,11 +1500,24 @@ impl Capture {
         }
         let mut tables = Vec::new();
         let mut bulk = Vec::new();
+        let mut budget = self.settings.max_tx_bytes;
         for table in order {
             let changes = by_table.remove(&table).unwrap_or_default();
+            let before = budget;
             let rows = self
-                .materialize_table(connection, &table, changes)
-                .and_then(|rows| kv::reshape(rows, &self.filter.scope, crate::export_kv::decode));
+                .materialize_table(connection, &table, changes, &mut budget)
+                .and_then(|rows| kv::reshape(rows, &self.filter.scope, crate::export_kv::decode))
+                .and_then(|rows| {
+                    if let Some(rows) = &rows {
+                        let bytes = serde_json::to_vec(rows)?.len() as u64;
+                        anyhow::ensure!(
+                            bytes <= before,
+                            "reshaped rows exceed export transaction budget"
+                        );
+                        budget = before - bytes;
+                    }
+                    Ok(rows)
+                });
             match rows {
                 Ok(Some(rows)) => tables.push(rows),
                 Ok(None) => {}
@@ -1500,6 +1538,7 @@ impl Capture {
         connection: &Connection,
         table: &str,
         changes: Vec<Change>,
+        budget: &mut u64,
     ) -> anyhow::Result<TableRows> {
         let shape = self.shape(connection, table)?.clone();
         let width = shape.changeset_columns();
@@ -1540,6 +1579,38 @@ impl Capture {
                 // insert, so an update's row is still found by its old key.
                 read_row(&mut lookup, &key)?
             };
+            let bytes: u64 = key.iter().chain(&row).map(encoded_size).sum();
+            anyhow::ensure!(
+                bytes <= *budget,
+                "materialized rows exceed export transaction budget"
+            );
+            *budget -= bytes;
+            if change.op == Op::Update && !shape.key.is_empty() {
+                let current_key: Vec<Value> = shape.key.iter().map(|&i| row[i].clone()).collect();
+                if current_key != key {
+                    // Non-binary collations may let SQLite match an old key to
+                    // a different spelling. Retire the exact exported old key.
+                    let extra: u64 = current_key.iter().map(encoded_size).sum::<u64>()
+                        + change.old[offset..]
+                            .iter()
+                            .zip(&row)
+                            .map(|(old, now)| encoded_size(old.as_ref().unwrap_or(now)))
+                            .sum::<u64>();
+                    anyhow::ensure!(
+                        extra <= *budget,
+                        "key update exceeds export transaction budget"
+                    );
+                    *budget -= extra;
+                    let old_row = change.old[offset..]
+                        .iter()
+                        .zip(&row)
+                        .map(|(old, now)| old.as_ref().unwrap_or(now).clone())
+                        .collect();
+                    rows.push(RowChange(Op::Delete, key, old_row));
+                    rows.push(RowChange(Op::Insert, current_key, row));
+                    continue;
+                }
+            }
             rows.push(RowChange(change.op, key, row));
         }
         Ok(TableRows {
@@ -1783,6 +1854,7 @@ fn exported_schema(mut schema: SchemaBody) -> SchemaBody {
         generated: false,
     };
     match schema.table.as_str() {
+        kv::KV_TABLE => schema.table = kv::SQL_KV_TABLE.to_string(),
         kv::KV_SOURCE => {
             schema.table = kv::KV_TABLE.to_string();
             if !schema.columns.is_empty() {
@@ -1795,6 +1867,9 @@ fn exported_schema(mut schema: SchemaBody) -> SchemaBody {
         }
         _ => {}
     }
+    schema.renamed_from = schema
+        .renamed_from
+        .map(|t| kv::exported_name(&t).to_string());
     schema
 }
 

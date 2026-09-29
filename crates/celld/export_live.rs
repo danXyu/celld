@@ -93,7 +93,9 @@ use celld_export_format::{
 };
 use celld_logic::export::{Attribution, Capture, CapturedWal, Released, WalGeneration, WalPoint};
 use celld_logic::RequestError;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use rusqlite::OptionalExtension as _;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -348,6 +350,7 @@ pub struct Exporter {
     /// Set while the delivery task handles a batch of results, which can
     /// submit watermarks and gaps of its own.
     delivering: AtomicBool,
+    delivery_failed: AtomicBool,
     counters: Counters,
     /// Proves facet streams durable; installed by the cell runtime.
     replication: OnceLock<crate::ltx_replication::Replication>,
@@ -420,6 +423,7 @@ impl Exporter {
             advances: Mutex::new(BTreeMap::new()),
             wake,
             delivering: AtomicBool::new(false),
+            delivery_failed: AtomicBool::new(false),
             counters: Counters::default(),
             replication: OnceLock::new(),
             relays: Mutex::new(HashMap::new()),
@@ -708,6 +712,9 @@ impl Exporter {
         // watermarks, which need a flush of their own; stop once a flush
         // leaves nothing submitted and nothing being delivered.
         loop {
+            if self.delivery_failed.load(Ordering::SeqCst) {
+                break;
+            }
             self.sink.flush();
             crate::asyncrt::sleep(Duration::from_millis(20)).await;
             let unresolved = !self
@@ -742,17 +749,21 @@ impl Exporter {
             "attribution_mismatches": load(&c.attribution_mismatches),
             "delivered_records": load(&c.delivered_records),
             "watermarks": load(&c.watermarks),
+            "delivery_failed": self.delivery_failed.load(Ordering::SeqCst),
         })
     }
 
     /// Submit records in order, registering what delivery needs first.
     fn submit(&self, records: Vec<(Record, Submitted)>) {
-        if records.is_empty() {
+        if records.is_empty() || self.delivery_failed.load(Ordering::SeqCst) {
             return;
         }
         let mut batch = Vec::with_capacity(records.len());
         {
             let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+            if self.delivery_failed.load(Ordering::SeqCst) {
+                return;
+            }
             for (record, meta) in records {
                 let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
                 submitted.insert(seq, meta);
@@ -772,8 +783,14 @@ impl Exporter {
     /// Let the stream's delivered position reach `meta.position` once every
     /// record submitted before now is acknowledged. It carries no record.
     fn advance(&self, meta: Submitted) {
+        if self.delivery_failed.load(Ordering::SeqCst) {
+            return;
+        }
         {
             let _submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+            if self.delivery_failed.load(Ordering::SeqCst) {
+                return;
+            }
             let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
             self.advances
                 .lock()
@@ -949,6 +966,8 @@ struct Stream {
     /// ticket for a facet delete asks for.
     last_position: u64,
     sequencer: Sequencer<Option<CapturedCommit>>,
+    /// After the first attribution gap, repair must establish a new baseline.
+    gapped: bool,
 }
 
 /// A facet delete waiting on its root's stream.
@@ -1097,6 +1116,7 @@ impl Stream {
             counted_commits: 0,
             last_position: 0,
             sequencer: Sequencer::default(),
+            gapped: false,
         }
     }
 
@@ -1367,6 +1387,9 @@ impl Stream {
     /// Every later commit is labelled above the released position, and
     /// every later gap sorts after it (see `last_txid`).
     fn advance(&mut self) {
+        if self.gapped {
+            return;
+        }
         let released = self.attribution.released_position();
         let position = Position::new(self.key.1, released, self.next_commit - 1);
         if position <= self.delivered {
@@ -1439,6 +1462,9 @@ impl Stream {
         let max_record = self.exporter.config.max_record_bytes;
         let mut out: Vec<(Record, Submitted)> = Vec::new();
         for entry in released {
+            if self.gapped {
+                break;
+            }
             let entry = match entry {
                 // A commit with no exported row takes no position; the
                 // released position covers its TXID.
@@ -1574,6 +1600,7 @@ impl Stream {
                     unmatched,
                     overflowed,
                 }) => {
+                    self.gapped = true;
                     self.exporter.counters.gaps.fetch_add(1, Ordering::Relaxed);
                     let position = Position::new(epoch, self.last_txid.max(after), number);
                     records.push(Record {
@@ -1616,7 +1643,7 @@ impl Stream {
 }
 
 /// What delivery knows about one stream.
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct Delivered {
     stream: Option<(StreamId, Option<String>)>,
     /// The newest position whose commit is wholly acknowledged.
@@ -1624,6 +1651,7 @@ struct Delivered {
     /// The `through` of the last watermark submitted.
     marked: Option<Position>,
     /// Whole records acknowledged since the last watermark, per position.
+    #[serde(with = "acked_entries")]
     acked: BTreeMap<Position, u64>,
     frozen: bool,
 }
@@ -1637,13 +1665,120 @@ fn delivery_key(meta: &Submitted) -> DeliveryKey {
     (meta.key.0.clone(), meta.key.1, meta.stream.incarnation)
 }
 
+// Historical residencies must not remain in RAM or be scanned on every ack.
+// Keep a small hot set and spill the rest to a process-local SQLite file. The
+// saved counts also preserve the chain when a cell reopens in the same epoch.
+const DELIVERY_CACHE_SIZE: usize = 256;
+
+struct DeliveryStates {
+    hot: BTreeMap<DeliveryKey, (u64, Delivered)>,
+    clock: u64,
+    cold: rusqlite::Connection,
+}
+
+impl DeliveryStates {
+    fn new() -> anyhow::Result<Self> {
+        let cold = rusqlite::Connection::open("")?;
+        cold.execute_batch(
+            "PRAGMA cache_size=-1024; PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF;
+            CREATE TABLE delivery (key TEXT PRIMARY KEY, value BLOB NOT NULL);",
+        )?;
+        Ok(Self {
+            hot: BTreeMap::new(),
+            clock: 0,
+            cold,
+        })
+    }
+
+    fn get(&mut self, key: DeliveryKey) -> anyhow::Result<&mut Delivered> {
+        self.clock += 1;
+        if !self.hot.contains_key(&key) {
+            if self.hot.len() >= DELIVERY_CACHE_SIZE {
+                let oldest = self
+                    .hot
+                    .iter()
+                    .min_by_key(|(_, (used, _))| used)
+                    .unwrap()
+                    .0
+                    .clone();
+                let (_, state) = self.hot.remove(&oldest).unwrap();
+                self.cold.execute(
+                    "INSERT OR REPLACE INTO delivery VALUES (?1, ?2)",
+                    rusqlite::params![serde_json::to_string(&oldest)?, serde_json::to_vec(&state)?],
+                )?;
+            }
+            let encoded = serde_json::to_string(&key)?;
+            let bytes: Option<Vec<u8>> = self
+                .cold
+                .query_row(
+                    "SELECT value FROM delivery WHERE key=?1",
+                    [&encoded],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let state = bytes
+                .map(|bytes| serde_json::from_slice(&bytes))
+                .transpose()?
+                .unwrap_or_default();
+            self.cold
+                .execute("DELETE FROM delivery WHERE key=?1", [&encoded])?;
+            self.hot.insert(key.clone(), (self.clock, state));
+        }
+        let (used, state) = self.hot.get_mut(&key).unwrap();
+        *used = self.clock;
+        Ok(state)
+    }
+}
+
+mod acked_entries {
+    use super::*;
+    pub fn serialize<S: serde::Serializer>(
+        map: &BTreeMap<Position, u64>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        map.iter().collect::<Vec<_>>().serialize(serializer)
+    }
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<BTreeMap<Position, u64>, D::Error> {
+        Ok(Vec::<(Position, u64)>::deserialize(deserializer)?
+            .into_iter()
+            .collect())
+    }
+}
+
 /// Read the sink's results, advance delivered positions, and submit
 /// watermarks and gaps.
-async fn deliver(exporter: Arc<Exporter>, mut outcomes: mpsc::UnboundedReceiver<Outcome>) {
-    let mut streams: BTreeMap<DeliveryKey, Delivered> = BTreeMap::new();
+async fn deliver(exporter: Arc<Exporter>, outcomes: mpsc::UnboundedReceiver<Outcome>) {
+    if let Err(error) = deliver_inner(&exporter, outcomes).await {
+        // A failed spill must never reset a watermark's counts. Stop exporting;
+        // the next link/reconciliation reports the uncertified tail.
+        exporter.delivery_failed.store(true, Ordering::SeqCst);
+        exporter
+            .submitted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        exporter
+            .advances
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        exporter.delivering.store(false, Ordering::SeqCst);
+        tracing::error!(%error, "export: delivery bookkeeping failed; export stopped");
+    }
+}
+
+async fn deliver_inner(
+    exporter: &Exporter,
+    mut outcomes: mpsc::UnboundedReceiver<Outcome>,
+) -> anyhow::Result<()> {
+    let mut streams = DeliveryStates::new()?;
     while let Some(outcome) = outcomes.recv().await {
         exporter.delivering.store(true, Ordering::SeqCst);
+        streams.cold.execute_batch("BEGIN;")?;
         let mut follow_up: Vec<(Record, Submitted)> = Vec::new();
+        let mut dirty = BTreeSet::new();
         for (seq, result) in outcome.results {
             let Some(meta) = exporter
                 .submitted
@@ -1663,7 +1798,9 @@ async fn deliver(exporter: Arc<Exporter>, mut outcomes: mpsc::UnboundedReceiver<
                 }
                 continue;
             }
-            let state = streams.entry(delivery_key(&meta)).or_default();
+            let key = delivery_key(&meta);
+            dirty.insert(key.clone());
+            let state = streams.get(key)?;
             state.stream = Some((meta.stream.clone(), meta.cell_name.clone()));
             if state.frozen {
                 continue;
@@ -1714,15 +1851,18 @@ async fn deliver(exporter: Arc<Exporter>, mut outcomes: mpsc::UnboundedReceiver<
                 }
             }
         }
-        resolve_advances(&exporter, &mut streams);
-        for (key, state) in &mut streams {
-            let (Some(through), Some((stream, cell_name))) = (state.position, state.stream.clone())
-            else {
+        resolve_advances(exporter, &mut streams, &mut dirty)?;
+        for key in dirty {
+            let state = streams.get(key.clone())?;
+            let Some(through) = state.position else {
                 continue;
             };
             if state.frozen || state.marked.is_some_and(|marked| marked >= through) {
                 continue;
             }
+            let Some((stream, cell_name)) = state.stream.clone() else {
+                continue;
+            };
             // Records of a commit whose last record is still in flight lie
             // past `through` and wait for the next watermark.
             let later = state.acked.split_off(&Position {
@@ -1760,13 +1900,19 @@ async fn deliver(exporter: Arc<Exporter>, mut outcomes: mpsc::UnboundedReceiver<
             ));
             state.marked = Some(through);
         }
+        streams.cold.execute_batch("COMMIT;")?;
         exporter.submit(follow_up);
         exporter.delivering.store(false, Ordering::SeqCst);
     }
+    Ok(())
 }
 
 /// Apply the advances that nothing submitted before them still holds up.
-fn resolve_advances(exporter: &Exporter, streams: &mut BTreeMap<DeliveryKey, Delivered>) {
+fn resolve_advances(
+    exporter: &Exporter,
+    streams: &mut DeliveryStates,
+    dirty: &mut BTreeSet<DeliveryKey>,
+) -> anyhow::Result<()> {
     let ready = {
         let submitted = exporter.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let mut advances = exporter.advances.lock().unwrap_or_else(|e| e.into_inner());
@@ -1779,12 +1925,15 @@ fn resolve_advances(exporter: &Exporter, streams: &mut BTreeMap<DeliveryKey, Del
         }
     };
     for meta in ready.into_values() {
-        let state = streams.entry(delivery_key(&meta)).or_default();
+        let key = delivery_key(&meta);
+        dirty.insert(key.clone());
+        let state = streams.get(key)?;
         state.stream = Some((meta.stream, meta.cell_name));
         if !state.frozen && state.position.is_none_or(|at| at < meta.position) {
             state.position = Some(meta.position);
         }
     }
+    Ok(())
 }
 
 /// Where a residency's link sits: after every position an earlier residency
@@ -2466,5 +2615,64 @@ mod tests {
                 size: 2 * (4096 + 24),
             })
         );
+    }
+    #[test]
+    fn gap_records_are_bounded_during_sink_outage() {
+        let budget = 65536;
+        let (exporter, sink, _outcomes) = exporter(budget);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut stream = Stream::new(
+            exporter,
+            ("Items:a".into(), 1),
+            ActivationLink {
+                start_txid: 0,
+                prev_epoch: None,
+                prev_txid: None,
+                mode: ActivationMode::Fresh,
+            },
+            tx.downgrade(),
+        );
+        for i in 1..=1000 {
+            // The per-commit result when the sink is full but durability keeps succeeding.
+            stream.release(vec![Out::Released(Released::Gap {
+                after: i - 1,
+                through: i,
+                unmatched: 0,
+                overflowed: 1,
+            })]);
+        }
+        stream.advance();
+        assert!(stream.exporter.advances.lock().unwrap().is_empty());
+        let held = sink.held.lock().unwrap();
+        assert_eq!(held.len(), 1);
+        let bytes: usize = held.iter().map(|r| r.record.to_json().len()).sum();
+        assert!(
+            bytes <= budget,
+            "{} queued gap records occupy {bytes} bytes for budget {budget}",
+            held.len()
+        );
+    }
+
+    #[test]
+    fn delivery_cache_preserves_same_epoch_counts_after_eviction() {
+        let mut states = DeliveryStates::new().unwrap();
+        let key = ("Items:a".to_string(), 1, 1);
+        let at = Position::new(1, 3, 1);
+        let state = states.get(key.clone()).unwrap();
+        state.marked = Some(at);
+        state.position = Some(at);
+        state.acked.insert(Position::new(1, 4, 2), 3);
+        for epoch in 2..=1000 {
+            states.get(("Items:a".into(), epoch, 1)).unwrap();
+        }
+        assert_eq!(states.hot.len(), DELIVERY_CACHE_SIZE);
+        let resumed = states.get(key).unwrap();
+        assert_eq!(resumed.marked, Some(at));
+        assert_eq!(resumed.acked[&Position::new(1, 4, 2)], 3);
+        resumed.frozen = true;
+        for epoch in 1001..=2000 {
+            states.get(("Items:a".into(), epoch, 1)).unwrap();
+        }
+        assert!(states.get(("Items:a".into(), 1, 1)).unwrap().frozen);
     }
 }

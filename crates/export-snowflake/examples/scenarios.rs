@@ -1325,7 +1325,10 @@ fn expected(s: &Scenario) -> Json {
                 .map(|g| match g {
                     Gap::Reported { to, .. } => json!(["gap", to.epoch, to.txid]),
                     Gap::Link { prev_epoch, prev_txid, .. } => json!(["link", prev_epoch, prev_txid]),
-                    Gap::Recovered { head, .. } => json!(["recovered", head.epoch, head.txid]),
+                    Gap::Recovered { head, certified, loss } => {
+                        let bound = if *loss { certified.map_or(head.txid, |c| c.txid.max(head.txid)) } else { head.txid };
+                        json!(["recovered", head.epoch, bound])
+                    },
                 })
                 .collect();
             json!({
@@ -1379,6 +1382,87 @@ fn dynamic_tables(s: &Scenario) -> Vec<Json> {
         .collect()
 }
 
+/// Scriptless recovery records adopt root/facet incarnations, and a declared
+/// loss beyond the recovered head remains visible until a snapshot covers the
+/// certified changes (not merely the lower recovered head).
+fn recovery() -> Scenario {
+    let mut s = Scenario::new("recovery");
+    for (cell, loss, cut) in [
+        ("lost", true, None),
+        ("ahead", false, None),
+        ("short-cut", true, Some(5)),
+        ("covered", true, Some(10)),
+    ] {
+        let target = stream(cell);
+        s.watermark(&target, None, pos(1, 10, 1));
+        let mut unknown = target.clone();
+        unknown.script.clear();
+        unknown.incarnation = 0;
+        s.emit(record(
+            &unknown,
+            pos(1, 5, 100),
+            Origin::Live,
+            Body::Recovered(RecoveredBody {
+                session: "dead/1".into(),
+                head: pos(1, 5, 100),
+                loss,
+                cells: 4,
+            }),
+        ));
+        if let Some(txid) = cut {
+            s.emit(record(
+                &target,
+                pos(1, txid, 100),
+                Origin::Repair,
+                Body::SnapshotEnd(SnapshotEndBody {
+                    snapshot_id: format!("{cell}-cut"),
+                    scope: SnapshotScope::Stream,
+                    tables: vec![],
+                    records: 0,
+                }),
+            ));
+        }
+    }
+    // The newest root incarnation <= recovery's epoch, for each script.
+    for incarnation in [1, 3, 7] {
+        let mut target = stream("recreated");
+        target.incarnation = incarnation;
+        s.watermark(&target, None, pos(incarnation, 0, 0));
+    }
+    let mut unknown = stream("recreated");
+    unknown.script.clear();
+    unknown.incarnation = 0;
+    s.emit(record(
+        &unknown,
+        pos(5, 9, 100),
+        Origin::Live,
+        Body::Recovered(RecoveredBody {
+            session: "dead/5".into(),
+            head: pos(5, 9, 100),
+            loss: false,
+            cells: 1,
+        }),
+    ));
+    // Facet incarnation numbers are not compared to the recovered epoch.
+    for incarnation in [100, 200] {
+        s.watermark(&facet("faceted", "child", incarnation), None, pos(1, 0, 0));
+    }
+    let mut unknown = facet("faceted", "child", 0);
+    unknown.script.clear();
+    s.emit(record(
+        &unknown,
+        pos(1, 9, 100),
+        Origin::Live,
+        Body::Recovered(RecoveredBody {
+            session: "dead/1".into(),
+            head: pos(1, 9, 100),
+            loss: false,
+            cells: 1,
+        }),
+    ));
+    s
+}
+
 fn main() {
     let random_count: u64 = std::env::args()
         .nth(1)
@@ -1391,6 +1475,7 @@ fn main() {
         generations(),
         deletions(),
         certification(),
+        recovery(),
         tombstones(),
     ];
     all.extend((1..=random_count).map(random));

@@ -225,7 +225,7 @@ def check(w, scenario):
 
 
 def scenario_names():
-    names = ["basic", "fragments", "snapshots", "generations", "deletions", "certification", "tombstones"]
+    names = ["basic", "fragments", "snapshots", "generations", "deletions", "certification", "recovery", "tombstones"]
     return names + [f"random_{n}" for n in range(1, int(RANDOM_COUNT) + 1)]
 
 

@@ -49,12 +49,16 @@ const HELP: &str = "celld export reconcile | verify | erase
 
   --export-bucket B   Where the export writes, if not the fleet bucket
                       (or CELLD_EXPORT_BUCKET)
+  --cache PATH        Reuse a local SQLite index of export objects
+  --max-cell-history N  Maximum encoded bytes evaluated per cell (default 67108864)
   --json              One JSON object per line
 ";
 
 struct Command {
     fleet: FleetFlags,
     export_bucket: Option<String>,
+    cache: Option<std::path::PathBuf>,
+    max_cell_history: usize,
     json: bool,
     settle: Duration,
     dry_run: bool,
@@ -73,6 +77,8 @@ impl Command {
         let mut command = Command {
             fleet: FleetFlags::default(),
             export_bucket: None,
+            cache: None,
+            max_cell_history: super::cache::MAX_CELL_HISTORY,
             json: false,
             settle: DEFAULT_SETTLE,
             dry_run: false,
@@ -98,6 +104,16 @@ impl Command {
             match argument.as_str() {
                 "--help" | "-h" => return Ok(None),
                 "--export-bucket" => command.export_bucket = Some(value("--export-bucket")?),
+                "--cache" => command.cache = Some(value("--cache")?.into()),
+                "--max-cell-history" => {
+                    command.max_cell_history = value("--max-cell-history")?
+                        .parse()
+                        .context("--max-cell-history takes a positive byte count")?;
+                    anyhow::ensure!(
+                        command.max_cell_history > 0,
+                        "--max-cell-history must be positive"
+                    );
+                }
                 "--json" => command.json = true,
                 "--settle" => {
                     command.settle = crate::export::parse_interval("--settle", &value("--settle")?)?
@@ -131,6 +147,25 @@ impl Command {
             );
         }
         Ok(Some(command))
+    }
+
+    async fn consumer(
+        &self,
+        export: &Bucket,
+        cell: Option<String>,
+    ) -> anyhow::Result<BucketConsumer> {
+        let storage = self.fleet.clone().resolve("celld export audit")?;
+        let identity = serde_json::to_string(&(
+            export.scheme(),
+            &export.name,
+            &export.prefix,
+            export.store.to_string(),
+            &storage.endpoint,
+            &storage.region,
+        ))?;
+        BucketConsumer::load_cached(export.clone(), self.cache.as_deref(), &identity, cell)
+            .await?
+            .with_history_limit(self.max_cell_history)
     }
 
     fn format(&self) -> Format {
@@ -202,7 +237,16 @@ impl Record for Row {
     }
 }
 
-async fn run_reconcile(command: Command) -> anyhow::Result<()> {
+async fn run_reconcile(mut command: Command) -> anyhow::Result<()> {
+    // A scheduled run reuses its index even without an operator-selected path.
+    let temporary = if command.cache.is_none() {
+        Some(tempfile::NamedTempFile::new()?)
+    } else {
+        None
+    };
+    if let Some(file) = &temporary {
+        command.cache = Some(file.path().to_path_buf());
+    }
     let config = config()?;
     let (fleet, export) = command.buckets("celld export reconcile").await?;
     loop {
@@ -232,7 +276,7 @@ async fn reconcile_once(
     }
     let heads = inventory.heads().await;
     let tombstones = tombstone::load(export).await?;
-    let consumer = BucketConsumer::load(export.clone()).await?;
+    let consumer = command.consumer(export, None).await?;
     let streams = consumer.streams().await?;
     let recovered = consumer.recovered().await?;
     let broken = inventory.broken(&heads);
@@ -288,7 +332,7 @@ async fn reconcile_once(
 async fn run_verify(command: Command) -> anyhow::Result<()> {
     let config = config()?;
     let (fleet, export) = command.buckets("celld export verify").await?;
-    let consumer = BucketConsumer::load(export.clone()).await?;
+    let consumer = command.consumer(&export, command.cell.clone()).await?;
     let streams = consumer.streams().await?;
     let chosen = match &command.cell {
         Some(cell) => {
@@ -382,7 +426,7 @@ async fn run_erase(command: Command) -> anyhow::Result<()> {
             })
             .collect()
     } else {
-        let consumer = BucketConsumer::load(export.clone()).await?;
+        let consumer = command.consumer(&export, command.cell.clone()).await?;
         let held: Vec<StreamId> = consumer
             .streams()
             .await?

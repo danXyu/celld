@@ -1901,3 +1901,157 @@ mod on_the_cell_connection {
         assert_eq!(table(&commits[0], "u").rows.len(), 1);
     }
 }
+
+#[test]
+fn after_images_obey_capture_budget() {
+    let mut f = Fixture::with_settings(
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB)",
+        Settings {
+            max_tx_bytes: 65536,
+        },
+    );
+    f.run("BEGIN");
+    for i in 0..64 {
+        f.run(&format!("INSERT INTO t VALUES ({i}, zeroblob(65536))"));
+        assert_eq!(f.checkpoint(), Checkpoint::Deferred);
+    }
+    f.run("COMMIT");
+    let commit = f.pull();
+    assert!(
+        !commit.bulk.is_empty(),
+        "4 MiB afterimages from 64 separate statements materialized under a 64 KiB budget; rows={}",
+        commit.tables.len()
+    );
+}
+
+#[test]
+fn collated_key_updates_leave_no_phantom() {
+    for (collation, replacement) in [("NOCASE", "A"), ("RTRIM", "a ")] {
+        let mut f = Fixture::new(&format!(
+            "CREATE TABLE t(k TEXT PRIMARY KEY COLLATE {collation}, v TEXT)"
+        ));
+        let mut consumer = Consumer::new();
+        for sql in [
+            "INSERT INTO t VALUES ('a', 'one')".to_string(),
+            format!("UPDATE t SET k = '{replacement}', v = 'two'"),
+            "DELETE FROM t".to_string(),
+        ] {
+            f.run(&sql);
+            ingest(&mut consumer, &f.pull());
+            let expected: BTreeMap<Vec<Value>, Vec<Value>> = f
+                .connection
+                .prepare("SELECT k, v FROM t")
+                .unwrap()
+                .query_map([], |row| {
+                    let key = from_row(row.get_ref(0)?);
+                    Ok((vec![key.clone()], vec![key, from_row(row.get_ref(1)?)]))
+                })
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(
+                consumer
+                    .stream(&stream())
+                    .unwrap()
+                    .table("t")
+                    .map(|t| t.rows.clone())
+                    .unwrap_or_default(),
+                expected,
+                "{collation}: {sql}"
+            );
+        }
+    }
+}
+
+#[test]
+fn user_kv_table_does_not_collide_with_storage_kv() {
+    let mut f = Fixture::new(
+        "CREATE TABLE kv(id INTEGER PRIMARY KEY, v TEXT);
+        CREATE TABLE _cf_KV(scope TEXT, k TEXT, v, PRIMARY KEY(scope,k)) WITHOUT ROWID;",
+    );
+    f.run("INSERT INTO kv VALUES(1, 'sql'); INSERT INTO _cf_KV VALUES('cell-a', 'api-key', '42');");
+    let commit = f.pull();
+    assert_eq!(commit.tables.len(), 2);
+    assert_eq!(
+        commit
+            .schemas
+            .iter()
+            .map(|s| s.table.as_str())
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from(["kv", "_cf_SQL_kv"])
+    );
+    let keys: std::collections::BTreeSet<_> = commit
+        .tables
+        .iter()
+        .map(|t| (&t.table, t.generation))
+        .collect();
+    assert_eq!(
+        keys.len(),
+        commit.tables.len(),
+        "distinct source tables share an export identity: {:?}",
+        commit.tables
+    );
+}
+
+#[test]
+fn small_changesets_cannot_expand_to_unbounded_afterimages() {
+    let mut f = Fixture::with_settings(
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB, n INTEGER);
+        WITH RECURSIVE ids(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM ids WHERE i<64)
+        INSERT INTO t SELECT i, zeroblob(32768), 0 FROM ids;",
+        Settings {
+            max_tx_bytes: 65536,
+        },
+    );
+    f.run("UPDATE t SET n=1");
+    let commit = f.pull();
+    assert_eq!(
+        commit.bulk,
+        vec![TableGen {
+            table: "t".into(),
+            generation: 1
+        }]
+    );
+    assert!(commit.tables.is_empty());
+}
+
+#[test]
+fn kv_deny_rules_address_the_two_exported_names_independently() {
+    for (denied, expected) in [("kv", "_cf_SQL_kv"), ("_cf_SQL_kv", "kv")] {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE kv(id INTEGER PRIMARY KEY, v TEXT);
+            CREATE TABLE _cf_KV(scope TEXT, k TEXT, v, PRIMARY KEY(scope,k)) WITHOUT ROWID;",
+            )
+            .unwrap();
+        let mut capture = Capture::install(
+            &connection,
+            SCOPE,
+            settings(),
+            HashSet::from([denied.to_string()]),
+            DirtyList::default(),
+        )
+        .unwrap();
+        connection.execute_batch("INSERT INTO kv VALUES (1, 'sql'); INSERT INTO _cf_KV VALUES ('cell-a', 'api', '42');").unwrap();
+        let Checkpoint::Pulled(commit) = capture.checkpoint(&connection, 0) else {
+            panic!("expected captured commit")
+        };
+        assert_eq!(
+            commit
+                .tables
+                .iter()
+                .map(|t| t.table.as_str())
+                .collect::<Vec<_>>(),
+            [expected]
+        );
+        assert_eq!(
+            commit
+                .schemas
+                .iter()
+                .map(|t| t.table.as_str())
+                .collect::<Vec<_>>(),
+            [expected]
+        );
+    }
+}
