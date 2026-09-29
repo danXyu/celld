@@ -235,8 +235,10 @@ async fn reconcile_once(
     let consumer = BucketConsumer::load(export.clone()).await?;
     let streams = consumer.streams().await?;
     let recovered = consumer.recovered().await?;
+    let broken = inventory.broken(&heads);
     let result = reconcile(
         &heads,
+        &broken,
         inventory.losses(),
         &streams,
         &recovered,

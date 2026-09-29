@@ -92,9 +92,12 @@ through the same interface (`export_audit::ConsumerView`).
   when the consumer certified changes the cell no longer has (past the end
   of a closed epoch, in a skipped epoch, or past the head after the
   producing node declared a loss), `missing_deleted` for a facet that has
-  objects no more while its root does, and `unknown_stream` for an exported
-  cell the consumer has never seen. Differences count only once they are
-  older than `--settle` (default `1h`). It writes the findings to
+  no objects at all while its root does, `unknown_stream` for an exported
+  cell the consumer has never seen, and `unrestorable` for a cell whose
+  objects form no restorable chain. A difference counts only once the
+  evidence it rests on is older than `--settle` (default `1h`): for a gap,
+  when the first change the consumer lacks reached the bucket, not the
+  cell's latest write, so a busy cell cannot defer an old gap. It writes the findings to
   `export/reconcile/` and `gap` and `deleted` records, with
   `origin: repair` and `node: reconciler`, to `export/changes/reconciler/`.
   `--dry-run` writes nothing; `--schedule` repeats every

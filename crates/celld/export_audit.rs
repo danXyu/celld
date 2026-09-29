@@ -115,6 +115,10 @@ pub enum FindingKind {
     MissingDeleted,
     /// The bucket holds a cell the consumer has never seen. Backfill it.
     UnknownStream,
+    /// The bucket holds objects for a cell that form no restorable chain: no
+    /// snapshot to start from, or a hole. Neither a repair nor a deletion can
+    /// be inferred; an operator has to look.
+    Unrestorable,
 }
 
 impl FindingKind {
@@ -124,6 +128,7 @@ impl FindingKind {
             FindingKind::Lost => "lost",
             FindingKind::MissingDeleted => "missing_deleted",
             FindingKind::UnknownStream => "unknown_stream",
+            FindingKind::Unrestorable => "unrestorable",
         }
     }
 }

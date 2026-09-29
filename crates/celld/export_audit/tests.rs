@@ -12,7 +12,7 @@ use object_store::memory::InMemory;
 use rusqlite::Connection;
 
 use super::cli::{erase_targets, Selection};
-use super::inventory::{BucketHead, Inventory, Loss, Span};
+use super::inventory::{BucketHead, Inventory, Landed, Loss, Span};
 use super::reconcile::{reconcile, Options, Reconciled};
 use super::tombstone::{self, scope_of, Tombstone};
 use super::verify::{self, DiffKind, Outcome};
@@ -164,6 +164,15 @@ fn head(scope: &str, spans: &[(u64, u64, u64)]) -> BucketHead {
             })
             .collect(),
         modified_ms: 0,
+        landed: spans
+            .iter()
+            .map(|(epoch, lo, hi)| Landed {
+                epoch: *epoch,
+                min: *lo,
+                max: *hi,
+                ms: 0,
+            })
+            .collect(),
     }
 }
 
@@ -179,6 +188,7 @@ fn run(
 ) -> Reconciled {
     reconcile(
         heads,
+        &BTreeMap::new(),
         losses,
         streams,
         &[],
@@ -246,7 +256,8 @@ fn the_head_follows_the_chain_across_a_paged_epoch_and_skips_a_fenced_one() {
         inventory.losses(),
         &[Loss {
             session: "node-a/g1".into(),
-            epoch: 7
+            epoch: 7,
+            modified_ms: 5,
         }]
     );
     assert_eq!(inventory.losses()[0].node(), "node-a");
@@ -300,9 +311,12 @@ fn a_consumer_behind_the_head_is_a_gap_once_it_settles() {
     assert!(matches!(&r.records[0].body, Body::Gap(g) if g.to == at(5, 9, u64::MAX)));
     assert_eq!(r.records[0].envelope.origin, Origin::Repair);
 
-    // Objects written a minute ago may still be on their way to the consumer.
+    // A change that landed a minute ago may still be on its way to the
+    // consumer.
     let mut fresh = h.clone();
-    fresh.get_mut(CELL).unwrap().modified_ms = 10 * HOUR - 60_000;
+    for l in &mut fresh.get_mut(CELL).unwrap().landed {
+        l.ms = 10 * HOUR - 60_000;
+    }
     let r = run(&fresh, &[], &streams, &[]);
     assert!(r.findings.is_empty());
     assert_eq!(r.unsettled, 1);
@@ -367,11 +381,13 @@ fn past_the_newest_head_is_lost_only_after_its_node_declared_a_loss() {
     let other = Loss {
         session: "node-b/g1".into(),
         epoch: 1,
+        modified_ms: 0,
     };
     assert!(run(&h, &[other], &streams, &[]).findings.is_empty());
     let ours = Loss {
         session: "node-a/g1".into(),
         epoch: 1,
+        modified_ms: 0,
     };
     let r = run(&h, &[ours], &streams, &[]);
     assert_eq!(kinds(&r), vec![(FindingKind::Lost, CELL.to_string())]);
@@ -512,6 +528,7 @@ fn short_recoveries_are_reported() {
     ];
     let r = reconcile(
         &BTreeMap::new(),
+        &BTreeMap::new(),
         &[],
         &[],
         &recovered,
@@ -523,6 +540,68 @@ fn short_recoveries_are_reported() {
         },
     );
     assert_eq!(r.recovered_short, vec![recovered[0].clone()]);
+}
+
+#[test]
+fn a_cell_that_keeps_writing_cannot_defer_an_old_gap() {
+    // Epoch 1 closed at 5 hours ago with the consumer certified only
+    // through 3; epoch 2 is fully certified and was written a minute ago.
+    let mut h = head(CELL, &[(1, 1, 5), (2, 6, 9)]);
+    h.modified_ms = 10 * HOUR - 60_000;
+    h.landed[1].ms = 10 * HOUR - 60_000;
+    let r = run(
+        &heads(vec![h.clone()]),
+        &[],
+        &[summary(root(), &[(1, 3), (2, 9)])],
+        &[],
+    );
+    assert_eq!(kinds(&r), vec![(FindingKind::Gap, CELL.to_string())]);
+    assert_eq!(r.findings[0].epochs, vec![1]);
+
+    // A lag that only concerns the change that just landed is not yet one.
+    let r = run(
+        &heads(vec![h]),
+        &[],
+        &[summary(root(), &[(1, 5), (2, 8)])],
+        &[],
+    );
+    assert!(r.findings.is_empty(), "{:?}", r.findings);
+    assert_eq!(r.unsettled, 1);
+}
+
+#[test]
+fn a_facet_whose_objects_do_not_restore_is_not_read_as_deleted() {
+    let facet = stream(CELL, Some("child"));
+    let facet_scope = scope_of(CELL, Some("child"));
+    let mut inventory = Inventory::new();
+    inventory.add(&ltx_key(CELL, 1, 0, 1, 3), 0);
+    // The facet's object exists, but without the snapshot to start from.
+    inventory.add(&ltx_key(&facet_scope, 2, 0, 2, 2), 0);
+    assert!(inventory.contains(&facet_scope));
+    let heads = block_on(inventory.heads());
+    assert!(!heads.contains_key(&facet_scope));
+    let broken = inventory.broken(&heads);
+    assert_eq!(broken.keys().collect::<Vec<_>>(), vec![&facet_scope]);
+
+    let r = reconcile(
+        &heads,
+        &broken,
+        &[],
+        &[
+            summary(root(), &[(1, 3)]),
+            summary(facet.clone(), &[(2, 2)]),
+        ],
+        &[],
+        &[],
+        |_| true,
+        Options {
+            now_ms: 10 * HOUR,
+            settle_ms: HOUR,
+        },
+    );
+    assert_eq!(kinds(&r), vec![(FindingKind::Unrestorable, facet_scope)]);
+    assert_eq!(r.findings[0].stream, facet);
+    assert!(r.records.is_empty(), "{:?}", r.records);
 }
 
 // ── the bucket consumer, end to end ─────────────────────────────────────────
@@ -569,6 +648,7 @@ fn reconcile_over_the_bucket_writes_records_the_next_run_reads_back() {
 
         let r = reconcile(
             &heads,
+            &inventory.broken(&heads),
             &[],
             &streams,
             &recovered,

@@ -30,6 +30,8 @@ pub struct Loss {
     pub session: String,
     /// The node-log epoch, not a cell epoch.
     pub epoch: u64,
+    /// When the loss record was written, in unix ms.
+    pub modified_ms: i64,
 }
 
 impl Loss {
@@ -47,9 +49,19 @@ pub struct Inventory {
     /// Per cell scope (a root, or `<root>/facets/<hash>...`), per epoch, the
     /// LTX files by level.
     cells: BTreeMap<String, BTreeMap<u64, Vec<Vec<FileInfo>>>>,
-    /// Per cell scope, the newest object's last-modified time in unix ms.
-    modified: BTreeMap<String, i64>,
+    /// Per cell scope, every LTX object with its last-modified time.
+    landed: BTreeMap<String, Vec<Landed>>,
     losses: Vec<Loss>,
+}
+
+/// One LTX object and when it reached the bucket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Landed {
+    pub epoch: u64,
+    pub min: u64,
+    pub max: u64,
+    /// Last-modified, unix ms.
+    pub ms: i64,
 }
 
 /// A cell epoch as the chain serves it: `lo..=hi`.
@@ -72,6 +84,9 @@ pub struct BucketHead {
     pub spans: Vec<Span>,
     /// The newest object of the scope, in unix ms.
     pub modified_ms: i64,
+    /// Every LTX object of the scope, so a difference can be aged by the
+    /// objects it rests on rather than by the cell's latest write.
+    pub landed: Vec<Landed>,
 }
 
 impl BucketHead {
@@ -87,6 +102,26 @@ impl BucketHead {
     pub fn span(&self, epoch: u64) -> Option<&Span> {
         self.spans.iter().find(|s| s.epoch == epoch)
     }
+
+    /// When `txid` of `epoch` first reached the bucket: the oldest object of
+    /// that epoch holding it. A compaction that rewrites the range later
+    /// does not make the change younger.
+    pub fn landed_ms(&self, epoch: u64, txid: u64) -> Option<i64> {
+        self.landed
+            .iter()
+            .filter(|l| l.epoch == epoch && l.min <= txid && txid <= l.max)
+            .map(|l| l.ms)
+            .min()
+    }
+
+    /// When the scope's first object reached the bucket.
+    pub fn first_landed_ms(&self) -> i64 {
+        first_landed(&self.landed)
+    }
+}
+
+fn first_landed(landed: &[Landed]) -> i64 {
+    landed.iter().map(|l| l.ms).min().unwrap_or(0)
 }
 
 pub fn root_of(scope: &str) -> &str {
@@ -107,7 +142,7 @@ impl Inventory {
     /// Take one object name, unprefixed, with its last-modified time.
     /// Names that are neither an LTX object nor a loss record are ignored.
     pub fn add(&mut self, key: &str, modified_ms: i64) {
-        if let Some(loss) = parse_loss(key) {
+        if let Some(loss) = parse_loss(key, modified_ms) {
             self.losses.push(loss);
             return;
         }
@@ -120,12 +155,16 @@ impl Inventory {
             .or_default()
             .entry(epoch)
             .or_insert_with(|| vec![Vec::new(); SNAPSHOT_LEVEL as usize + 1]);
-        levels[level as usize].push(file);
-        let newest = self
-            .modified
+        self.landed
             .entry(scope.to_string())
-            .or_insert(modified_ms);
-        *newest = (*newest).max(modified_ms);
+            .or_default()
+            .push(Landed {
+                epoch,
+                min: file.min_txid.0,
+                max: file.max_txid.0,
+                ms: modified_ms,
+            });
+        levels[level as usize].push(file);
     }
 
     pub fn losses(&self) -> &[Loss] {
@@ -138,6 +177,18 @@ impl Inventory {
 
     pub fn contains(&self, scope: &str) -> bool {
         self.cells.contains_key(scope)
+    }
+
+    /// Scopes that hold objects but no head: their objects form no
+    /// restorable chain (no snapshot to start from, or a hole). Each with
+    /// when its first object landed. Such a scope is not absent, so the
+    /// reconciler must never read it as deleted.
+    pub fn broken(&self, heads: &BTreeMap<String, BucketHead>) -> BTreeMap<String, i64> {
+        self.landed
+            .iter()
+            .filter(|(scope, _)| !heads.contains_key(*scope))
+            .map(|(scope, landed)| (scope.clone(), first_landed(landed)))
+            .collect()
     }
 
     /// Every scope's head. A scope whose objects form no chain (nothing
@@ -182,7 +233,12 @@ impl Inventory {
             epoch: serving.0,
             txid: cut.0,
             spans,
-            modified_ms: self.modified.get(scope).copied().unwrap_or(0),
+            modified_ms: self
+                .landed
+                .get(scope)
+                .and_then(|l| l.iter().map(|l| l.ms).max())
+                .unwrap_or(0),
+            landed: self.landed.get(scope).cloned().unwrap_or_default(),
         })
     }
 }
@@ -214,13 +270,14 @@ fn parse_ltx(key: &str) -> Option<(&str, u64, i32, FileInfo)> {
 
 /// `log/<node>/<generation>.e<epoch>.loss.json`. A bundle's own loss record
 /// (`.bundle-<name>.loss.json`) is not a session loss and is ignored.
-fn parse_loss(key: &str) -> Option<Loss> {
+fn parse_loss(key: &str, modified_ms: i64) -> Option<Loss> {
     let stem = key.strip_prefix("log/")?.strip_suffix(".loss.json")?;
     let (session, epoch) = stem.rsplit_once(".e")?;
     let epoch = epoch.parse().ok()?;
     session.contains('/').then(|| Loss {
         session: session.to_string(),
         epoch,
+        modified_ms,
     })
 }
 
