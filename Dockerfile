@@ -9,6 +9,11 @@ ARG TARGETARCH
 # the fat-LTO relink and keep incremental state in the target cache.
 ARG CELLD_PROFILE=release
 WORKDIR /src
+# rusqlite's `session` feature regenerates libsqlite3-sys bindings with
+# bindgen, which loads libclang at build time.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libclang-dev && \
+    rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 RUN --mount=type=cache,id=celld-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
