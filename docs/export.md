@@ -61,7 +61,8 @@ lacks come out as one-key objects, for example `{"$bigint": "12"}`,
 A stored object with a key that starts with `$` comes out wrapped as
 `{"$object": {…}}`, so every such key in the JSON is one of these tags. The
 full list is in `crates/celld/export_kv.rs`. A value that does not decode,
-such as one that refers to itself, or one stored in more than 2 MiB, is
+such as one that refers to itself, one stored in more than 2 MiB, or one
+whose JSON would grow far past its stored size (a large sparse array), is
 exported as its stored bytes, a `{"$blob": …}` in the record.
 `CELLD_EXPORT_TABLES` names the table as `Class.kv`.
 

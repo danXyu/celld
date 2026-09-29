@@ -134,3 +134,35 @@ fn values_over_the_decode_limit_are_not_read() {
         [None, Some(r#""x""#.to_string())]
     );
 }
+
+#[test]
+fn an_own_proto_key_is_kept() {
+    assert_eq!(
+        json(r#"JSON.parse('{"__proto__": {"kept": 1}, "normal": 2}')"#),
+        serde_json::json!({"__proto__": {"kept": 1}, "normal": 2})
+    );
+    assert_eq!(
+        json(r#"JSON.parse('{"__proto__": 1, "$x": 2}')"#),
+        serde_json::json!({"$object": {"__proto__": 1, "$x": 2}})
+    );
+}
+
+#[test]
+fn values_that_expand_past_the_budget_do_not_decode() {
+    let sparse = encode_for_test("new Array(10_000_000)");
+    assert!(sparse.len() < 32);
+    // 2^30 leaves behind 30 shared levels.
+    let shared = encode_for_test(
+        "(() => { let a = [1]; for (let i = 0; i < 30; i++) a = [a, a]; return a; })()",
+    );
+    assert!(shared.len() < 1024);
+    let small = encode_for_test("new Array(3)");
+    assert_eq!(
+        decode(vec![sparse, shared, small]),
+        [
+            None,
+            None,
+            Some(r#"[{"$undefined":true},{"$undefined":true},{"$undefined":true}]"#.to_string())
+        ]
+    );
+}

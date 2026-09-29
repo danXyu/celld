@@ -38,8 +38,10 @@
 //! | a stored-stub row              | `{"$stub": <decoded marker tree>}`         |
 //!
 //! A value that refers to itself cannot be written as JSON and does not
-//! decode. Nor does anything V8 refuses to read, or a value stored in more
-//! than [`MAX_DECODE_BYTES`]. The caller exports those as tagged blobs.
+//! decode. Nor does anything V8 refuses to read, a value stored in more than
+//! [`MAX_DECODE_BYTES`], or one whose JSON would grow far past its stored
+//! size (a sparse array, an object shared many times over). The caller
+//! exports those as tagged blobs.
 
 use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
@@ -84,12 +86,29 @@ const ENCODE_JS: &str = r#"
     return out;
   };
   const kind = (value) => Object.prototype.toString.call(value).slice(8, -1);
+  // A few stored bytes can stand for far more: a sparse array's holes, or an
+  // object shared many times over. Every value walked and every character
+  // written is charged, and a value that runs out does not decode.
+  const BUDGET = 64 * 1024 * 1024;
+  const VALUE_COST = 64;
+  let budget = 0;
+  const charge = (units) => {
+    budget -= units;
+    if (budget < 0) throw new RangeError("the value expands past the export budget");
+  };
+  // A plain `{}` would treat an own `__proto__` key as the prototype setter.
+  const define = (out, key, value) => {
+    Object.defineProperty(out, key, { value, enumerable: true, writable: true, configurable: true });
+  };
   const encode = (value, ancestors) => {
+    charge(VALUE_COST);
     switch (typeof value) {
       case "undefined":
         return { $undefined: true };
       case "boolean":
+        return value;
       case "string":
+        charge(value.length);
         return value;
       case "number":
         return Number.isFinite(value) ? value : { $number: String(value) };
@@ -101,9 +120,11 @@ const ENCODE_JS: &str = r#"
     ancestors.add(value);
     try {
       if (value instanceof ArrayBuffer) {
+        charge(value.byteLength * 2);
         return { $bytes: { base64: base64(new Uint8Array(value)), type: "ArrayBuffer" } };
       }
       if (ArrayBuffer.isView(value)) {
+        charge(value.byteLength * 2);
         const bytes = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
         return { $bytes: { base64: base64(bytes), type: kind(value) } };
       }
@@ -134,8 +155,9 @@ const ENCODE_JS: &str = r#"
       const out = {};
       let tagged = false;
       for (const key of Object.keys(value)) {
+        charge(key.length);
         if (key.startsWith("$")) tagged = true;
-        out[key] = encode(value[key], ancestors);
+        define(out, key, encode(value[key], ancestors));
       }
       return tagged ? { $object: out } : out;
     } finally {
@@ -143,6 +165,7 @@ const ENCODE_JS: &str = r#"
     }
   };
   return (value, stub) => {
+    budget = BUDGET;
     const encoded = encode(value, new Set());
     return JSON.stringify(stub ? { $stub: encoded } : encoded);
   };
