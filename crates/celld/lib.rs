@@ -340,6 +340,7 @@ pub mod drain_token;
 pub mod engine_api;
 pub mod env_vars;
 pub mod export;
+pub(crate) mod export_kv;
 pub mod export_live;
 pub mod export_sink;
 #[cfg(celld_internal_tests)]

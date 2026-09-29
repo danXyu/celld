@@ -163,6 +163,7 @@ impl Dev {
         let child = command
             .args(["dev", "--no-watch", "--logs", "--port", &port.to_string()])
             .current_dir(project)
+            .env("RUST_LOG", "info")
             .env("CELLD_EXPORT", "1")
             .env("CELLD_EXPORT_FLUSH_MS", "200")
             .env("CELLD_SHUTDOWN_TOTAL_MS", "1000")

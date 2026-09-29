@@ -19,9 +19,11 @@
 //! the capture loop reports. Installing the hook replaces SQLite's default
 //! autocheckpoint, so the hook runs the same passive checkpoint itself.
 //!
+//! The key-value tables are reshaped on the way out ([`kv`]): `_cf_KV` is
+//! exported as `kv`, and `__kv` gains its blob references.
+//!
 //! What this module does not do yet: table generations (every table is at
-//! [`FIRST_GENERATION`] until DDL tracking lands), and the `kv` mapping of
-//! `_cf_KV`, which is exported as the raw table here.
+//! [`FIRST_GENERATION`] until DDL tracking lands).
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -31,6 +33,8 @@ use std::rc::Rc;
 
 use celld_export_format::{Op, RowChange, TableGen, TableRows, Value, ROWID_KEY_COLUMN};
 use rusqlite::{ffi, Connection};
+
+pub(crate) mod kv;
 
 /// The generation every table is exported at until DDL tracking assigns real
 /// ones.
@@ -394,6 +398,11 @@ impl Capture {
         denied: HashSet<String>,
         queue: DirtyList,
     ) -> anyhow::Result<Self> {
+        let mut denied = denied;
+        // The deny list names tables as they are exported.
+        if denied.contains(kv::KV_TABLE) {
+            denied.insert(kv::KV_SOURCE.to_string());
+        }
         let filter = Box::new(FilterState {
             scope: scope.to_string(),
             excluded: RefCell::new(HashSet::new()),
@@ -601,6 +610,15 @@ impl Capture {
         bulk: Vec<TableGen>,
     ) -> CapturedCommit {
         self.seq += 1;
+        let mut named = HashSet::new();
+        let bulk = bulk
+            .into_iter()
+            .map(|table| TableGen {
+                table: kv::exported_name(&table.table).to_string(),
+                ..table
+            })
+            .filter(|table| named.insert(table.clone()))
+            .collect();
         CapturedCommit {
             seq: self.seq,
             committed_at: now_ms,
@@ -732,8 +750,12 @@ impl Capture {
         let mut bulk = Vec::new();
         for table in order {
             let changes = by_table.remove(&table).unwrap_or_default();
-            match self.materialize_table(connection, &table, changes) {
-                Ok(rows) => tables.push(rows),
+            let rows = self
+                .materialize_table(connection, &table, changes)
+                .and_then(|rows| kv::reshape(rows, &self.filter.scope, crate::export_kv::decode));
+            match rows {
+                Ok(Some(rows)) => tables.push(rows),
+                Ok(None) => {}
                 Err(error) => {
                     tracing::warn!(
                         scope = %self.filter.scope, table, %error,
