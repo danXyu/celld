@@ -521,3 +521,47 @@ fn dead_leader_sweep_still_recovers_past_an_unreadable_record() {
         fixture.stop().await;
     });
 }
+
+#[test]
+fn recovery_reports_the_cell_epochs_it_folded_for_change_export() {
+    run(async {
+        let fixture = Fixture::new(true, false).await;
+        fixture.witness.online.store(true, Ordering::SeqCst);
+        fixture.manager.recover_self().await.unwrap();
+        assert_eq!(
+            *fixture.manager.recovered_reports.lock().unwrap(),
+            vec![crate::export_live::Recovery {
+                session: PREDECESSOR.into(),
+                loss: false,
+                cells: vec![crate::export_live::RecoveredCell {
+                    cell: "acknowledged".into(),
+                    epoch: 1,
+                    through: 1,
+                }],
+            }]
+        );
+        // A sealed log is not recovered again, so it reports nothing more.
+        fixture.manager.recover(PREDECESSOR).await.unwrap();
+        assert_eq!(fixture.manager.recovered_reports.lock().unwrap().len(), 1);
+        fixture.stop().await;
+    });
+}
+
+#[test]
+fn a_declared_loss_reaches_change_export_even_with_no_cell_to_report() {
+    run(async {
+        let fixture = Fixture::new(false, false).await;
+        fixture.witness.online.store(true, Ordering::SeqCst);
+        fixture.manager.recover_self().await.unwrap();
+        assert!(fixture.bucket.get(LOSS).await.unwrap().is_some());
+        assert_eq!(
+            *fixture.manager.recovered_reports.lock().unwrap(),
+            vec![crate::export_live::Recovery {
+                session: PREDECESSOR.into(),
+                loss: true,
+                cells: Vec::new(),
+            }]
+        );
+        fixture.stop().await;
+    });
+}

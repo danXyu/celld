@@ -81,7 +81,24 @@ export class Items {
     const url = new URL(request.url);
     const op = url.searchParams.get("op");
     const id = Number(url.searchParams.get("id"));
-    if (op === "facet" || op === "flist") {
+    if (op === "ddl") {
+      // Schema changes, including deleteAll()'s drops, which run with the
+      // SQL authorizer off.
+      const step = url.searchParams.get("step");
+      if (step === "create") {
+        this.sql.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
+        this.sql.exec("INSERT INTO t VALUES (1, 'one'), (2, 'two')");
+      } else if (step === "alter") {
+        this.sql.exec("ALTER TABLE t ADD COLUMN w INTEGER DEFAULT 5");
+      } else if (step === "wipe") {
+        await this.storage.deleteAll();
+        return Response.json({});
+      } else if (step === "again") {
+        this.sql.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
+        this.sql.exec("INSERT INTO t VALUES (3, 'three')");
+      }
+      return Response.json({ t: this.sql.exec("SELECT * FROM t ORDER BY id").toArray() });
+    } else if (op === "facet" || op === "flist") {
       // `path` names the facet below this cell: `child` or `child/nested`.
       const [head, ...rest] = url.searchParams.get("path").split("/");
       const facet = this.state.facets.get(head, () => ({ class: this.state.exports.Leaf }));
@@ -517,21 +534,25 @@ async fn exported_rows_match_the_restored_cell() {
         "cell=b&op=delete&id=1",
         "cell=b&op=alarm",
         // A facet and a nested facet, deleted and recreated.
-        "cell=c&op=put&id=1&name=root&qty=1",
-        "cell=c&op=facet&path=child&id=1&name=old-child",
-        "cell=c&op=facet&path=child/nested&id=1&name=old-nested",
-        "cell=c&op=facet&path=child&id=2&name=old-child-2",
-        "cell=c&op=fdelete",
-        "cell=c&op=facet&path=child&id=3&name=new-child",
-        "cell=c&op=facet&path=child/nested&id=4&name=new-nested",
+        "cell=d&op=put&id=1&name=root&qty=1",
+        "cell=d&op=facet&path=child&id=1&name=old-child",
+        "cell=d&op=facet&path=child/nested&id=1&name=old-nested",
+        "cell=d&op=facet&path=child&id=2&name=old-child-2",
+        "cell=d&op=fdelete",
+        "cell=d&op=facet&path=child&id=3&name=new-child",
+        "cell=d&op=facet&path=child/nested&id=4&name=new-nested",
+        "cell=c&op=ddl&step=create",
+        "cell=c&op=ddl&step=alter",
+        "cell=c&op=ddl&step=wipe",
+        "cell=c&op=ddl&step=again",
     ] {
         dev.call(&client, query).await;
     }
     let live_a = dev.call(&client, "cell=a&op=list").await;
     let live_b = dev.call(&client, "cell=b&op=list").await;
     let live_facets = [
-        dev.call(&client, "cell=c&op=flist&path=child").await,
-        dev.call(&client, "cell=c&op=flist&path=child/nested").await,
+        dev.call(&client, "cell=d&op=flist&path=child").await,
+        dev.call(&client, "cell=d&op=flist&path=child/nested").await,
     ];
     let log = dev.log_text();
     // The cell ids, from the node's activation log.
@@ -569,7 +590,26 @@ async fn exported_rows_match_the_restored_cell() {
                 })
             })
         });
-        if done {
+        // Cell c: `t` was created, altered, dropped by deleteAll() along
+        // with the constructor's tables, and created again. Only the third
+        // generation's row is live; nothing of the first two resurrects.
+        let recreated = cells.iter().any(|cell| {
+            stream_state(&records, cell).is_some_and(|(state, newest)| {
+                let open: Vec<(&str, u64)> = state
+                    .tables
+                    .keys()
+                    .map(|tg| (tg.table.as_str(), tg.generation))
+                    .collect();
+                open == [("t", 3)]
+                    && exported_rows(&state, "t").len() == 1
+                    && exported_rows(&state, "t")["3"]
+                        == [serde_json::json!(3.0), serde_json::json!("three")]
+                    && state.certified_head().is_some_and(|head| head >= newest)
+                    && state.gaps.is_empty()
+                    && state.uncertain.is_empty()
+            })
+        });
+        if done && recreated {
             break records;
         }
         assert!(
@@ -722,17 +762,17 @@ async fn exported_rows_match_the_restored_cell() {
     // to its first residency, with the same incarnation and no gap.
     dev.call(
         &client,
-        "cell=c&op=facet&path=child&id=5&name=after-restart",
+        "cell=d&op=facet&path=child&id=5&name=after-restart",
     )
     .await;
     dev.call(
         &client,
-        "cell=c&op=facet&path=child/nested&id=6&name=after-restart",
+        "cell=d&op=facet&path=child/nested&id=6&name=after-restart",
     )
     .await;
     let live_facets = [
-        dev.call(&client, "cell=c&op=flist&path=child").await,
-        dev.call(&client, "cell=c&op=flist&path=child/nested").await,
+        dev.call(&client, "cell=d&op=flist&path=child").await,
+        dev.call(&client, "cell=d&op=flist&path=child/nested").await,
     ];
     let records = settled_facets(&dev, &live_facets).await;
     for (stream, first) in &facet_epochs {

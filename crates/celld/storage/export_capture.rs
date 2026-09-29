@@ -19,26 +19,51 @@
 //! the capture loop reports. Installing the hook replaces SQLite's default
 //! autocheckpoint, so the hook runs the same passive checkpoint itself.
 //!
-//! The key-value tables are reshaped on the way out ([`kv`]): `_cf_KV` is
-//! exported as `kv`, and `__kv` gains its blob references.
+//! Schema changes are found by comparing `sqlite_schema` with what the cell
+//! last exported, at the same safe point, not through the authorizer (plan
+//! C9): `deleteAll` drops tables with the authorizer off, and the authorizer
+//! reports neither the kind of an `ALTER TABLE` nor a rename's new name. Each
+//! exported table has a generation that starts at one and moves on every
+//! change to its definition, and a drop and recreate under one name is a new
+//! generation. Generations persist in the cell's own [`GENERATIONS_TABLE`],
+//! written right after the change is seen, so they move and restore with the
+//! cell (plan C10). A table whose generation opened in a commit is exported
+//! as an inline snapshot rather than rows, or as `bulk` when it is larger than
+//! `CELLD_EXPORT_MAX_TX_BYTES`. See "DDL and table generations" in the design.
 //!
-//! What this module does not do yet: table generations (every table is at
-//! [`FIRST_GENERATION`] until DDL tracking lands).
+//! The key-value tables are reshaped on the way out ([`kv`]): `_cf_KV` is
+//! exported as `kv`, and `__kv` gains its blob references. Their rows,
+//! snapshots, `bulk` entries and `schema` records all use the exported shape.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::ptr;
 use std::rc::Rc;
 
-use celld_export_format::{Op, RowChange, TableGen, TableRows, Value, ROWID_KEY_COLUMN};
+use celld_export_format::{
+    ColumnDef, Op, RowChange, SchemaBody, TableGen, TableRows, Value, ROWID_KEY_COLUMN,
+};
 use rusqlite::{ffi, Connection};
 
 pub(crate) mod kv;
 
-/// The generation every table is exported at until DDL tracking assigns real
-/// ones.
+/// The generation a table name starts at.
 pub(crate) const FIRST_GENERATION: u64 = 1;
+
+/// Where a cell keeps its table generations: one row per table name the
+/// exporter has seen, with the name's newest generation, the definition and
+/// root page it was exported under, or `NULL` once no table has the name.
+/// The `_cf_` prefix keeps it out of application SQL and out of the export,
+/// and `deleteAll` leaves it in place, so a table recreated afterwards
+/// continues from the old generation instead of reusing it.
+pub(crate) const GENERATIONS_TABLE: &str = "_cf_EXPORT";
+
+/// The [`GENERATIONS_TABLE`] row that holds, as its generation, the schema
+/// cookie the generations were last compared at. No table can have this
+/// name, and a later residency that finds the cookie moved knows the schema
+/// changed while nothing watched it.
+const COOKIE_ROW: &str = "sqlite_schema";
 
 /// How capture behaves on every cell of one isolate.
 #[derive(Clone, Copy, Debug)]
@@ -66,6 +91,23 @@ pub(crate) struct CapturedCommit {
     /// Tables whose changes the commit does not carry. A consumer's copy of
     /// them is unknown until a snapshot covers them.
     pub bulk: Vec<TableGen>,
+    /// `schema` records at this commit, in order: generations it closed, then
+    /// the ones it opened, then the definition of every other generation this
+    /// capture exports for the first time.
+    pub schemas: Vec<SchemaBody>,
+    /// Tables exported whole at this commit instead of as rows: every table
+    /// whose generation opened here, and every table when the changeset
+    /// could not be pulled across a schema change.
+    pub snapshot: Option<InlineSnapshot>,
+}
+
+/// A snapshot taken at the commit, of the listed table generations only.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct InlineSnapshot {
+    pub id: String,
+    /// One entry per table with every row as an insert, including empty
+    /// tables, which the snapshot also covers.
+    pub tables: Vec<TableRows>,
 }
 
 /// What capture reports for one cell, in the order it happened. The live
@@ -141,11 +183,12 @@ pub(crate) enum WalStamp {
 struct WalState {
     /// The newest commit's stamp since the last pull.
     last: Cell<Option<WalStamp>>,
-    /// Queues the cell for a check point after any commit, so a write that
-    /// touched no exported table still reaches one: the live path proves
-    /// its position, and the delivered position passes its TXID.
-    scope: String,
-    queue: DirtyList,
+    /// The capture's filter, to queue the cell on a commit (see
+    /// [`commit_hook`]).
+    filter: *const FilterState,
+    /// Set while capture writes [`GENERATIONS_TABLE`] itself, which needs no
+    /// visit of its own.
+    quiet: Cell<bool>,
 }
 
 /// SQLite calls this after each commit on the connection, with the number
@@ -168,18 +211,31 @@ unsafe extern "C" fn wal_hook(
         // the WAL in between; the frame's own salts catch that.
         let stamp = unsafe { read_stamp(database, u64::try_from(frames).unwrap_or(0)) };
         state.last.set(Some(stamp.unwrap_or(WalStamp::Unplaced)));
-        // Held only briefly by check points, never across a commit.
-        if let Ok(mut queue) = state.queue.try_borrow_mut() {
-            if !queue.contains(&state.scope) {
-                queue.push(state.scope.clone());
-            }
-        }
     }
     // The default hook's passive checkpoint, which this hook replaced.
     if frames >= AUTOCHECKPOINT_FRAMES {
         unsafe { ffi::sqlite3_wal_checkpoint(database, name) };
     }
     ffi::SQLITE_OK
+}
+
+/// SQLite calls this as each transaction on the connection commits. Every
+/// commit is visited, not only those the session saw: a schema change
+/// reaches no session, and a cell is caught up only once its schema has been
+/// compared. A commit that then fails costs one visit that finds nothing.
+///
+/// # Safety
+///
+/// `context` is the `WalState` the owning `Capture` registered, which
+/// outlives the hook: `Capture` removes the hook when it drops.
+unsafe extern "C" fn commit_hook(context: *mut c_void) -> c_int {
+    let state = unsafe { &*context.cast::<WalState>() };
+    if !state.quiet.get() {
+        // SAFETY: the filter is boxed beside `wal` in the same `Capture`.
+        unsafe { &*state.filter }.mark_dirty();
+    }
+    // Zero lets the commit proceed.
+    0
 }
 
 /// Read the WAL header's salts and check that frame `frames` is a commit
@@ -257,6 +313,9 @@ struct FilterState {
     /// Tables with generated columns the transaction wrote. They are
     /// exported as `bulk`.
     untracked: RefCell<Vec<String>>,
+    /// Tables the session tracks changes to since it started. When the
+    /// changeset fails, these are snapshotted first.
+    touched: RefCell<Vec<String>>,
     dirty: Cell<bool>,
     queue: DirtyList,
     database: *mut ffi::sqlite3,
@@ -333,6 +392,7 @@ unsafe extern "C" fn table_filter(context: *mut c_void, table: *const c_char) ->
         }
         return 0;
     }
+    state.touched.borrow_mut().push(table.into_owned());
     1
 }
 
@@ -369,6 +429,46 @@ impl Shape {
     }
 }
 
+/// One table name's generation, as the cell last exported it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Tracked {
+    generation: u64,
+    /// The `sqlite_schema.sql` the generation was exported under; `None` once
+    /// no table has the name.
+    sql: Option<String>,
+    /// The table's root page, which a rename keeps and a recreate changes.
+    /// Zero when not known.
+    rootpage: i64,
+    /// A virtual table, which the export names but does not cover.
+    virtual_table: bool,
+}
+
+/// An exported table as `sqlite_schema` has it now.
+struct LiveTable {
+    sql: String,
+    rootpage: i64,
+    virtual_table: bool,
+}
+
+/// A schema record the next pulled commit carries, and whether the table it
+/// opens is snapshotted with it.
+#[derive(Clone, Debug)]
+struct SchemaChange {
+    body: SchemaBody,
+    snapshot: bool,
+}
+
+/// What a schema comparison compares against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Since {
+    /// Nothing: the cell has never exported. Its tables start at their first
+    /// generation with no record, since there is no earlier state to
+    /// supersede, and are described with their first rows.
+    Never,
+    /// The generations the cell stored, or the previous comparison.
+    Before,
+}
+
 /// One session on one cell connection.
 ///
 /// It must be dropped before the connection closes: the session holds the
@@ -386,11 +486,32 @@ pub(crate) struct Capture {
     shapes: HashMap<String, Shape>,
     /// The schema cookie `shapes` and the excluded set were read at.
     schema_version: Option<i64>,
+    /// Every table name this cell has exported, with its generation.
+    generations: BTreeMap<String, Tracked>,
+    /// The schema cookie `generations` was last compared at.
+    compared_version: Option<i64>,
+    /// Whether the last comparison found the schema changed, whether or not
+    /// any generation moved: an added column dropped again leaves every
+    /// definition as it was, but the changeset no longer matches the table.
+    schema_moved: bool,
+    /// Whether [`GENERATIONS_TABLE`] exists in the cell.
+    stored: bool,
+    /// Schema changes found outside a pull (at install), for the next commit.
+    pending: Vec<SchemaChange>,
+    /// Table generations whose `schema` record this capture already emitted.
+    announced: HashSet<TableGen>,
+    /// Tables a `DROP TABLE` or rename may have removed since the last
+    /// comparison. A table replaced by one with the same definition between
+    /// two safe points can leave `sqlite_schema` as it was, so only this says
+    /// it is new.
+    hinted: HashSet<String>,
 }
 
 impl Capture {
     /// Start capturing on `connection`. Changes made before this are not
-    /// captured.
+    /// captured. Table generations are read from the cell and brought up to
+    /// date with its schema; a change made while nothing captured the cell
+    /// is reported by the first pull.
     pub(crate) fn install(
         connection: &Connection,
         scope: &str,
@@ -409,10 +530,16 @@ impl Capture {
             denied,
             generated: RefCell::new(HashMap::new()),
             untracked: RefCell::new(Vec::new()),
+            touched: RefCell::new(Vec::new()),
             dirty: Cell::new(false),
-            queue: queue.clone(),
+            queue,
             // SAFETY: as for `database` below.
             database: unsafe { connection.handle() },
+        });
+        let wal = Box::new(WalState {
+            last: Cell::new(None),
+            filter: &*filter,
+            quiet: Cell::new(false),
         });
         let mut capture = Self {
             session: ptr::null_mut(),
@@ -420,29 +547,50 @@ impl Capture {
             // capture before the connection.
             database: unsafe { connection.handle() },
             filter,
-            wal: Box::new(WalState {
-                last: Cell::new(None),
-                scope: scope.to_string(),
-                queue,
-            }),
+            wal,
             settings,
             overflowed: false,
             seq: 0,
             shapes: HashMap::new(),
             schema_version: None,
+            generations: BTreeMap::new(),
+            compared_version: None,
+            schema_moved: false,
+            stored: false,
+            pending: Vec::new(),
+            announced: HashSet::new(),
+            hinted: HashSet::new(),
         };
         capture.refresh_schema(connection)?;
         capture.start_session()?;
         // SAFETY: the connection is live, and `wal` is boxed and outlives the
         // hook, which `Drop` removes.
         unsafe {
-            ffi::sqlite3_wal_hook(
-                capture.database,
-                Some(wal_hook),
-                (&*capture.wal as *const WalState)
-                    .cast_mut()
-                    .cast::<c_void>(),
-            );
+            let context = (&*capture.wal as *const WalState)
+                .cast_mut()
+                .cast::<c_void>();
+            ffi::sqlite3_wal_hook(capture.database, Some(wal_hook), context);
+            ffi::sqlite3_commit_hook(capture.database, Some(commit_hook), context);
+        }
+        // After the hook, so a write of the generations is stamped for the
+        // commit that reports it.
+        capture.load_generations(connection)?;
+        let since = if capture.generations.is_empty() {
+            Since::Never
+        } else {
+            Since::Before
+        };
+        match capture.compare_schema(connection, since) {
+            Ok(pending) => capture.pending = pending,
+            // Nothing is released for the changes until they are stored; the
+            // first pull compares again.
+            Err(error) => {
+                tracing::warn!(scope, %error, "export capture: compare schema at install");
+                capture.filter.mark_dirty();
+            }
+        }
+        if !capture.pending.is_empty() {
+            capture.filter.mark_dirty();
         }
         Ok(capture)
     }
@@ -451,6 +599,15 @@ impl Capture {
     /// `None` when no commit ran since.
     pub(crate) fn take_wal_stamp(&self) -> Option<WalStamp> {
         self.wal.last.take()
+    }
+
+    /// `tables` may have been dropped or renamed away on this connection since
+    /// the last pull: a `DROP TABLE` or `ALTER TABLE` naming them was
+    /// prepared on the cell thread. A table that exists under such a name
+    /// with the same definition at the next schema change is then taken to
+    /// be a new one. A table that was not replaced only costs a snapshot.
+    pub(crate) fn hint_dropped<'a>(&mut self, tables: impl IntoIterator<Item = &'a String>) {
+        self.hinted.extend(tables.into_iter().cloned());
     }
 
     fn start_session(&mut self) -> anyhow::Result<()> {
@@ -512,7 +669,10 @@ impl Capture {
                 tracing::error!(scope = %self.filter.scope, %error, "export capture: restart session");
                 return Checkpoint::Deferred;
             }
-            self.bulk_everything(connection, now_ms)
+            let changes = self
+                .take_schema_changes(connection)
+                .unwrap_or_else(|known| known);
+            self.bulk_everything(connection, now_ms, changes)
         } else {
             let commit = self.pull(connection, now_ms);
             if let Err(error) = self.restart(connection) {
@@ -527,9 +687,9 @@ impl Capture {
     }
 
     /// Whether a check point must visit the cell again: it has unpulled
-    /// writes, or it lost its session.
+    /// writes or schema changes, or it lost its session.
     pub(crate) fn needs_visit(&self) -> bool {
-        self.session.is_null() || self.filter.dirty.get()
+        self.session.is_null() || self.filter.dirty.get() || !self.pending.is_empty()
     }
 
     /// Whether every commit the connection made has been pulled.
@@ -542,6 +702,7 @@ impl Capture {
         // Every write so far is pulled or accounted for as bulk.
         self.filter.dirty.set(false);
         self.filter.untracked.borrow_mut().clear();
+        self.filter.touched.borrow_mut().clear();
         self.refresh_schema(connection)?;
         self.start_session()
     }
@@ -564,52 +725,231 @@ impl Capture {
         }
     }
 
+    /// The schema changes the next commit reports: those found at install
+    /// and those since the last comparison. `Err` holds the ones already
+    /// known when the schema cannot be read; which tables exist is then
+    /// unknown, and the commit must be conservative.
+    fn take_schema_changes(
+        &mut self,
+        connection: &Connection,
+    ) -> Result<Vec<SchemaChange>, Vec<SchemaChange>> {
+        let compared = self.compare_schema(connection, Since::Before);
+        let mut all = std::mem::take(&mut self.pending);
+        match compared {
+            Ok(changes) => {
+                all.extend(changes);
+                Ok(all)
+            }
+            Err(error) => {
+                tracing::error!(scope = %self.filter.scope, %error, "export capture: compare schema");
+                Err(all)
+            }
+        }
+    }
+
+    /// The generation `table` is exported at now.
+    fn generation(&self, table: &str) -> u64 {
+        self.generations
+            .get(table)
+            .map_or(FIRST_GENERATION, |tracked| tracked.generation)
+    }
+
+    fn table_gen(&self, table: &str) -> TableGen {
+        TableGen {
+            table: table.to_string(),
+            generation: self.generation(table),
+        }
+    }
+
+    /// Whether `table` is an exported table that exists now.
+    fn live(&self, table: &str) -> bool {
+        self.generations
+            .get(table)
+            .is_some_and(|tracked| tracked.sql.is_some())
+    }
+
+    /// Whether the commit exports `table`'s changes as rows: it exists, and
+    /// it is not exported whole.
+    fn carries_rows(&self, table: &str, whole: &[String]) -> bool {
+        self.live(table) && !whole.iter().any(|t| t == table)
+    }
+
     /// Pull the session at a safe point. `None` when nothing exported changed.
     fn pull(&mut self, connection: &Connection, now_ms: i64) -> Option<CapturedCommit> {
         self.enforce_budget();
-        if self.overflowed {
-            return self.bulk_everything(connection, now_ms);
+        let changes = match self.take_schema_changes(connection) {
+            Ok(changes) if !self.overflowed => changes,
+            Ok(changes) | Err(changes) => return self.bulk_everything(connection, now_ms, changes),
+        };
+        // A table whose generation opened here is exported whole; the rows of
+        // a table that no longer exists are moot.
+        let mut whole: Vec<String> = Vec::new();
+        for change in &changes {
+            let table = &change.body.table;
+            if change.snapshot && self.live(table) && !whole.contains(table) {
+                whole.push(table.clone());
+            }
         }
         let untracked: Vec<TableGen> = self
             .filter
             .untracked
             .borrow()
             .iter()
-            .map(|table| TableGen {
-                table: table.clone(),
-                generation: FIRST_GENERATION,
-            })
+            .filter(|table| self.carries_rows(table, &whole))
+            .map(|table| self.table_gen(table))
             .collect();
+        let mut tables = Vec::new();
+        let mut bulk = untracked;
         // SAFETY: a live session.
-        if unsafe { ffi::sqlite3session_isempty(self.session) } != 0 {
-            return (!untracked.is_empty()).then(|| self.commit(now_ms, Vec::new(), untracked));
-        }
-        if let Err(error) = self.refresh_schema(connection) {
-            tracing::error!(scope = %self.filter.scope, %error, "export capture: read schema");
-            return self.bulk_everything(connection, now_ms);
-        }
-        let changes = match self.changeset() {
-            Ok(changes) => changes,
-            Err(error) => {
-                tracing::error!(scope = %self.filter.scope, %error, "export capture: changeset");
-                return self.bulk_everything(connection, now_ms);
+        if unsafe { ffi::sqlite3session_isempty(self.session) } == 0 {
+            if let Err(error) = self.refresh_schema(connection) {
+                tracing::error!(scope = %self.filter.scope, %error, "export capture: read schema");
+                return self.bulk_everything(connection, now_ms, changes);
             }
+            match self.changeset() {
+                Ok(rows) => {
+                    let rows = rows
+                        .into_iter()
+                        .filter(|change| self.carries_rows(&change.table, &whole))
+                        .collect();
+                    let (materialized, failed) = self.materialize(connection, rows);
+                    tables = materialized;
+                    for table in failed {
+                        // Changes recorded under an earlier shape of the
+                        // table: its current rows say what they became.
+                        if self.schema_moved {
+                            whole.push(table);
+                        } else {
+                            tracing::warn!(
+                                scope = %self.filter.scope, table,
+                                "export capture: table exported as bulk"
+                            );
+                            bulk.push(self.table_gen(&table));
+                        }
+                    }
+                }
+                // A table dropped or renamed after the session recorded
+                // changes to it fails the changeset as a whole, and so does
+                // one created in a transaction that rolled back. A column
+                // dropped from a table the session recorded stops the
+                // session outright, so tables written after it were never
+                // seen. Every table is snapshotted, those the session saw
+                // first, within the snapshot budget.
+                Err(error) => {
+                    tracing::debug!(
+                        scope = %self.filter.scope, %error,
+                        "export capture: changeset failed; snapshotting"
+                    );
+                    let mut candidates = self.filter.touched.borrow().clone();
+                    match self.exported_tables(connection) {
+                        Ok(tables) => candidates.extend(tables),
+                        Err(error) => {
+                            tracing::error!(scope = %self.filter.scope, %error, "export capture: list tables");
+                            return self.bulk_everything(connection, now_ms, changes);
+                        }
+                    }
+                    for table in candidates {
+                        if self.carries_rows(&table, &whole) {
+                            whole.push(table);
+                        }
+                    }
+                    bulk.retain(|tg| !whole.contains(&tg.table));
+                }
+            }
+        }
+        let snapshot = if whole.is_empty() {
+            None
+        } else {
+            if let Err(error) = self.refresh_schema(connection) {
+                tracing::error!(scope = %self.filter.scope, %error, "export capture: read schema");
+                return self.bulk_everything(connection, now_ms, changes);
+            }
+            let mut taken = Vec::new();
+            let mut budget = self.settings.max_tx_bytes;
+            for table in &whole {
+                let rows = self
+                    .snapshot_table(connection, table, &mut budget)
+                    .and_then(|rows| {
+                        let Some(rows) = rows else { return Ok(None) };
+                        let (generation, empty) = (rows.generation, rows.table == kv::KV_SOURCE);
+                        Ok(Some(
+                            match kv::reshape(rows, &self.filter.scope, crate::export_kv::decode)? {
+                                Some(rows) => rows,
+                                // Nothing of the cell's: the snapshot still covers
+                                // the table, empty.
+                                None if empty => TableRows {
+                                    table: kv::KV_TABLE.to_string(),
+                                    generation,
+                                    columns: vec!["key".to_string(), "value".to_string()],
+                                    key_columns: vec!["key".to_string()],
+                                    rows: Vec::new(),
+                                },
+                                None => unreachable!("only {} reshapes to nothing", kv::KV_SOURCE),
+                            },
+                        ))
+                    });
+                match rows {
+                    Ok(Some(rows)) => taken.push(rows),
+                    Ok(None) => bulk.push(self.table_gen(table)),
+                    Err(error) => {
+                        tracing::warn!(
+                            scope = %self.filter.scope, table, %error,
+                            "export capture: snapshot exported as bulk"
+                        );
+                        bulk.push(self.table_gen(table));
+                    }
+                }
+            }
+            Some(InlineSnapshot {
+                id: format!("ddl-{now_ms}-{}", self.seq + 1),
+                tables: taken,
+            })
         };
-        let (tables, mut bulk) = self.materialize(connection, changes);
-        bulk.extend(untracked);
-        if tables.is_empty() && bulk.is_empty() {
+        if tables.is_empty() && bulk.is_empty() && snapshot.is_none() && changes.is_empty() {
             return None;
         }
-        Some(self.commit(now_ms, tables, bulk))
+        Some(self.commit(connection, now_ms, changes, tables, bulk, snapshot))
     }
 
     fn commit(
         &mut self,
+        connection: &Connection,
         now_ms: i64,
+        changes: Vec<SchemaChange>,
         tables: Vec<TableRows>,
         bulk: Vec<TableGen>,
+        snapshot: Option<InlineSnapshot>,
     ) -> CapturedCommit {
         self.seq += 1;
+        let mut schemas: Vec<SchemaBody> = changes.into_iter().map(|change| change.body).collect();
+        // Every generation this commit carries has its definition in the
+        // stream: announced once per capture, and again with each snapshot.
+        let snapshotted = snapshot.iter().flat_map(|s| s.tables.iter());
+        let carried: Vec<(TableGen, bool)> = snapshotted
+            .map(|t| (t.table_gen(), true))
+            .chain(tables.iter().map(|t| (t.table_gen(), false)))
+            .chain(bulk.iter().map(|tg| (tg.clone(), false)))
+            .map(|(tg, always)| {
+                let table = self.storage_name(&tg.table).to_string();
+                (TableGen { table, ..tg }, always)
+            })
+            .collect();
+        for (tg, always) in carried {
+            let present = schemas
+                .iter()
+                .any(|s| !s.dropped && s.table == tg.table && s.generation == tg.generation);
+            if present || (!always && self.announced.contains(&tg)) {
+                continue;
+            }
+            schemas.push(self.schema_body(connection, &tg.table));
+        }
+        for schema in &schemas {
+            self.announced.insert(TableGen {
+                table: schema.table.clone(),
+                generation: schema.generation,
+            });
+        }
+        let schemas = schemas.into_iter().map(exported_schema).collect();
         let mut named = HashSet::new();
         let bulk = bulk
             .into_iter()
@@ -624,22 +964,36 @@ impl Capture {
             committed_at: now_ms,
             tables,
             bulk,
+            schemas,
+            snapshot,
+        }
+    }
+
+    /// The table in the cell that exported `table` came from: rows of
+    /// `_cf_KV` are exported as `kv`.
+    fn storage_name<'a>(&self, table: &'a str) -> &'a str {
+        if table == kv::KV_TABLE
+            && self.generations.contains_key(kv::KV_SOURCE)
+            && !self.generations.contains_key(kv::KV_TABLE)
+        {
+            kv::KV_SOURCE
+        } else {
+            table
         }
     }
 
     /// A commit that names every exported table as `bulk`: the conservative
     /// answer when the tables a transaction touched are not known.
-    fn bulk_everything(&mut self, connection: &Connection, now_ms: i64) -> Option<CapturedCommit> {
+    fn bulk_everything(
+        &mut self,
+        connection: &Connection,
+        now_ms: i64,
+        changes: Vec<SchemaChange>,
+    ) -> Option<CapturedCommit> {
         match self.exported_tables(connection) {
             Ok(tables) => {
-                let bulk = tables
-                    .into_iter()
-                    .map(|table| TableGen {
-                        table,
-                        generation: FIRST_GENERATION,
-                    })
-                    .collect();
-                Some(self.commit(now_ms, Vec::new(), bulk))
+                let bulk = tables.iter().map(|table| self.table_gen(table)).collect();
+                Some(self.commit(connection, now_ms, changes, Vec::new(), bulk, None))
             }
             Err(error) => {
                 // Nothing to name. Release reports the stream's gap.
@@ -673,7 +1027,7 @@ impl Capture {
     /// Re-read the excluded set and drop cached shapes when the schema cookie
     /// moved.
     fn refresh_schema(&mut self, connection: &Connection) -> anyhow::Result<()> {
-        let version: i64 = connection.query_row("PRAGMA schema_version", [], |row| row.get(0))?;
+        let version = schema_cookie(connection)?;
         if self.schema_version == Some(version) {
             return Ok(());
         }
@@ -692,6 +1046,379 @@ impl Capture {
         self.shapes.clear();
         self.schema_version = Some(version);
         Ok(())
+    }
+
+    /// Read the generations the cell stored.
+    fn load_generations(&mut self, connection: &Connection) -> anyhow::Result<()> {
+        self.stored = connection
+            .query_row(
+                "SELECT 1 FROM main.sqlite_schema WHERE type = 'table' AND name = ?1",
+                [GENERATIONS_TABLE],
+                |_| Ok(()),
+            )
+            .map(|()| true)
+            .or_else(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => Ok(false),
+                error => Err(error),
+            })?;
+        if !self.stored {
+            return Ok(());
+        }
+        let mut statement = connection.prepare(&format!(
+            "SELECT name, generation, schema_sql, rootpage FROM main.{GENERATIONS_TABLE}"
+        ))?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+            ))
+        })?;
+        let mut cookie = None;
+        for row in rows {
+            let (name, generation, sql, rootpage) = row?;
+            if name == COOKIE_ROW {
+                cookie = Some(generation);
+                continue;
+            }
+            let virtual_table = sql.as_deref().is_some_and(is_virtual_sql);
+            self.generations.insert(
+                name,
+                Tracked {
+                    generation: u64::try_from(generation).unwrap_or(FIRST_GENERATION),
+                    sql,
+                    rootpage: rootpage.unwrap_or(0),
+                    virtual_table,
+                },
+            );
+        }
+        // The schema changed since the generations were stored, while no
+        // capture watched: a table may have been dropped and recreated with
+        // the same definition, even on the same root page. Every table is
+        // then taken to be new, which costs a snapshot each.
+        if !self.generations.is_empty() && cookie != Some(schema_cookie(connection)?) {
+            self.hinted.extend(self.generations.keys().cloned());
+        }
+        Ok(())
+    }
+
+    /// The exported tables `sqlite_schema` holds now, virtual tables included
+    /// and their shadow tables not.
+    fn live_tables(&self, connection: &Connection) -> anyhow::Result<BTreeMap<String, LiveTable>> {
+        let mut shadow = HashSet::new();
+        let mut statement = connection.prepare("PRAGMA table_list")?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let (schema, name, kind): (String, String, String) =
+                (row.get(0)?, row.get(1)?, row.get(2)?);
+            if schema == "main" && kind == "shadow" {
+                shadow.insert(name);
+            }
+        }
+        let mut statement = connection
+            .prepare("SELECT name, sql, rootpage FROM main.sqlite_schema WHERE type = 'table'")?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+            ))
+        })?;
+        let mut live = BTreeMap::new();
+        for row in rows {
+            let (name, sql, rootpage) = row?;
+            if !exported_table(&name)
+                || self.filter.denied.contains(&name)
+                || shadow.contains(&name)
+            {
+                continue;
+            }
+            let sql = sql.unwrap_or_default();
+            let virtual_table = is_virtual_sql(&sql);
+            live.insert(
+                name,
+                LiveTable {
+                    sql,
+                    rootpage: rootpage.unwrap_or(0),
+                    virtual_table,
+                },
+            );
+        }
+        Ok(live)
+    }
+
+    /// Compare the schema with the generations and bring them up to date,
+    /// persisting what moved. Returns the `schema` records that describe the
+    /// change.
+    ///
+    /// Every generation that opens is snapshotted. After an alteration, a
+    /// rename, or a drop and recreate under one name, its rows reached the
+    /// session under the old definition or not at all. Even a new name's
+    /// rows may have: a table created, written, and renamed in one interval
+    /// was tracked under its first name. The snapshot of a table just
+    /// created holds the rows its rows records would have held.
+    fn compare_schema(
+        &mut self,
+        connection: &Connection,
+        since: Since,
+    ) -> anyhow::Result<Vec<SchemaChange>> {
+        let version = schema_cookie(connection)?;
+        self.schema_moved = self.compared_version != Some(version);
+        if !self.schema_moved {
+            // Nothing was dropped if nothing changed.
+            self.hinted.clear();
+            return Ok(Vec::new());
+        }
+        let live = self.live_tables(connection)?;
+        // A generation is released only once stored: a later residency must
+        // never reuse one a consumer has seen. If the store fails, this
+        // comparison is undone and the next pull repeats it.
+        let before = (self.generations.clone(), self.hinted.clone());
+        let hinted = std::mem::take(&mut self.hinted);
+        let vanished: Vec<String> = self
+            .generations
+            .iter()
+            .filter(|(name, tracked)| tracked.sql.is_some() && !live.contains_key(*name))
+            .map(|(name, _)| name.clone())
+            .collect();
+        let opened: Vec<&String> = live
+            .iter()
+            .filter(|(name, table)| match self.generations.get(*name) {
+                Some(tracked @ Tracked { sql: Some(sql), .. }) => {
+                    // A new root page is a new b-tree: the table was dropped
+                    // and recreated. Nothing else moves one, since VACUUM is
+                    // denied and cells do not use auto-vacuum.
+                    let moved = !tracked.virtual_table
+                        && tracked.rootpage > 0
+                        && tracked.rootpage != table.rootpage;
+                    *sql != table.sql || hinted.contains(*name) || moved
+                }
+                _ => true,
+            })
+            .map(|(name, _)| name)
+            .collect();
+        // A rename keeps the root page. A drop and create in one interval can
+        // reuse it too, and is then reported as a rename: the consumer's
+        // result is the same, since the new generation is snapshotted.
+        let mut renamed_from: HashMap<String, String> = HashMap::new();
+        for name in &opened {
+            let table = &live[*name];
+            if table.virtual_table || table.rootpage <= 0 {
+                continue;
+            }
+            if let Some(from) = vanished.iter().find(|from| {
+                let tracked = &self.generations[*from];
+                !tracked.virtual_table
+                    && tracked.rootpage == table.rootpage
+                    && !renamed_from.values().any(|used| used == *from)
+            }) {
+                renamed_from.insert((*name).clone(), from.clone());
+            }
+        }
+
+        let mut changes = Vec::new();
+        let mut moved: Vec<String> = Vec::new();
+        for name in &vanished {
+            let tracked = self.generations.get_mut(name).expect("tracked");
+            let sql = tracked.sql.take().unwrap_or_default();
+            moved.push(name.clone());
+            if renamed_from.values().any(|from| from == name) {
+                // Closed by the new name's `renamed_from`.
+                continue;
+            }
+            changes.push(SchemaChange {
+                body: SchemaBody {
+                    table: name.clone(),
+                    generation: tracked.generation,
+                    sql,
+                    columns: Vec::new(),
+                    dropped: true,
+                    renamed_from: None,
+                    unsupported: tracked.virtual_table,
+                },
+                snapshot: false,
+            });
+        }
+        let opened: Vec<String> = opened.into_iter().cloned().collect();
+        for name in &opened {
+            let table = &live[name];
+            let first_seen = !self.generations.contains_key(name);
+            let generation = self
+                .generations
+                .get(name)
+                .map_or(FIRST_GENERATION, |tracked| tracked.generation + 1);
+            self.generations.insert(
+                name.clone(),
+                Tracked {
+                    generation,
+                    sql: Some(table.sql.clone()),
+                    rootpage: table.rootpage,
+                    virtual_table: table.virtual_table,
+                },
+            );
+            moved.push(name.clone());
+            if since == Since::Never && first_seen {
+                continue;
+            }
+            let mut body = self.schema_body(connection, name);
+            body.renamed_from = renamed_from.get(name).cloned();
+            changes.push(SchemaChange {
+                body,
+                snapshot: !table.virtual_table,
+            });
+        }
+        for (name, table) in &live {
+            if let Some(tracked) = self.generations.get_mut(name) {
+                tracked.rootpage = table.rootpage;
+            }
+        }
+        match self.store_generations(connection, &moved) {
+            // The store read the cookie after any change of its own.
+            Ok(cookie) => self.compared_version = Some(cookie),
+            Err(error) => {
+                (self.generations, self.hinted) = before;
+                return Err(error.context("store generations"));
+            }
+        }
+        Ok(changes)
+    }
+
+    /// Write the generations of `names` to [`GENERATIONS_TABLE`], with the
+    /// schema cookie they were compared at. Returns that cookie. Nothing is
+    /// written when neither the generations nor the stored cookie would
+    /// change, as for a cell that has never had an exported table.
+    fn store_generations(
+        &mut self,
+        connection: &Connection,
+        names: &[String],
+    ) -> anyhow::Result<i64> {
+        use rusqlite::types::Value as Sql;
+        if names.is_empty() && !self.stored {
+            return Ok(schema_cookie(connection)?);
+        }
+        self.wal.quiet.set(true);
+        let result = (|| -> anyhow::Result<i64> {
+            if !self.stored {
+                connection.execute_batch(&format!(
+                    "CREATE TABLE IF NOT EXISTS main.{GENERATIONS_TABLE} (
+                        name TEXT PRIMARY KEY,
+                        generation INTEGER NOT NULL,
+                        schema_sql TEXT,
+                        rootpage INTEGER
+                    ) WITHOUT ROWID"
+                ))?;
+                self.stored = true;
+            }
+            // Read after the create, which moves it; the inserts do not.
+            let cookie = schema_cookie(connection)?;
+            let mut rows: Vec<[Sql; 4]> = names
+                .iter()
+                .map(|name| {
+                    let tracked = &self.generations[name];
+                    [
+                        Sql::Text(name.clone()),
+                        Sql::Integer(i64::try_from(tracked.generation).unwrap_or(i64::MAX)),
+                        tracked.sql.clone().map_or(Sql::Null, Sql::Text),
+                        Sql::Integer(tracked.rootpage),
+                    ]
+                })
+                .collect();
+            rows.push([
+                Sql::Text(COOKIE_ROW.to_string()),
+                Sql::Integer(cookie),
+                Sql::Null,
+                Sql::Null,
+            ]);
+            // SQLITE_LIMIT_VARIABLE_NUMBER on the cell connection is 100.
+            // A failure part way leaves some generations stored ahead of
+            // what was released, which only skips numbers.
+            for chunk in rows.chunks(24) {
+                let tuples: Vec<String> = (0..chunk.len())
+                    .map(|i| {
+                        let n = i * 4;
+                        format!("(?{}, ?{}, ?{}, ?{})", n + 1, n + 2, n + 3, n + 4)
+                    })
+                    .collect();
+                connection.execute(
+                    &format!(
+                        "INSERT INTO main.{GENERATIONS_TABLE} (name, generation, schema_sql, rootpage)
+                         VALUES {} ON CONFLICT(name) DO UPDATE SET
+                         generation = excluded.generation, schema_sql = excluded.schema_sql,
+                         rootpage = excluded.rootpage",
+                        tuples.join(", ")
+                    ),
+                    rusqlite::params_from_iter(chunk.iter().flatten()),
+                )?;
+            }
+            Ok(cookie)
+        })();
+        self.wal.quiet.set(false);
+        result
+    }
+
+    /// The `schema` record for `table` at its current generation. The
+    /// columns are left empty when the table cannot be inspected, which a
+    /// virtual table whose module is not loaded cannot; `sql` still says
+    /// what the table is.
+    fn schema_body(&self, connection: &Connection, table: &str) -> SchemaBody {
+        let tracked = self.generations.get(table);
+        let virtual_table = tracked.is_some_and(|t| t.virtual_table);
+        let columns = read_columns(connection, table).unwrap_or_else(|error| {
+            tracing::warn!(scope = %self.filter.scope, table, %error, "export capture: read columns");
+            Vec::new()
+        });
+        SchemaBody {
+            table: table.to_string(),
+            generation: self.generation(table),
+            sql: tracked.and_then(|t| t.sql.clone()).unwrap_or_default(),
+            columns,
+            dropped: false,
+            renamed_from: None,
+            unsupported: virtual_table,
+        }
+    }
+
+    /// Every row of `table` as an insert, or `None` when its encoding exceeds
+    /// what is left of the commit's snapshot `budget`, which it draws from.
+    fn snapshot_table(
+        &mut self,
+        connection: &Connection,
+        table: &str,
+        budget: &mut u64,
+    ) -> anyhow::Result<Option<TableRows>> {
+        let shape = self.shape(connection, table)?.clone();
+        let mut statement = connection.prepare(&scan_sql(table, &shape))?;
+        let mut rows = statement.query([])?;
+        // A rowid-only table's scan leads with the rowid, its key.
+        let key_width = usize::from(shape.rowid_only());
+        let mut changes = Vec::new();
+        let mut bytes: u64 = 0;
+        while let Some(row) = rows.next()? {
+            let width = row.as_ref().column_count();
+            let values: Vec<Value> = (0..width)
+                .map(|i| Ok(from_row(row.get_ref(i)?)))
+                .collect::<anyhow::Result<_>>()?;
+            bytes += values.iter().map(encoded_size).sum::<u64>() + 8;
+            if bytes > *budget {
+                return Ok(None);
+            }
+            let (key, row) = values.split_at(key_width);
+            let key = if shape.rowid_only() {
+                key.to_vec()
+            } else {
+                shape.key.iter().map(|&i| row[i].clone()).collect()
+            };
+            changes.push(RowChange(Op::Insert, key, row.to_vec()));
+        }
+        *budget -= bytes;
+        Ok(Some(TableRows {
+            table: table.to_string(),
+            generation: self.generation(table),
+            columns: shape.columns.clone(),
+            key_columns: shape.key_columns(),
+            rows: changes,
+        }))
     }
 
     fn shape(&mut self, connection: &Connection, table: &str) -> anyhow::Result<&Shape> {
@@ -720,13 +1447,13 @@ impl Capture {
         changes
     }
 
-    /// Turn raw changes into whole-row records. A table whose changes cannot
-    /// be materialized becomes `bulk`.
+    /// Turn raw changes into whole-row records. Also returns the tables
+    /// whose changes could not be materialized.
     fn materialize(
         &mut self,
         connection: &Connection,
         changes: Vec<Change>,
-    ) -> (Vec<TableRows>, Vec<TableGen>) {
+    ) -> (Vec<TableRows>, Vec<String>) {
         let mut order: Vec<String> = Vec::new();
         let mut by_table: HashMap<String, Vec<Change>> = HashMap::new();
         {
@@ -757,14 +1484,11 @@ impl Capture {
                 Ok(Some(rows)) => tables.push(rows),
                 Ok(None) => {}
                 Err(error) => {
-                    tracing::warn!(
+                    tracing::debug!(
                         scope = %self.filter.scope, table, %error,
-                        "export capture: table exported as bulk"
+                        "export capture: rows not materialized"
                     );
-                    bulk.push(TableGen {
-                        table,
-                        generation: FIRST_GENERATION,
-                    });
+                    bulk.push(table);
                 }
             }
         }
@@ -820,7 +1544,7 @@ impl Capture {
         }
         Ok(TableRows {
             table: table.to_string(),
-            generation: FIRST_GENERATION,
+            generation: self.generation(table),
             columns: shape.columns.clone(),
             key_columns: shape.key_columns(),
             rows,
@@ -833,8 +1557,12 @@ impl Drop for Capture {
         self.end_session();
         // SAFETY: the connection outlives the capture (`OpenCell` drops the
         // capture first). Put the default autocheckpoint back, which also
-        // removes the hook that points at `wal`.
-        unsafe { ffi::sqlite3_wal_autocheckpoint(self.database, AUTOCHECKPOINT_FRAMES) };
+        // removes the WAL hook, and remove the commit hook; both point at
+        // `wal`.
+        unsafe {
+            ffi::sqlite3_wal_autocheckpoint(self.database, AUTOCHECKPOINT_FRAMES);
+            ffi::sqlite3_commit_hook(self.database, None, ptr::null_mut());
+        }
     }
 }
 
@@ -1039,6 +1767,100 @@ fn lookup_sql(table: &str, shape: &Shape) -> anyhow::Result<String> {
         columns.join(", "),
         quote(table)
     ))
+}
+
+/// The key-value tables are exported in another shape than they are stored
+/// (plan piece 12): `_cf_KV` as `kv` with columns `key` and `value`, the key
+/// being `k` alone and the value decoded JSON with no declared type, and
+/// `__kv` with a `blob_key` column naming a large value's bucket object. A
+/// schema record describes the exported shape.
+fn exported_schema(mut schema: SchemaBody) -> SchemaBody {
+    let column = |name: &str, decl_type: &str, pk: u32| ColumnDef {
+        name: name.to_string(),
+        decl_type: decl_type.to_string(),
+        pk,
+        not_null: pk > 0,
+        generated: false,
+    };
+    match schema.table.as_str() {
+        kv::KV_SOURCE => {
+            schema.table = kv::KV_TABLE.to_string();
+            if !schema.columns.is_empty() {
+                schema.columns = vec![column("key", "TEXT", 1), column("value", "", 0)];
+            }
+        }
+        // Only a table with `blob_id` gains `blob_key`, as its rows do.
+        kv::NAMESPACE_TABLE if schema.columns.iter().any(|c| c.name == "blob_id") => {
+            schema.columns.push(column(kv::BLOB_KEY_COLUMN, "TEXT", 0));
+        }
+        _ => {}
+    }
+    schema
+}
+
+/// Every row of a table, led by the rowid for a rowid-only table.
+fn scan_sql(table: &str, shape: &Shape) -> String {
+    let columns = shape
+        .rowid
+        .map(str::to_string)
+        .into_iter()
+        .chain(shape.columns.iter().map(|c| quote(c)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("SELECT {columns} FROM main.{}", quote(table))
+}
+
+/// The schema cookie, which every schema change on the connection moves.
+fn schema_cookie(connection: &Connection) -> rusqlite::Result<i64> {
+    connection
+        .prepare_cached("PRAGMA schema_version")?
+        .query_row([], |row| row.get(0))
+}
+
+fn is_virtual_sql(sql: &str) -> bool {
+    let mut words = sql.split_ascii_whitespace();
+    words
+        .next()
+        .is_some_and(|w| w.eq_ignore_ascii_case("create"))
+        && words
+            .next()
+            .is_some_and(|w| w.eq_ignore_ascii_case("virtual"))
+}
+
+/// A table's columns as `PRAGMA table_xinfo` reports them, without the
+/// hidden columns of a virtual table.
+fn read_columns(connection: &Connection, table: &str) -> anyhow::Result<Vec<ColumnDef>> {
+    let mut statement =
+        connection.prepare(&format!("PRAGMA main.table_xinfo({})", quote(table)))?;
+    let mut rows = statement.query([])?;
+    let mut columns = Vec::new();
+    while let Some(row) = rows.next()? {
+        let hidden: i64 = row.get(6)?;
+        if hidden == 1 {
+            continue;
+        }
+        columns.push(ColumnDef {
+            name: row.get(1)?,
+            decl_type: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            pk: u32::try_from(row.get::<_, i64>(5)?).unwrap_or(0),
+            not_null: row.get::<_, i64>(3)? != 0,
+            generated: hidden >= 2,
+        });
+    }
+    anyhow::ensure!(!columns.is_empty(), "table {table} does not exist");
+    Ok(columns)
+}
+
+/// Roughly what a value adds to a record's JSON, for the snapshot budget.
+fn encoded_size(value: &Value) -> u64 {
+    let bytes = match value {
+        Value::Null => 4,
+        Value::Integer(_) | Value::Real(_) => 20,
+        Value::Text(t) => t.len() + 2,
+        // Base64 in `{"$blob": "…"}`.
+        Value::Blob(b) => b.len().div_ceil(3) * 4 + 12,
+    };
+    bytes as u64 + 1
 }
 
 fn read_row(lookup: &mut rusqlite::Statement<'_>, key: &[Value]) -> anyhow::Result<Vec<Value>> {
