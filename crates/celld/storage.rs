@@ -20,6 +20,7 @@ use std::ffi::{CStr, CString};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+pub(crate) mod export_capture;
 pub(crate) mod wake_record;
 
 /// Read the alarm and its identity before releasing the source's SQLite lock.
@@ -71,6 +72,13 @@ pub struct Cells {
     sql_critical_errors: RefCell<HashMap<String, String>>,
     /// The schema cookie last read for a cell, and what it was read against.
     schema_cookies: RefCell<HashMap<String, SchemaCookie>>,
+    /// Change-export capture, when export is on for this isolate's cells.
+    /// See [`export_capture`].
+    export_capture: std::cell::Cell<Option<export_capture::Settings>>,
+    /// Cells whose capture session saw a write since its last pull.
+    export_dirty: export_capture::DirtyList,
+    /// What capture reported per cell and release has not taken yet.
+    export_events: RefCell<HashMap<String, Vec<export_capture::CaptureEvent>>>,
 }
 
 /// The database and the ownership epoch that authorized its activation.
@@ -79,6 +87,9 @@ pub struct Cells {
 /// prevents asynchronous object-store work from recovering an epoch through a
 /// later ownership lookup after a takeover.
 struct OpenCell {
+    /// Declared before `connection` and dropped first by `Drop`: the session
+    /// holds the connection's handle.
+    capture: Option<export_capture::Capture>,
     connection: Connection,
     epoch: u64,
     replicated_wake: bool,
@@ -88,6 +99,13 @@ struct OpenCell {
     /// read-only answer reports what it observed only above it, and a reader
     /// on a cell no handler has written asks for no proof.
     published_position: Option<u64>,
+}
+
+impl Drop for OpenCell {
+    fn drop(&mut self) {
+        // A session must be deleted before its connection closes.
+        drop(self.capture.take());
+    }
 }
 
 enum StorageBacking {
@@ -222,6 +240,15 @@ impl Cells {
             return Installed(CURRENT_CELLS.get());
         }
         Installed(CURRENT_CELLS.replace(self))
+    }
+}
+
+impl Cells {
+    /// Capture row changes on every cell opened from now on, for change
+    /// export. Off by default.
+    #[allow(dead_code)] // Wired with the live export path.
+    pub(crate) fn set_export_capture(&self, settings: Option<export_capture::Settings>) {
+        self.export_capture.set(settings);
     }
 }
 
@@ -463,6 +490,11 @@ thread_local! {
     /// judged by it. Everything else the authorizer denies -- pragmas,
     /// ATTACH, load_extension -- stays denied for both.
     static USER_SQL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set while change export pulls a capture session. The session module
+    /// wraps changeset generation in `SAVEPOINT changeset`, which the
+    /// authorizer otherwise denies; toggling the authorizer off instead would
+    /// expire every cached statement on each pull.
+    static CAPTURE_PULL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Run `callback` with application-SQL restrictions in force.
@@ -553,6 +585,11 @@ fn authorize_sql(context: rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::
     SQL_PREPARES.fetch_add(1, Ordering::Relaxed);
 
     let prohibited = match context.action {
+        AuthAction::Savepoint { savepoint_name, .. }
+            if savepoint_name == "changeset" && CAPTURE_PULL.with(std::cell::Cell::get) =>
+        {
+            false
+        }
         // The Attach deny is also the only thing blocking VACUUM and VACUUM
         // INTO: SQLite emits no distinct authorizer action for VACUUM and
         // implements it via an internal ATTACH, which lands here. Relaxing
@@ -868,10 +905,22 @@ fn finish_open(
     close_sql_cursors(scope);
     close_sql_statement_cache(scope);
     sql_critical_errors(|errors| errors.borrow_mut().remove(scope));
+    // Installed last, so the engine's own open-time writes are not captured.
+    let capture = cells(|cells| {
+        let settings = cells.export_capture.get()?;
+        export_capture::Capture::install(&c, scope, settings, cells.export_dirty.clone())
+            .inspect_err(|error| {
+                tracing::error!(scope, %error, "export capture: install session");
+            })
+            .ok()
+    });
+    // A reopen replaces the cell: pull what its old session holds first.
+    export_checkpoint_scope(scope);
     dbs(|d| {
         d.borrow_mut().insert(
             scope.to_string(),
             OpenCell {
+                capture,
                 connection: c,
                 epoch,
                 replicated_wake,
@@ -904,6 +953,10 @@ pub fn close(scope: &str) {
     close_sync_list_cursors(scope);
     close_sql_cursors(scope);
     close_sql_statement_cache(scope);
+    // Pull the last writes before the session goes with the connection.
+    // After the cursors: finalizing an unfinished write cursor commits its
+    // implicit transaction.
+    export_checkpoint_scope(scope);
     sql_critical_errors(|errors| errors.borrow_mut().remove(scope));
     cells(|c| c.schema_cookies.borrow_mut().remove(scope));
     dbs(|d| d.borrow_mut().remove(scope));
@@ -926,6 +979,94 @@ fn with_mut<T>(scope: &str, f: impl FnOnce(&mut Connection) -> T) -> Option<T> {
             .get_mut(scope)
             .map(|cell| f(&mut cell.connection))
     })
+}
+
+/// The change-export check point: pull the capture session of every cell that
+/// wrote since its last pull and is at a safe point. There is no single place
+/// where storage calls return, and some writes bypass the storage ops, so this
+/// runs after every host op and after each writer outside the ops. A cell not
+/// at a safe point stays queued for the next check point.
+pub(crate) fn export_checkpoint() {
+    if CURRENT_CELLS.get().is_null() {
+        return;
+    }
+    let dirty = cells(|c| {
+        let mut dirty = c.export_dirty.borrow_mut();
+        (!dirty.is_empty()).then(|| std::mem::take(&mut *dirty))
+    });
+    for scope in dirty.into_iter().flatten() {
+        export_checkpoint_scope(&scope);
+    }
+}
+
+fn export_checkpoint_scope(scope: &str) {
+    let now_ms = crate::asyncrt::wall_ms();
+    let visited = dbs(|d| {
+        let Ok(mut d) = d.try_borrow_mut() else {
+            // Reached inside a storage call; the next check point retries.
+            return Some((export_capture::Checkpoint::Deferred, false, true));
+        };
+        let cell = d.get_mut(scope)?;
+        let capture = cell.capture.as_mut()?;
+        CAPTURE_PULL.with(|flag| flag.set(true));
+        let result = capture.checkpoint(&cell.connection, now_ms);
+        CAPTURE_PULL.with(|flag| flag.set(false));
+        let caught_up = capture.caught_up(&cell.connection);
+        Some((result, caught_up, capture.needs_visit()))
+    });
+    let Some((result, caught_up, again)) = visited else {
+        return;
+    };
+    let mut events = Vec::new();
+    if let export_capture::Checkpoint::Pulled(commit) = result {
+        events.push(export_capture::CaptureEvent::Commit(commit));
+    }
+    if caught_up {
+        events.push(export_capture::CaptureEvent::CaughtUp);
+    }
+    cells(|c| {
+        if !events.is_empty() {
+            c.export_events
+                .borrow_mut()
+                .entry(scope.to_string())
+                .or_default()
+                .extend(events);
+        }
+        if again {
+            let mut dirty = c.export_dirty.borrow_mut();
+            if !dirty.iter().any(|queued| queued == scope) {
+                dirty.push(scope.to_string());
+            }
+        }
+    });
+}
+
+/// Report that `scope` is caught up if it is: at a safe point with every
+/// commit pulled. Check points report this on their own; the live path calls
+/// this on the cell's thread when release needs a quiet cell to settle a
+/// capture that holds no exported commit.
+#[allow(dead_code)] // Called by the live export path.
+pub(crate) fn export_report_caught_up(scope: &str) {
+    let caught_up = dbs(|d| {
+        let d = d.try_borrow().ok()?;
+        let cell = d.get(scope)?;
+        Some(cell.capture.as_ref()?.caught_up(&cell.connection))
+    });
+    if caught_up == Some(true) {
+        cells(|c| {
+            c.export_events
+                .borrow_mut()
+                .entry(scope.to_string())
+                .or_default()
+                .push(export_capture::CaptureEvent::CaughtUp);
+        });
+    }
+}
+
+/// What capture reported for `scope` since the last call, in order.
+#[allow(dead_code)] // Drained by release once the live export path is wired.
+pub(crate) fn take_capture_events(scope: &str) -> Vec<export_capture::CaptureEvent> {
+    cells(|c| c.export_events.borrow_mut().remove(scope)).unwrap_or_default()
 }
 
 /// Return the epoch installed with the active cell database.
@@ -3319,6 +3460,7 @@ pub fn abandon_open_transaction(scope: &str) {
             });
         }
     }
+    export_checkpoint();
 }
 
 #[cfg(celld_internal_tests)]
@@ -4145,6 +4287,12 @@ pub fn transaction<T>(
 /// actor. This is runtime identity metadata, not user storage, so deleteAll()
 /// must not remove it.
 pub fn set_actor_name(scope: &str, name: &str) -> anyhow::Result<()> {
+    let result = set_actor_name_inner(scope, name);
+    export_checkpoint();
+    result
+}
+
+fn set_actor_name_inner(scope: &str, name: &str) -> anyhow::Result<()> {
     with(scope, |connection| -> anyhow::Result<()> {
         connection.execute(
             "INSERT INTO _cf_METADATA(scope, actor_name) VALUES(?1, ?2) \

@@ -222,7 +222,10 @@ fn flush_pending_puts(scope: &mut v8::PinScope, cell: &str) -> Result<(), String
     if entries.is_empty() {
         return Ok(());
     }
-    storage::put_many_serialized(cell, &entries).map_err(|error| error.to_string())
+    let result = storage::put_many_serialized(cell, &entries).map_err(|error| error.to_string());
+    // Buffered puts can be written outside any op.
+    storage::export_checkpoint();
+    result
 }
 
 /// `storage.sync()`: resolve once every write the cell committed before the
