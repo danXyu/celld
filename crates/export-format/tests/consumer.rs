@@ -87,6 +87,7 @@ fn deleted_removes_the_stream_at_or_below_its_position() {
                 facet: None,
                 incarnation: None,
                 subtree: false,
+                through_incarnation: None,
             }),
         ),
         rows(pos(3, 3), "t", 1, vec![put(2, "b")]),
@@ -117,6 +118,7 @@ fn a_facet_deleted_from_the_root_removes_that_incarnation_and_its_subtree() {
             facet: Some("rooms/7".into()),
             incarnation: Some(11),
             subtree: true,
+            through_incarnation: None,
         }),
     ))
     .unwrap();

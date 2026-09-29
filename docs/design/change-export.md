@@ -154,11 +154,14 @@ command that emits authoritative snapshots.
 Every record names the state it belongs to with four identifiers.
 
 - **Stream.** The cell scope, and for a facet the root scope plus the facet
-  path plus an **incarnation**: a random 64-bit value the node writes into
-  the facet's `_cf_METADATA` when it first creates the stream. A facet
+  path plus an **incarnation**: a 64-bit value the node writes into the
+  facet's `_cf_METADATA` when it first creates the stream. A facet
   deleted and recreated under the same path has a new incarnation, so its
-  records cannot be confused with the old stream's. A root cell's
-  incarnation is its first epoch.
+  records cannot be confused with the old stream's. Facet incarnations are
+  ordered per root (the root's epoch, then a counter seeded from the
+  clock), so every facet created before a delete has a smaller incarnation
+  than every facet created after it. A root cell's incarnation is its
+  first epoch.
 - **Position.** `(epoch, txid, commit)`: the cell epoch, the LTX transaction
   id that contains the commit's last WAL frame, and the commit's sequence in
   the epoch. Positions order a stream totally. Consumers never order by
@@ -425,7 +428,13 @@ the incarnation.
 every facet below it, resident or not, locally and in the bucket, with no
 row or DDL event. The exporter emits a `deleted` record for the subtree from
 the root's cell thread at that point, positioned at the root's current
-position, and releases it through the root's next ticket. A recreated facet
+position, and releases it through the root's next ticket. The record names
+the facet path with `subtree` set and carries `through_incarnation`, a bound
+above every incarnation handed out before the delete and below every one
+handed out after it: it removes every stream
+at or under the path with an incarnation at or below that bound, including
+nested facets that were not resident and whose incarnations the node never
+read. A recreated facet
 under the same path gets a new incarnation, and its first records follow the
 `deleted` record in the root stream's order. Repair cannot restore a deleted
 facet, so the `deleted` record is authoritative; if it is lost, the
