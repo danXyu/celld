@@ -689,6 +689,21 @@ pub enum Event {
         result: Result<u64, Failure>,
         source: ProofSource,
     },
+    /// The change exporter asks the output gate to prove the cell's committed
+    /// `position` durable, the way a write's output does, so it may release
+    /// the commits a capture at or below the proof holds. `ticket` is the
+    /// exporter's own id for the ask, returned on [`Effect::ExportProven`].
+    ///
+    /// The barrier gets the gate's authority check, its fence, and the
+    /// ownership read a bucket proof needs, but it never holds a request's
+    /// output and a failed proof does not reset the cell: the exporter
+    /// retries rather than change what the cell serves.
+    ExportTicket {
+        cell: CellId,
+        epoch: Epoch,
+        position: u64,
+        ticket: u64,
+    },
     /// The ownership record still names this node at this epoch
     /// (`Ok`), or does not, or could not be read.
     OwnershipVerified {
@@ -1235,6 +1250,17 @@ pub enum Effect {
     Release {
         request: RequestId,
         channel: Channel,
+        result: Result<(), RequestError>,
+    },
+    /// The verdict on an [`Event::ExportTicket`]. `Ok` means a proof covered
+    /// the ticket's position and, for a bucket proof, the ownership read
+    /// passed: the exporter reads `max(durable_txid, shipped_txid)` now and
+    /// releases up to it. `Err(NodeFenced)` is final for this node; any other
+    /// error is retried with a new ticket.
+    ExportProven {
+        cell: CellId,
+        epoch: Epoch,
+        ticket: u64,
         result: Result<(), RequestError>,
     },
     /// Complete the synchronous resident-selection decision. `None` means
