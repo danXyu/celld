@@ -139,6 +139,10 @@ impl Replication {
         self.ltx.await_durable(cell, epoch, position).await
     }
 
+    pub(crate) fn export_proven_txid(&self, cell: &str, epoch: u64) -> Option<u64> {
+        self.ltx.export_proven_txid(cell, epoch)
+    }
+
     pub(crate) async fn evict(
         &self,
         cell: &str,

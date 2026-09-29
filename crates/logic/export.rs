@@ -293,6 +293,29 @@ impl<T> Attribution<T> {
         self.release();
     }
 
+    /// A commit the cell thread pulled whose WAL point could not be read,
+    /// because the capture loop restarted or truncated the WAL between the
+    /// commit and the WAL hook's read. The capture loop does that only after
+    /// it captured and reported every frame, so the capture that holds the
+    /// commit has already arrived: the commit is dropped into a gap bounded
+    /// by the latest capture, like a commit a capture passed.
+    pub fn unplaced(&mut self, bytes: u64, payload: T) {
+        let at = self.last_commit.unwrap_or(WalPoint {
+            generation: WalGeneration { salt1: 0, salt2: 0 },
+            frames: 0,
+        });
+        self.pending.push_back(Entry::Commit {
+            at,
+            label: None,
+            bytes,
+            payload,
+        });
+        self.pending_bytes = self.pending_bytes.saturating_add(bytes);
+        self.unmatched_total += 1;
+        self.drop_commit(self.pending.len() - 1, true);
+        self.release();
+    }
+
     /// A file the capture loop wrote, in TXID order.
     pub fn captured(&mut self, capture: &Capture) {
         if capture.txid <= self.captured_txid {

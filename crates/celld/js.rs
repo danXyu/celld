@@ -6093,7 +6093,16 @@ impl Worker {
                 original_heap_limit,
                 compat,
                 loader_owner,
-                cells: storage::Cells::default(),
+                cells: {
+                    let cells = storage::Cells::default();
+                    // Change export captures on this isolate's cells only
+                    // when the node exports.
+                    if let Some(exporter) = crate::export_live::installed() {
+                        cells.set_export_capture(Some(exporter.capture_settings()));
+                        cells.set_export_script(script_name);
+                    }
+                    cells
+                },
             }),
         })
     }

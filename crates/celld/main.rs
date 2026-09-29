@@ -2939,7 +2939,12 @@ async fn handle_internal(
         "/state" => {
             let snapshot = app.snapshot().await;
             match celld::runtime_identity::state_json(&snapshot, &app.process_generation) {
-                Ok(state) => response(StatusCode::OK, state.to_string()),
+                Ok(mut state) => {
+                    if let Some(exporter) = celld::export_live::installed() {
+                        state["export"] = exporter.state();
+                    }
+                    response(StatusCode::OK, state.to_string())
+                }
                 Err(_) => response(StatusCode::INTERNAL_SERVER_ERROR, "invalid actor state"),
             }
         }
@@ -3535,7 +3540,7 @@ fn main() -> anyhow::Result<()> {
 
 async fn async_main(
     telemetry_config: Option<celld::telemetry::Config>,
-    export_config: Option<celld::export::Config>,
+    mut export_config: Option<celld::export::Config>,
 ) -> anyhow::Result<()> {
     #[cfg(all(test, celld_internal_tests))]
     let shutdown_accept_failure_test_active =
@@ -3910,6 +3915,25 @@ async fn async_main(
                     region: settings.region.clone(),
                 },
             )?;
+            // Change export starts before the runtime, so every isolate it
+            // creates captures and every replica it opens reports captures.
+            if let Some(config) = export_config.take() {
+                let bucket = match config.bucket_override.as_deref() {
+                    Some(bucket) => fleet::bucket_client_with_credentials(
+                        bucket,
+                        settings.endpoint.as_deref(),
+                        &settings.region,
+                        managed_storage.as_ref(),
+                    )?,
+                    // Its own client, as for telemetry, so export PUTs never
+                    // share a connection pool with ownership traffic.
+                    None => node_bucket(&settings, managed_storage.as_ref(), false)?,
+                };
+                let export_tx = tx.clone();
+                celld::export_live::Exporter::start(config, bucket, node.clone(), move |ask| {
+                    let _ = export_tx.send(Message::ExportTicket(ask));
+                })?;
+            }
             let runtime = RuntimeManager::start(
                 generation,
                 RuntimeOptions {
@@ -4205,9 +4229,9 @@ async fn async_main(
         };
         celld::telemetry::init(config, sink_bucket, node.clone(), settings.region.clone())?;
     }
-    // With export off nothing below is constructed. The exporter itself
-    // starts here once its sinks exist; until then an enabled node only
-    // refuses a configuration it could never serve.
+    // With export off nothing was constructed. With it on, the exporter
+    // started with the fleet bucket above; a node without one still holds
+    // the configuration, which it cannot serve.
     if let Some(config) = &export_config {
         // Like telemetry, CELLD_EXPORT_BUCKET borrows the fleet bucket's
         // endpoint and credentials, so it needs a fleet bucket too.
@@ -4218,6 +4242,7 @@ async fn async_main(
                  for a node without one"
             );
         }
+        anyhow::bail!("CELLD_EXPORT=1 needs the node's bucket-backed runtime");
     }
     let peer_auth = Arc::new(PeerAuth::new(peer_key, node.clone())?);
     // Connect-only timeout: a peer request may legitimately run through a
@@ -5653,6 +5678,17 @@ async fn async_main(
         shutdown_accept_failure_test_active,
         "local durability shutdown finished",
     );
+    // Write what the export sink holds, within the process deadline. What
+    // is cut off was never acknowledged, so no watermark claims it.
+    if let Some(exporter) = celld::export_live::installed() {
+        let remaining = process_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if tokio::time::timeout(remaining, exporter.close())
+            .await
+            .is_err()
+        {
+            tracing::warn!("change export: the sink's last flush exceeded the process deadline");
+        }
+    }
     // Exit without unwinding. Returning from here drops the tokio runtime
     // and the V8 platform underneath tasks and isolates that are still
     // alive -- on a deadline-cut drain that teardown segfaults (status 139

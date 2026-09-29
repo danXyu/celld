@@ -77,8 +77,11 @@ pub struct Cells {
     export_capture: std::cell::Cell<Option<export_capture::Settings>>,
     /// Cells whose capture session saw a write since its last pull.
     export_dirty: export_capture::DirtyList,
-    /// What capture reported per cell and release has not taken yet.
+    /// What capture reported per cell and release has not taken yet, for a
+    /// cell with no live export stream (tests read it directly).
     export_events: RefCell<HashMap<String, Vec<export_capture::CaptureEvent>>>,
+    /// The script of the isolate's deployment, named in export records.
+    export_script: RefCell<String>,
 }
 
 /// The database and the ownership epoch that authorized its activation.
@@ -90,6 +93,8 @@ struct OpenCell {
     /// Declared before `connection` and dropped first by `Drop`: the session
     /// holds the connection's handle.
     capture: Option<export_capture::Capture>,
+    /// Where pulled commits go when the node exports this cell.
+    export_stream: Option<crate::export_live::CellStream>,
     connection: Connection,
     epoch: u64,
     replicated_wake: bool,
@@ -246,9 +251,13 @@ impl Cells {
 impl Cells {
     /// Capture row changes on every cell opened from now on, for change
     /// export. Off by default.
-    #[allow(dead_code)] // Wired with the live export path.
     pub(crate) fn set_export_capture(&self, settings: Option<export_capture::Settings>) {
         self.export_capture.set(settings);
+    }
+
+    /// The deployment's script, which export records name.
+    pub(crate) fn set_export_script(&self, script: &str) {
+        *self.export_script.borrow_mut() = script.to_string();
     }
 }
 
@@ -906,13 +915,38 @@ fn finish_open(
     close_sql_statement_cache(scope);
     sql_critical_errors(|errors| errors.borrow_mut().remove(scope));
     // Installed last, so the engine's own open-time writes are not captured.
-    let capture = cells(|cells| {
-        let settings = cells.export_capture.get()?;
-        export_capture::Capture::install(&c, scope, settings, cells.export_dirty.clone())
-            .inspect_err(|error| {
-                tracing::error!(scope, %error, "export capture: install session");
-            })
-            .ok()
+    // With the live path on, only a cell whose replica opened an export
+    // stream is captured; without it (tests) every cell is, into
+    // `export_events`.
+    let (capture, export_stream) = cells(|cells| {
+        let Some(settings) = cells.export_capture.get() else {
+            return (None, None);
+        };
+        let export_stream = match crate::export_live::installed() {
+            Some(exporter) => {
+                match exporter.attach(scope, epoch, &cells.export_script.borrow()) {
+                    Some(stream) => Some(stream),
+                    None => return (None, None),
+                }
+            }
+            None => None,
+        };
+        let denied = export_stream
+            .as_ref()
+            .map(crate::export_live::CellStream::denied_tables)
+            .unwrap_or_default();
+        let capture = export_capture::Capture::install(
+            &c,
+            scope,
+            settings,
+            denied,
+            cells.export_dirty.clone(),
+        )
+        .inspect_err(|error| {
+            tracing::error!(scope, %error, "export capture: install session");
+        })
+        .ok();
+        (capture, export_stream)
     });
     // A reopen replaces the cell: pull what its old session holds first.
     export_checkpoint_scope(scope);
@@ -921,6 +955,7 @@ fn finish_open(
             scope.to_string(),
             OpenCell {
                 capture,
+                export_stream,
                 connection: c,
                 epoch,
                 replicated_wake,
@@ -1002,25 +1037,50 @@ fn export_checkpoint_scope(scope: &str) {
     let visited = dbs(|d| {
         let Ok(mut d) = d.try_borrow_mut() else {
             // Reached inside a storage call; the next check point retries.
-            return Some((export_capture::Checkpoint::Deferred, false, true));
+            return Some((export_capture::Checkpoint::Deferred, false, true, None));
         };
         let cell = d.get_mut(scope)?;
         let capture = cell.capture.as_mut()?;
         CAPTURE_PULL.with(|flag| flag.set(true));
         let result = capture.checkpoint(&cell.connection, now_ms);
         CAPTURE_PULL.with(|flag| flag.set(false));
+        // At a safe point the WAL hook's stamp belongs to what was pulled.
+        let stamp = match result {
+            export_capture::Checkpoint::Deferred => None,
+            _ => capture.take_wal_stamp(),
+        };
         let caught_up = capture.caught_up(&cell.connection);
-        Some((result, caught_up, capture.needs_visit()))
+        let again = capture.needs_visit();
+        // The gate proves the cell's committed-write position, sampled after
+        // the commit, the way an output's barrier does.
+        let live = cell.export_stream.clone().map(|stream| {
+            let stamp = stamp.unwrap_or(export_capture::WalStamp::Unplaced);
+            let position = matches!(result, export_capture::Checkpoint::Pulled(_))
+                .then(|| fingerprint(scope, &cell.connection))
+                .unwrap_or(0);
+            (stream, stamp, position)
+        });
+        Some((result, caught_up, again, live))
     });
-    let Some((result, caught_up, again)) = visited else {
+    let Some((result, caught_up, again, live)) = visited else {
         return;
     };
     let mut events = Vec::new();
-    if let export_capture::Checkpoint::Pulled(commit) = result {
-        events.push(export_capture::CaptureEvent::Commit(commit));
-    }
-    if caught_up {
-        events.push(export_capture::CaptureEvent::CaughtUp);
+    if let Some((stream, stamp, position)) = live {
+        // Straight onto the stream's FIFO, in the order they happened.
+        if let export_capture::Checkpoint::Pulled(commit) = result {
+            stream.commit(stamp, position, commit);
+        }
+        if caught_up {
+            stream.caught_up();
+        }
+    } else {
+        if let export_capture::Checkpoint::Pulled(commit) = result {
+            events.push(export_capture::CaptureEvent::Commit(commit));
+        }
+        if caught_up {
+            events.push(export_capture::CaptureEvent::CaughtUp);
+        }
     }
     cells(|c| {
         if !events.is_empty() {

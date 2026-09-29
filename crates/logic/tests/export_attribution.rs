@@ -666,3 +666,40 @@ mod interleaving {
         }
     }
 }
+
+#[test]
+fn an_unplaced_commit_becomes_a_gap_bounded_by_the_latest_capture() {
+    let mut state = Attribution::new();
+    state.commit(at(1, 2), 10, 1u32);
+    state.captured(&partial(1, 1, 0, 2));
+    state.captured(&partial(2, 1, 2, 4));
+    // The WAL hook lost the race with a restart: the capture holding the
+    // commit is one of those already reported.
+    state.unplaced(10, 2);
+    state.commit(at(1, 5), 10, 3);
+    state.captured(&partial(3, 1, 4, 5));
+    state.proven(3);
+    let released = state.take_released();
+    assert_eq!(
+        released,
+        vec![
+            Released::Commit {
+                label: 1,
+                payload: 1
+            },
+            // The gap starts at the released position before this release.
+            Released::Gap {
+                after: 0,
+                through: 2,
+                unmatched: 1,
+                overflowed: 0
+            },
+            Released::Commit {
+                label: 3,
+                payload: 3
+            },
+        ]
+    );
+    assert_eq!(state.unmatched_total(), 1);
+    assert_eq!(state.pending_bytes(), 0);
+}

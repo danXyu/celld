@@ -14,8 +14,12 @@
 //! neither live beside the connection in `OpenCell` nor set
 //! `SQLITE_SESSION_OBJCONFIG_ROWID`. [`Capture`] drives the C API directly.
 //!
-//! What this module does not do yet: positions (the WAL stamp and the LTX
-//! label arrive with the live path), table generations (every table is at
+//! A WAL hook on the same connection stamps each commit with where its last
+//! frame landed ([`WalStamp`]), which release matches against the LTX files
+//! the capture loop reports. Installing the hook replaces SQLite's default
+//! autocheckpoint, so the hook runs the same passive checkpoint itself.
+//!
+//! What this module does not do yet: table generations (every table is at
 //! [`FIRST_GENERATION`] until DDL tracking lands), and the `kv` mapping of
 //! `_cf_KV`, which is exported as the raw table here.
 
@@ -112,12 +116,125 @@ pub(crate) fn safe_point(connection: &Connection) -> bool {
             != ffi::SQLITE_TXN_WRITE
 }
 
+/// SQLite's default `wal_autocheckpoint`. The cell connection never sets
+/// one, so this is what it ran before the export hook replaced the default.
+pub(crate) const AUTOCHECKPOINT_FRAMES: c_int = 1000;
+
+/// Where a commit's last frame landed in the WAL.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WalStamp {
+    /// The WAL generation named by its header salts, and the number of
+    /// frames in it through the commit (the WAL hook's count).
+    At { salt1: u32, salt2: u32, frames: u64 },
+    /// The hook could not read the generation its commit landed in: the WAL
+    /// was restarted or truncated between the commit and the read. Only the
+    /// capture loop does that, and only after it captured every frame, so
+    /// the file holding the commit was already reported.
+    Unplaced,
+}
+
+/// What the WAL hook needs. Boxed for the same reason as [`FilterState`].
+struct WalState {
+    /// The newest commit's stamp since the last pull.
+    last: Cell<Option<WalStamp>>,
+}
+
+/// SQLite calls this after each commit on the connection, with the number
+/// of frames now in the WAL.
+///
+/// # Safety
+///
+/// `context` is the `WalState` the owning `Capture` registered, which
+/// outlives the hook: `Capture` removes the hook when it drops.
+unsafe extern "C" fn wal_hook(
+    context: *mut c_void,
+    database: *mut ffi::sqlite3,
+    name: *const c_char,
+    frames: c_int,
+) -> c_int {
+    let state = unsafe { &*context.cast::<WalState>() };
+    if unsafe { CStr::from_ptr(name) }.to_bytes() == b"main" {
+        // Read on this thread before any later statement runs, so the header
+        // is the one the commit wrote into unless the capture loop restarted
+        // the WAL in between; the frame's own salts catch that.
+        let stamp = unsafe { read_stamp(database, u64::try_from(frames).unwrap_or(0)) };
+        state.last.set(Some(stamp.unwrap_or(WalStamp::Unplaced)));
+    }
+    // The default hook's passive checkpoint, which this hook replaced.
+    if frames >= AUTOCHECKPOINT_FRAMES {
+        unsafe { ffi::sqlite3_wal_checkpoint(database, name) };
+    }
+    ffi::SQLITE_OK
+}
+
+/// Read the WAL header's salts and check that frame `frames` is a commit
+/// frame of that generation. `None` when the WAL no longer holds it.
+///
+/// # Safety
+///
+/// `database` is a live connection in WAL mode.
+unsafe fn read_stamp(database: *mut ffi::sqlite3, frames: u64) -> Option<WalStamp> {
+    if frames == 0 {
+        return None;
+    }
+    let mut file: *mut ffi::sqlite3_file = ptr::null_mut();
+    // The pager's own handle on the WAL, through whatever VFS opened it.
+    let rc = unsafe {
+        ffi::sqlite3_file_control(
+            database,
+            c"main".as_ptr(),
+            ffi::SQLITE_FCNTL_JOURNAL_POINTER,
+            (&mut file as *mut *mut ffi::sqlite3_file).cast::<c_void>(),
+        )
+    };
+    if rc != ffi::SQLITE_OK || file.is_null() {
+        return None;
+    }
+    let methods = unsafe { (*file).pMethods };
+    if methods.is_null() {
+        return None;
+    }
+    let read = unsafe { (*methods).xRead }?;
+    let mut header = [0u8; 32];
+    let rc = unsafe { read(file, header.as_mut_ptr().cast(), 32, 0) };
+    if rc != ffi::SQLITE_OK {
+        return None;
+    }
+    let word = |bytes: &[u8], at: usize| u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap());
+    let page_size = u64::from(word(&header, 8));
+    let (salt1, salt2) = (word(&header, 16), word(&header, 20));
+    let offset = 32 + (frames - 1) * (24 + page_size);
+    let mut frame = [0u8; 24];
+    let rc = unsafe {
+        read(
+            file,
+            frame.as_mut_ptr().cast(),
+            24,
+            i64::try_from(offset).ok()?,
+        )
+    };
+    // A commit frame records the database size after the commit; a frame of
+    // a later generation carries that generation's salts.
+    (rc == ffi::SQLITE_OK
+        && page_size > 0
+        && word(&frame, 4) != 0
+        && word(&frame, 8) == salt1
+        && word(&frame, 12) == salt2)
+        .then_some(WalStamp::At {
+            salt1,
+            salt2,
+            frames,
+        })
+}
+
 /// What the table filter needs. Boxed so its address survives moves of the
 /// [`Capture`] that owns it, since the session holds a pointer to it.
 struct FilterState {
     scope: String,
     /// Virtual tables and their shadow tables, as of the last refresh.
     excluded: RefCell<HashSet<String>>,
+    /// Tables the operator's `CELLD_EXPORT_TABLES` denies for this class.
+    denied: HashSet<String>,
     /// Per table seen since the last refresh, whether it has generated
     /// columns. The session cannot track such a table: its changeset fails
     /// as a whole with `SQLITE_SCHEMA`.
@@ -187,7 +304,10 @@ unsafe fn generated_columns(database: *mut ffi::sqlite3, table: &str) -> Option<
 unsafe extern "C" fn table_filter(context: *mut c_void, table: *const c_char) -> c_int {
     let state = unsafe { &*context.cast::<FilterState>() };
     let table = unsafe { CStr::from_ptr(table) }.to_string_lossy();
-    if !exported_table(&table) || state.excluded.borrow().contains(table.as_ref()) {
+    if !exported_table(&table)
+        || state.denied.contains(table.as_ref())
+        || state.excluded.borrow().contains(table.as_ref())
+    {
         return 0;
     }
     state.mark_dirty();
@@ -242,6 +362,7 @@ pub(crate) struct Capture {
     session: *mut ffi::sqlite3_session,
     database: *mut ffi::sqlite3,
     filter: Box<FilterState>,
+    wal: Box<WalState>,
     settings: Settings,
     /// Tracking stopped for the current transaction because it exceeded
     /// `max_tx_bytes`.
@@ -259,11 +380,13 @@ impl Capture {
         connection: &Connection,
         scope: &str,
         settings: Settings,
+        denied: HashSet<String>,
         queue: DirtyList,
     ) -> anyhow::Result<Self> {
         let filter = Box::new(FilterState {
             scope: scope.to_string(),
             excluded: RefCell::new(HashSet::new()),
+            denied,
             generated: RefCell::new(HashMap::new()),
             untracked: RefCell::new(Vec::new()),
             dirty: Cell::new(false),
@@ -277,6 +400,9 @@ impl Capture {
             // capture before the connection.
             database: unsafe { connection.handle() },
             filter,
+            wal: Box::new(WalState {
+                last: Cell::new(None),
+            }),
             settings,
             overflowed: false,
             seq: 0,
@@ -285,7 +411,22 @@ impl Capture {
         };
         capture.refresh_schema(connection)?;
         capture.start_session()?;
+        // SAFETY: the connection is live, and `wal` is boxed and outlives the
+        // hook, which `Drop` removes.
+        unsafe {
+            ffi::sqlite3_wal_hook(
+                capture.database,
+                Some(wal_hook),
+                (&*capture.wal as *const WalState).cast_mut().cast::<c_void>(),
+            );
+        }
         Ok(capture)
+    }
+
+    /// Where the newest commit since the last call landed, and forget it.
+    /// `None` when no commit ran since.
+    pub(crate) fn take_wal_stamp(&self) -> Option<WalStamp> {
+        self.wal.last.take()
     }
 
     fn start_session(&mut self) -> anyhow::Result<()> {
@@ -486,6 +627,7 @@ impl Capture {
             if schema == "main"
                 && kind == "table"
                 && exported_table(&name)
+                && !self.filter.denied.contains(&name)
                 && !excluded.contains(&name)
             {
                 tables.push(name);
@@ -652,6 +794,10 @@ impl Capture {
 impl Drop for Capture {
     fn drop(&mut self) {
         self.end_session();
+        // SAFETY: the connection outlives the capture (`OpenCell` drops the
+        // capture first). Put the default autocheckpoint back, which also
+        // removes the hook that points at `wal`.
+        unsafe { ffi::sqlite3_wal_autocheckpoint(self.database, AUTOCHECKPOINT_FRAMES) };
     }
 }
 
