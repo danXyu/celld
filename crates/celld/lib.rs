@@ -341,6 +341,7 @@ pub mod engine_api;
 pub mod env_vars;
 pub mod export;
 pub mod export_restore;
+pub mod export_sink;
 #[cfg(celld_internal_tests)]
 #[allow(clippy::disallowed_methods)]
 #[doc(hidden)]
