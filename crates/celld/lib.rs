@@ -342,6 +342,7 @@ pub mod env_vars;
 pub mod export;
 pub(crate) mod export_kv;
 pub mod export_live;
+pub mod export_restore;
 pub mod export_sink;
 #[cfg(celld_internal_tests)]
 #[allow(clippy::disallowed_methods)]
