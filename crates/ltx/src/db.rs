@@ -132,6 +132,99 @@ impl std::fmt::Display for CheckpointMode {
     }
 }
 
+/// Which step of the capture loop wrote an L0 file. One `sync` can write up
+/// to four files: its own capture, then, when the checkpoint policy fires,
+/// the checkpoint's lead capture, the capture under a passive checkpoint's
+/// writer barrier, and the capture after the checkpoint restarted the WAL.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CaptureKind {
+    /// The capture `Db::sync` takes before its checkpoint policy runs.
+    Sync,
+    /// The capture a checkpoint takes before it runs, to copy the end of
+    /// the WAL it is about to backfill.
+    CheckpointLead,
+    /// The capture under a passive checkpoint's writer barrier, sealing the
+    /// commits that landed after the lead capture.
+    PassiveBarrier,
+    /// The capture after a checkpoint restarted the WAL: the new WAL's
+    /// first frames, or a boundary image of the whole database.
+    PostRestart,
+    /// A baseline seeded by [`Db::seed_l0_baseline`] or
+    /// [`Db::seed_continuation`]. Its pages do not come from this WAL.
+    Seed,
+}
+
+/// The WAL frames one captured L0 file covers: the frames in
+/// `[offset, offset + size)` of the WAL generation named by the salts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct WalRange {
+    pub salt1: u32,
+    pub salt2: u32,
+    /// Byte offset of the first covered frame; `WAL_HEADER_SIZE` when the
+    /// capture starts at the beginning of the WAL generation.
+    pub offset: i64,
+    /// Bytes of frames covered. Zero only for a full image of a WAL that
+    /// held no new frame.
+    pub size: i64,
+}
+
+impl WalRange {
+    /// The number of frames in this WAL generation that precede the range.
+    pub fn frames_before(&self, page_size: u32) -> u64 {
+        frames_through(self.offset, page_size)
+    }
+
+    /// The number of frames in this WAL generation through the end of the
+    /// range. A commit whose WAL hook reported `n` frames in the log, in the
+    /// same generation, is covered once `n <= frames_after`.
+    pub fn frames_after(&self, page_size: u32) -> u64 {
+        frames_through(self.offset + self.size, page_size)
+    }
+}
+
+fn frames_through(offset: i64, page_size: u32) -> u64 {
+    let frame_size = i64::from(page_size) + WAL_FRAME_HEADER_SIZE as i64;
+    (offset - WAL_HEADER_SIZE as i64).max(0) as u64 / frame_size as u64
+}
+
+/// One L0 file the capture loop wrote, reported to the observer installed
+/// with [`Db::set_capture_observer`] after the file is renamed into place.
+///
+/// A reported file exists locally; it is not yet shipped or durable. `txid`
+/// is the same LTX TXID the replication layer's durable and shipped
+/// watermarks count, so a consumer releases what a file covers only once a
+/// watermark reaches it. TXIDs restart per epoch, so the consumer adds the
+/// epoch itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapturedFile {
+    pub txid: TXID,
+    pub kind: CaptureKind,
+    pub page_size: u32,
+    /// The database's page count after this file applies.
+    pub commit: u32,
+    /// True when the file holds every page of the database rather than the
+    /// pages its WAL range changed: every commit through the end of `wal`
+    /// is in the image, including commits of earlier WAL generations and
+    /// frames a checkpoint already backfilled into the database file.
+    pub full_image: bool,
+    /// The WAL frames the file covers. `None` for a seed, whose pages come
+    /// from elsewhere and cover no frame of this WAL.
+    pub wal: Option<WalRange>,
+}
+
+/// Receives each L0 file the capture loop writes. It runs on the capture
+/// thread while the [`Db`] is borrowed, in TXID order, so it must be cheap
+/// and must not block: record the file and hand it off.
+pub trait CaptureObserver: Send {
+    fn captured(&mut self, file: &CapturedFile);
+}
+
+impl<F: FnMut(&CapturedFile) + Send> CaptureObserver for F {
+    fn captured(&mut self, file: &CapturedFile) {
+        self(file)
+    }
+}
+
 /// `verify()`'s decision result (db.go:1509-1515).
 #[derive(Debug, Clone, Default)]
 struct SyncInfo {
@@ -346,6 +439,9 @@ pub struct Db {
     wal_file: Option<crate::HostFile>,
     /// Last L0 `FileInfo` (db.go:99-102; only L0 is tracked in the one-shot).
     max_l0_file_info: Option<ltx::FileInfo>,
+    /// Told about every L0 file this instance writes. `None` unless change
+    /// export subscribes, and then the capture path does no extra work.
+    capture_observer: Option<Box<dyn CaptureObserver>>,
 }
 
 /// DDL for the replication control tables managed inside each database:
@@ -492,6 +588,7 @@ impl Db {
             l0_dir_ready: false,
             wal_file: None,
             max_l0_file_info: None,
+            capture_observer: None,
         };
 
         // Start the long-running read transaction (db.go:867-871).
@@ -882,7 +979,31 @@ impl Db {
         let _ = write_file_atomic(&self.host, &tmp_path, &local_path, data)?;
         self.last_l0_header = None;
         self.invalidate_pos_cache();
+        if let Some(observer) = self.capture_observer.as_mut() {
+            // A baseline's WAL fields describe where it came from, not
+            // frames of this WAL, so it reports no range.
+            let header = ltx::Header::parse(data).ok();
+            observer.captured(&CapturedFile {
+                txid: max_txid,
+                kind: CaptureKind::Seed,
+                page_size: header.as_ref().map_or(self.page_size, |h| h.page_size),
+                commit: header.as_ref().map_or(0, |h| h.commit),
+                full_image: false,
+                wal: None,
+            });
+        }
         Ok(())
+    }
+
+    /// Installs `observer` to be told about every L0 file this instance
+    /// writes from now on, replacing any earlier one. See [`CapturedFile`].
+    pub fn set_capture_observer(&mut self, observer: impl CaptureObserver + 'static) {
+        self.capture_observer = Some(Box::new(observer));
+    }
+
+    /// Removes the capture observer and returns it.
+    pub fn take_capture_observer(&mut self) -> Option<Box<dyn CaptureObserver>> {
+        self.capture_observer.take()
     }
 
     /// Continues a chain at `txid`, whose database has `commit` pages: the
@@ -960,7 +1081,8 @@ impl Db {
             crate::host::telemetry_us().saturating_sub(schema_done);
         self.last_sync_timing.prepare_us = crate::host::telemetry_us().saturating_sub(phase);
 
-        let (orig_wal_size, new_wal_size, synced) = self.verify_and_sync(hook)?;
+        let (orig_wal_size, new_wal_size, synced) =
+            self.verify_and_sync(hook, CaptureKind::Sync)?;
 
         // Track that data was synced for time-based checkpoint decisions.
         if synced {
@@ -982,7 +1104,11 @@ impl Db {
     /// Ported from `DB.verifyAndSync` (db.go:1058-1090). Returns
     /// `(orig_wal_size, new_wal_size, synced)` where the sizes are the **logical**
     /// WAL offset (`WALOffset+WALSize` of the last LTX), not file size (#997).
-    fn verify_and_sync(&mut self, between: Option<Box<dyn FnOnce()>>) -> Result<(i64, i64, bool)> {
+    fn verify_and_sync(
+        &mut self,
+        between: Option<Box<dyn FnOnce()>>,
+        kind: CaptureKind,
+    ) -> Result<(i64, i64, bool)> {
         // Use the last synced WAL offset as the logical size for checkpoint
         // decisions; on the first sync fall back to file size (db.go:1062-1069).
         let mut orig_wal_size = self.last_synced_wal_offset;
@@ -997,7 +1123,7 @@ impl Db {
             between();
         }
         let phase = crate::host::telemetry_us();
-        let synced = self.sync_inner(info)?;
+        let synced = self.sync_inner(info, kind)?;
         self.last_sync_timing.encode_write_us = crate::host::telemetry_us()
             .saturating_sub(phase)
             .saturating_sub(self.last_sync_timing.fsync_us);
@@ -1347,7 +1473,8 @@ impl Db {
     /// Ported from `DB.sync` (db.go:1517-1723). Returns `true` if an LTX file was
     /// written (there were new pages or we were snapshotting). Atomic
     /// tmp→fsync→rename with the pos cache + anti-feedback flags updated after.
-    fn sync_inner(&mut self, mut info: SyncInfo) -> Result<bool> {
+    /// A written file is reported to the capture observer as `kind`.
+    fn sync_inner(&mut self, mut info: SyncInfo, kind: CaptureKind) -> Result<bool> {
         let phase = crate::host::telemetry_us();
         // A capture that starts at the WAL header reads a logical WAL with no
         // backfilled prefix: the first sync, a restart, or a boundary image.
@@ -1430,7 +1557,7 @@ impl Db {
         // capture" — a silent miss the ship loop would then credit. The
         // mismatch path therefore re-reads the complete WAL first, which is
         // exactly the port's former full-read behavior on this branch.
-        let mismatch = !(info.offset == WAL_HEADER_SIZE as i64)
+        let mismatch = info.offset != WAL_HEADER_SIZE as i64
             && matches!(
                 wal.reader_at(info.offset, info.salt1, info.salt2),
                 Err(crate::wal::WalError::PrevFrameMismatch)
@@ -1584,6 +1711,22 @@ impl Db {
             Ok(wal_size) => final_offset == wal_size,
             Err(_) => false,
         };
+
+        if let Some(observer) = self.capture_observer.as_mut() {
+            observer.captured(&CapturedFile {
+                txid: tx_id,
+                kind,
+                page_size: self.page_size,
+                commit,
+                full_image: info.snapshotting,
+                wal: Some(WalRange {
+                    salt1: rd_salt1,
+                    salt2: rd_salt2,
+                    offset: info.offset,
+                    size: sz,
+                }),
+            });
+        }
 
         Ok(true)
     }
@@ -1785,7 +1928,7 @@ impl Db {
 
         // Copy the end of the WAL before the checkpoint to capture as much as
         // possible (db.go:1823-1826).
-        self.verify_and_sync(None)?;
+        self.verify_and_sync(None, CaptureKind::CheckpointLead)?;
 
         let frame_size = self.page_size as i64 + WAL_FRAME_HEADER_SIZE as i64;
         let pre_checkpoint_frame_n = if self.last_synced_wal_offset > WAL_HEADER_SIZE as i64 {
@@ -1859,9 +2002,9 @@ impl Db {
                     reason: "checkpoint boundary snapshot".to_string(),
                     ..Default::default()
                 };
-                self.sync_inner(info)?;
+                self.sync_inner(info, CaptureKind::PostRestart)?;
             } else {
-                self.verify_and_sync(None)?;
+                self.verify_and_sync(None, CaptureKind::PostRestart)?;
             }
             Ok(())
         })();
@@ -1921,12 +2064,12 @@ impl Db {
                     reason: "WAL restarted before passive checkpoint barrier".to_string(),
                     ..Default::default()
                 };
-                self.sync_inner(info)?;
+                self.sync_inner(info, CaptureKind::PassiveBarrier)?;
             } else {
                 // Commits can land between the earlier sync and acquisition of
                 // the barrier. This second sync seals them before the
                 // checkpoint.
-                self.verify_and_sync(None)?;
+                self.verify_and_sync(None, CaptureKind::PassiveBarrier)?;
             }
             if let Some(hook) = hook {
                 hook();
@@ -2450,7 +2593,7 @@ pub mod internal {
     }
 
     pub fn sync_inner(db: &mut Db, info: VerifyInfo) -> Result<bool> {
-        db.sync_inner(info.inner)
+        db.sync_inner(info.inner, CaptureKind::Sync)
     }
 
     pub fn read_wal_header(db: &Db) -> Result<[u8; WAL_HEADER_SIZE]> {

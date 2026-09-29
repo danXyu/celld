@@ -214,6 +214,7 @@ pub fn validate() -> anyhow::Result<()> {
 
     for name in [
         "CELLD_CLOUD",
+        "CELLD_EXPORT",
         "CELLD_LTX_COMPACTION",
         "CELLD_LTX_PAGED",
         "CELLD_TRUST_FORWARDED_HEADERS",
@@ -225,6 +226,12 @@ pub fn validate() -> anyhow::Result<()> {
     for name in [
         "CELLD_ACTIVATIONS",
         "CELLD_DEPLOY_POLL_S",
+        "CELLD_EXPORT_FLUSH_BYTES",
+        "CELLD_EXPORT_FLUSH_MS",
+        "CELLD_EXPORT_MAX_RECORD_BYTES",
+        "CELLD_EXPORT_MAX_TX_BYTES",
+        "CELLD_EXPORT_QUEUE_BYTES",
+        "CELLD_EXPORT_RETRY_MS",
         "CELLD_FETCH_TIMEOUT_S",
         "CELLD_HANDLER_BUDGET_S",
         "CELLD_IDLE_EVICT_S",

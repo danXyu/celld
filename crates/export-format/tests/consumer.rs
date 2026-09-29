@@ -87,6 +87,7 @@ fn deleted_removes_the_stream_at_or_below_its_position() {
                 facet: None,
                 incarnation: None,
                 subtree: false,
+                through_incarnation: None,
             }),
         ),
         rows(pos(3, 3), "t", 1, vec![put(2, "b")]),
@@ -117,6 +118,7 @@ fn a_facet_deleted_from_the_root_removes_that_incarnation_and_its_subtree() {
             facet: Some("rooms/7".into()),
             incarnation: Some(11),
             subtree: true,
+            through_incarnation: None,
         }),
     ))
     .unwrap();
@@ -129,6 +131,71 @@ fn a_facet_deleted_from_the_root_removes_that_incarnation_and_its_subtree() {
     assert!(state.contains_key(&new));
     assert!(state.contains_key(&sibling));
     assert!(state.contains_key(&stream()));
+}
+
+#[test]
+fn a_bounded_facet_delete_spares_facets_recreated_after_it() {
+    // Incarnations are ordered: 11 and 12 existed before the delete, 21 and
+    // 22 are the facet and its child recreated after it.
+    let old = facet("rooms/7", 11);
+    let old_child = facet("rooms/7/thread", 12);
+    let new = facet("rooms/7", 21);
+    let new_child = facet("rooms/7/thread", 22);
+    let sibling = facet("rooms/70", 5);
+    let body = || {
+        Body::Rows(RowsBody {
+            data: table_rows("t", 1, vec![put(1, "x")]),
+        })
+    };
+    let delete = live(
+        pos(9, 9),
+        Body::Deleted(DeletedBody {
+            facet: Some("rooms/7".into()),
+            incarnation: None,
+            subtree: true,
+            through_incarnation: Some(20),
+        }),
+    );
+    let mut records: Vec<Record> = [&old, &old_child, &new, &new_child, &sibling]
+        .into_iter()
+        .map(|s| record(s, pos(1, 1), Origin::Live, body()))
+        .collect();
+    records.push(delete.clone());
+    // The same result whatever the arrival order, and a late record of the
+    // old incarnation stays gone.
+    for order in [records.clone(), records.into_iter().rev().collect()] {
+        let mut c = Consumer::new();
+        c.ingest_all(order).unwrap();
+        c.ingest(record(&old_child, pos(2, 2), Origin::Live, body()))
+            .unwrap();
+        let state = c.state();
+        assert!(!state.contains_key(&old));
+        assert!(!state.contains_key(&old_child));
+        assert!(state.contains_key(&new));
+        assert!(state.contains_key(&new_child));
+        assert!(state.contains_key(&sibling));
+        assert!(state.contains_key(&stream()));
+    }
+
+    // Without `subtree`, the bound applies at the path only.
+    let mut c = Consumer::new();
+    for s in [&old, &old_child] {
+        c.ingest(record(s, pos(1, 1), Origin::Live, body()))
+            .unwrap();
+    }
+    c.ingest(live(
+        pos(9, 9),
+        Body::Deleted(DeletedBody {
+            facet: Some("rooms/7".into()),
+            incarnation: None,
+            subtree: false,
+            through_incarnation: Some(20),
+        }),
+    ))
+    .unwrap();
+    let state = c.state();
+    assert!(!state.contains_key(&old));
+    assert!(state.contains_key(&old_child));
 }
 
 #[test]
@@ -318,4 +385,57 @@ fn fragments_apply_only_once_complete() {
     c.ingest(parts[0].clone()).unwrap();
     assert_eq!(c.incomplete(), 0);
     assert_eq!(rows_of(&c.stream(&stream()).unwrap(), "t").len(), 100);
+}
+
+#[test]
+fn bulk_markers_for_two_tables_of_one_commit_both_count() {
+    let big = |t: &str| rows(pos(2, 2), t, 1, vec![put(1, &"q".repeat(2000))]);
+    let mut records = vec![
+        live(pos(1, 1), Body::Schema(schema("a", 1))),
+        live(pos(1, 1), Body::Schema(schema("b", 1))),
+    ];
+    for t in ["a", "b"] {
+        let Split::Bulk(b) = split(big(t), 1000) else {
+            panic!("expected bulk")
+        };
+        records.push(*b);
+    }
+    assert_ne!(DedupKey::of(&records[2]), DedupKey::of(&records[3]));
+    for order in [records.clone(), records.into_iter().rev().collect()] {
+        assert_eq!(apply(order).uncertain.len(), 2);
+    }
+}
+
+#[test]
+fn a_table_seen_only_in_a_bulk_marker_is_uncertain() {
+    let tg = TableGen {
+        table: "t".into(),
+        generation: 1,
+    };
+    let bulk = live(
+        pos(2, 2),
+        Body::Bulk(BulkBody {
+            tables: vec![tg.clone()],
+        }),
+    );
+    assert!(apply(vec![bulk.clone()]).uncertain.contains(&tg));
+
+    // A later snapshot still clears it, and a closed generation is not
+    // uncertain.
+    let repaired = apply(vec![
+        bulk.clone(),
+        snapshot_end(pos(3, 3), "s", SnapshotScope::Stream, &[("t", 1)], 0),
+    ]);
+    assert!(repaired.uncertain.is_empty());
+    let dropped = apply(vec![
+        bulk,
+        live(
+            pos(4, 4),
+            Body::Schema(SchemaBody {
+                dropped: true,
+                ..schema("t", 1)
+            }),
+        ),
+    ]);
+    assert!(dropped.uncertain.is_empty());
 }

@@ -150,15 +150,23 @@ impl Consumer {
             .filter(|s| {
                 targets.iter().any(|(root, d)| {
                     let path = d.facet.as_deref().expect("filtered");
-                    let exact = s.facet.as_deref() == Some(path)
-                        && d.incarnation.is_none_or(|i| i == s.incarnation);
-                    let below = d.subtree
-                        && s.facet.as_deref() != Some(path)
-                        && s.is_at_or_under(&root.script, &root.class, &root.cell, Some(path));
+                    let at_path = s.facet.as_deref() == Some(path);
+                    let under = at_path
+                        || (d.subtree
+                            && s.is_at_or_under(&root.script, &root.class, &root.cell, Some(path)));
+                    let removed = match d.through_incarnation {
+                        // Ordered incarnations: a facet recreated after the
+                        // delete, at the path or below it, is above the bound.
+                        Some(bound) => under && s.incarnation <= bound,
+                        None => {
+                            (at_path && d.incarnation.is_none_or(|i| i == s.incarnation))
+                                || (under && !at_path)
+                        }
+                    };
                     s.script == root.script
                         && s.class == root.class
                         && s.cell == root.cell
-                        && (exact || below)
+                        && removed
                 })
             })
             .cloned()
@@ -264,7 +272,9 @@ fn derive(all: &[Record]) -> StreamState {
     let mut closed: BTreeSet<TableGen> = BTreeSet::new();
     let mut renames: Vec<(&str, Position)> = Vec::new();
     for r in &records {
-        let tg = match &r.body {
+        // A `bulk` marker names generations too: a table seen only through
+        // one is still uncertain.
+        let tgs = match &r.body {
             Body::Schema(s) => {
                 let tg = TableGen {
                     table: s.table.clone(),
@@ -276,15 +286,18 @@ fn derive(all: &[Record]) -> StreamState {
                 if let Some(from) = &s.renamed_from {
                     renames.push((from.as_str(), r.position()));
                 }
-                tg
+                vec![tg]
             }
+            Body::Bulk(b) => b.tables.clone(),
             _ => match r.body.table_rows() {
-                Some(d) => d.table_gen(),
+                Some(d) => vec![d.table_gen()],
                 None => continue,
             },
         };
-        let at = opened.entry(tg).or_insert(r.position());
-        *at = (*at).min(r.position());
+        for tg in tgs {
+            let at = opened.entry(tg).or_insert(r.position());
+            *at = (*at).min(r.position());
+        }
     }
     let newest: BTreeMap<&str, u64> = opened.keys().fold(BTreeMap::new(), |mut m, tg| {
         let g = m.entry(tg.table.as_str()).or_insert(0);
