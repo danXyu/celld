@@ -46,7 +46,7 @@ const DEFAULT_OBJECTS: usize = 100;
 
 pub fn help_text() -> String {
     format!(
-        r#"Repair, backfill, and inspect the change export.
+        r#"Repair, backfill, inspect, reconcile, verify, and erase the change export.
 
 USAGE:
   celld export repair --stream SCOPE [--at EPOCH:TXID] [OPTIONS]
@@ -55,6 +55,9 @@ USAGE:
   celld export backfill --gaps FILE [OPTIONS]
   celld export inspect [--node NODE] [--hour YYYY/MM/DD[/HH]] [FILTERS]
   celld export inspect --file PATH [--file PATH]... [FILTERS]
+  celld export reconcile | verify | erase [FLAGS]
+
+Run `celld export reconcile|verify|erase --help` for those commands' flags.
 
 repair restores a stream read-only from the bucket at the first position
 at or after --at (the bucket's newest cut without it) and writes a snapshot
@@ -105,11 +108,14 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
         Some("repair") => run_snapshots(Mode::Repair, arguments.collect()).await,
         Some("backfill") => run_snapshots(Mode::Backfill, arguments.collect()).await,
         Some("inspect") => run_inspect(arguments.collect()).await,
+        Some(command @ ("reconcile" | "verify" | "erase")) => {
+            crate::export_audit::cli::run(command, arguments.collect()).await
+        }
         None | Some("-h") | Some("--help") | Some("help") => {
             crate::cli_output::Output::new(crate::cli_output::Format::Text).help(&help_text())
         }
         Some(other) => bail!(
-            "unknown export command: {other}; celld export takes repair, backfill, or inspect"
+            "unknown export command: {other}; celld export takes repair, backfill, inspect, reconcile, verify, or erase"
         ),
     }
 }

@@ -53,8 +53,8 @@ use crate::export_sink::{
 };
 use crate::storage::export_capture::{CapturedCommit, WalStamp};
 use celld_export_format::{
-    split, Body, BulkBody, Envelope, GapBody, Origin, Position, Record, RowsBody, Split, StreamId,
-    TableGen, WatermarkBody,
+    split, Body, BulkBody, Envelope, GapBody, Origin, Position, Record, RecoveredBody, RowsBody,
+    Split, StreamId, TableGen, WatermarkBody,
 };
 use celld_logic::export::{Attribution, Capture, CapturedWal, Released, WalGeneration, WalPoint};
 use celld_logic::RequestError;
@@ -187,6 +187,28 @@ struct Submitted {
     /// move to it.
     closes: bool,
     watermark: bool,
+    /// A `recovered` record for another node's residency: it moves no
+    /// delivered position here, and a drop freezes nothing.
+    recovered: bool,
+}
+
+/// What one dead-node recovery folded into the bucket, for its `recovered`
+/// records.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Recovery {
+    /// The dead session, `<node>/<generation>`.
+    pub session: String,
+    /// Recovery declared a bounded loss for the session.
+    pub loss: bool,
+    /// Per visited cell epoch, the TXID the bucket holds it through.
+    pub cells: Vec<RecoveredCell>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RecoveredCell {
+    pub cell: String,
+    pub epoch: u64,
+    pub through: u64,
 }
 
 pub struct Exporter {
@@ -359,6 +381,38 @@ impl Exporter {
         }
     }
 
+    /// Emit a `recovered` record for every exported cell epoch `recovery`
+    /// folded. Dead-node recovery calls this once its uploads are in the
+    /// bucket, before it seals the log, so a recoverer that dies first
+    /// leaves the emission to the node that takes the recovery over.
+    pub(crate) fn recovered(&self, recovery: &Recovery) {
+        let records = recovered_records(&self.node, recovery, |cell| self.exports(cell));
+        if records.is_empty() {
+            return;
+        }
+        tracing::info!(session = %recovery.session, cells = records.len(), loss = recovery.loss, "export: recovered records");
+        self.submit(
+            records
+                .into_iter()
+                .map(|record| {
+                    let meta = Submitted {
+                        key: (
+                            record.envelope.stream.cell.clone(),
+                            record.envelope.position.epoch,
+                        ),
+                        stream: record.envelope.stream.clone(),
+                        position: record.envelope.position,
+                        whole: true,
+                        closes: false,
+                        watermark: false,
+                        recovered: true,
+                    };
+                    (record, meta)
+                })
+                .collect(),
+        );
+    }
+
     /// Charge `bytes` to the shared budget for a commit going onto a
     /// FIFO. `false` when the budget cannot hold it.
     fn reserve(&self, bytes: u64) -> bool {
@@ -452,6 +506,66 @@ impl Exporter {
             fragment: 1,
             fragments: 1,
         }
+    }
+}
+
+/// The `recovered` records of `recovery`, one per cell epoch `exports`
+/// accepts. Recovery knows neither a cell's script nor its first epoch, so
+/// the stream names neither (see [`RecoveredBody`]).
+fn recovered_records(
+    node: &str,
+    recovery: &Recovery,
+    exports: impl Fn(&str) -> bool,
+) -> Vec<Record> {
+    let cells: Vec<&RecoveredCell> = recovery
+        .cells
+        .iter()
+        .filter(|cell| exports(&cell.cell))
+        .collect();
+    let count = cells.len() as u64;
+    let now = crate::asyncrt::wall_ms();
+    cells
+        .into_iter()
+        .map(|cell| {
+            let (root, facet) = recovered_root(&cell.cell);
+            let class = root.split_once(':').map_or(root, |(class, _)| class);
+            let head = Position::new(cell.epoch, cell.through, u64::MAX);
+            Record {
+                envelope: Envelope {
+                    stream: StreamId {
+                        script: String::new(),
+                        class: class.to_string(),
+                        cell: root.to_string(),
+                        facet: facet.map(str::to_string),
+                        incarnation: 0,
+                    },
+                    cell_name: None,
+                    position: head,
+                    committed_at: now,
+                    node: node.to_string(),
+                    origin: Origin::Live,
+                    fragment: 1,
+                    fragments: 1,
+                },
+                body: Body::Recovered(RecoveredBody {
+                    session: recovery.session.clone(),
+                    head,
+                    loss: recovery.loss,
+                    cells: count,
+                }),
+            }
+        })
+        .collect()
+}
+
+/// A replication stream name split into its root cell and, for a facet,
+/// the facet path below the root (`facets/<h>[/facets/<h>...]`), the
+/// `facet` a facet stream's records carry. Hashed facet names never contain
+/// `/`, so the root ends at the first `/facets/`.
+fn recovered_root(cell: &str) -> (&str, Option<&str>) {
+    match cell.find("/facets/") {
+        Some(at) => (&cell[..at], Some(&cell[at + 1..])),
+        None => (cell, None),
     }
 }
 
@@ -827,6 +941,7 @@ impl Stream {
                     whole: record.envelope.fragment == record.envelope.fragments,
                     closes: index == last,
                     watermark: false,
+                    recovered: false,
                 };
                 out.push((record, meta));
             }
@@ -864,6 +979,16 @@ async fn deliver(exporter: Arc<Exporter>, mut outcomes: mpsc::UnboundedReceiver<
             else {
                 continue;
             };
+            if meta.recovered {
+                if let SinkDelivery::Dropped { reason } = result {
+                    exporter
+                        .counters
+                        .dropped_records
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(cell = %meta.key.0, epoch = meta.key.1, %reason, "export: sink dropped a recovered record; the reconciler covers the cell");
+                }
+                continue;
+            }
             let state = streams.entry(meta.key.clone()).or_default();
             state.stream.get_or_insert_with(|| meta.stream.clone());
             if state.frozen {
@@ -947,6 +1072,7 @@ async fn deliver(exporter: Arc<Exporter>, mut outcomes: mpsc::UnboundedReceiver<
                     whole: false,
                     closes: false,
                     watermark: true,
+                    recovered: false,
                 },
             ));
             state.marked = Some(through);
@@ -1155,12 +1281,90 @@ mod tests {
                     whole: true,
                     closes: true,
                     watermark: false,
+                    recovered: false,
                 },
             )]);
             exporter.close().await;
             assert_eq!(*sink.log.lock().unwrap(), ["rows", "watermark", "close"]);
             assert_eq!(exporter.state()["watermarks"], 1);
         });
+    }
+
+    #[test]
+    fn recovered_records_name_each_exported_cell_epoch_and_the_loss() {
+        let recovery = Recovery {
+            session: "node-a/g1".into(),
+            loss: true,
+            cells: vec![
+                RecoveredCell {
+                    cell: "Chat:01".into(),
+                    epoch: 4,
+                    through: 17,
+                },
+                RecoveredCell {
+                    cell: "Chat:01/facets/child".into(),
+                    epoch: 2,
+                    through: 3,
+                },
+                RecoveredCell {
+                    cell: "__Queue:02".into(),
+                    epoch: 1,
+                    through: 9,
+                },
+            ],
+        };
+        let records = recovered_records("node-b", &recovery, |cell| {
+            cell.starts_with("Chat:") && !cell.contains("/facets/")
+        });
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        let head = Position::new(4, 17, u64::MAX);
+        assert_eq!(
+            record.envelope.stream,
+            StreamId {
+                script: String::new(),
+                class: "Chat".into(),
+                cell: "Chat:01".into(),
+                facet: None,
+                incarnation: 0,
+            }
+        );
+        assert_eq!(record.envelope.position, head);
+        assert_eq!(record.envelope.node, "node-b");
+        assert_eq!(
+            record.body,
+            Body::Recovered(RecoveredBody {
+                session: "node-a/g1".into(),
+                head,
+                loss: true,
+                cells: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn recovered_records_name_a_facet_by_its_root_and_path() {
+        let recovery = Recovery {
+            session: "node-a/g1".into(),
+            loss: false,
+            cells: vec![RecoveredCell {
+                cell: "Chat:01/facets/aa/facets/bb".into(),
+                epoch: 2,
+                through: 3,
+            }],
+        };
+        let records = recovered_records("node-b", &recovery, |_| true);
+        assert_eq!(
+            records[0].envelope.stream,
+            StreamId {
+                script: String::new(),
+                class: "Chat".into(),
+                cell: "Chat:01".into(),
+                facet: Some("facets/aa/facets/bb".into()),
+                incarnation: 0,
+            }
+        );
+        assert_eq!(recovered_root("Chat:01"), ("Chat:01", None));
     }
 
     #[test]

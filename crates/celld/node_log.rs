@@ -4203,6 +4203,9 @@ pub struct NodeLogManager {
     /// the memory a recovery costs.
     #[cfg(all(test, celld_internal_tests))]
     recovery_gather_peak_bytes: std::sync::atomic::AtomicU64,
+    /// What each recovery handed change export, in order.
+    #[cfg(test)]
+    recovered_reports: Mutex<Vec<crate::export_live::Recovery>>,
     /// Every predecessor session's log is proven recovered; see
     /// `ensure_predecessors_recovered` for why this can latch.
     predecessors_clean: std::sync::atomic::AtomicBool,
@@ -4680,6 +4683,8 @@ impl NodeLogManager {
             ),
             #[cfg(all(test, celld_internal_tests))]
             recovery_gather_peak_bytes: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            recovered_reports: Mutex::new(Vec::new()),
             predecessors_clean: std::sync::atomic::AtomicBool::new(false),
             recovery_locks: Mutex::new(BTreeMap::new()),
             gc_confirmed_empty: Mutex::new(std::collections::HashSet::new()),
@@ -4967,6 +4972,10 @@ impl NodeLogManager {
                     .filter(|(txid, _)| *txid > watermark)
                     .collect();
                 if rows.is_empty() {
+                    // The bucket already holds the epoch through its
+                    // watermark, which can lie past these rows; change
+                    // export reports the higher of the two as the head.
+                    let through = through.max(watermark);
                     return anyhow::Ok((recovery_progress::CoveredCell { cell, epoch: cell_epoch, through }, 0_usize));
                 }
                 let uploaded = rows.len();
@@ -5025,6 +5034,41 @@ impl NodeLogManager {
             }
         }
         Ok(count)
+    }
+
+    /// Hand change export what this recovery holds in the bucket: every
+    /// cell epoch the progress record covers, this pass's uploads and those
+    /// of a recoverer it took over from. It runs after the last upload and
+    /// before the seal, so a recoverer that dies in between leaves the
+    /// report to the next one. Cell epochs the session had already folded
+    /// are not visited and not reported; the reconciler covers them.
+    fn report_recovered(
+        &self,
+        dead: &str,
+        loss: bool,
+        progress: Option<&recovery_progress::Progress>,
+    ) {
+        let recovery = crate::export_live::Recovery {
+            session: dead.to_string(),
+            loss,
+            cells: progress
+                .map(|progress| {
+                    progress
+                        .covered()
+                        .map(|(cell, epoch, through)| crate::export_live::RecoveredCell {
+                            cell: cell.to_string(),
+                            epoch,
+                            through,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
+        if let Some(exporter) = crate::export_live::installed() {
+            exporter.recovered(&recovery);
+        }
+        #[cfg(test)]
+        self.recovered_reports.lock().unwrap().push(recovery);
     }
 
     /// Recover one dead SESSION's log: `dead` is `<node>/<generation>`.
@@ -5233,6 +5277,7 @@ impl NodeLogManager {
             // Only a fully conclusive, witness-free epoch with possible fleet
             // acknowledgements may declare bounded loss.
             let mut inconclusive = 0_usize;
+            let mut declared_loss = false;
             let mut gathered: BTreeMap<(String, u64, u64), Vec<u8>> = BTreeMap::new();
             for member in record.ensemble.iter().filter(|_| !record.bucket_complete) {
                 self.beat_claim(dead, &mut beat).await?;
@@ -5435,6 +5480,7 @@ impl NodeLogManager {
                         serde_json::to_vec(&loss)?,
                     )
                     .await?;
+                declared_loss = true;
                 warn!(
                     dead,
                     epoch = record.epoch,
@@ -5579,6 +5625,7 @@ impl NodeLogManager {
                     .await?;
                 upload_ms += mono_ms().saturating_sub(upload_started);
             }
+            self.report_recovered(dead, declared_loss, progress.as_ref());
             // The record is re-read for the token the beats moved.
             let mut sealed = false;
             for _ in 0..3 {
