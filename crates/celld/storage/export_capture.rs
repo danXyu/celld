@@ -1038,5 +1038,61 @@ fn read_row(lookup: &mut rusqlite::Statement<'_>, key: &[Value]) -> anyhow::Resu
     (0..width).map(|i| Ok(from_row(row.get_ref(i)?))).collect()
 }
 
+/// A table as a snapshot reads it: the columns and key capture materializes,
+/// so a table's `snapshot` rows and its `rows` rows have one shape.
+pub(crate) struct TableScan {
+    pub columns: Vec<String>,
+    pub key_columns: Vec<String>,
+    sql: String,
+    /// Indices of the declared key in `columns`; empty for a rowid-only
+    /// table, whose scan reads the rowid first.
+    key: Vec<usize>,
+}
+
+/// How to scan `table` on `connection` for a snapshot.
+pub(crate) fn table_scan(connection: &Connection, table: &str) -> anyhow::Result<TableScan> {
+    let shape = read_shape(connection, table)?;
+    let columns: Vec<String> = shape.columns.iter().map(|c| quote(c)).collect();
+    let selected = match shape.rowid {
+        Some(rowid) => format!("{rowid}, {}", columns.join(", ")),
+        None => columns.join(", "),
+    };
+    Ok(TableScan {
+        key_columns: shape.key_columns(),
+        sql: format!("SELECT {selected} FROM main.{}", quote(table)),
+        key: shape.key.clone(),
+        columns: shape.columns,
+    })
+}
+
+impl TableScan {
+    /// Hand every row to `each` as an insert of its full image, and return
+    /// how many there were. Two scans of an image that does not change
+    /// visit the rows in the same order.
+    pub(crate) fn for_each(
+        &self,
+        connection: &Connection,
+        mut each: impl FnMut(RowChange) -> anyhow::Result<()>,
+    ) -> anyhow::Result<u64> {
+        let mut statement = connection.prepare(&self.sql)?;
+        let mut rows = statement.query([])?;
+        let offset = usize::from(self.key.is_empty());
+        let mut count = 0;
+        while let Some(row) = rows.next()? {
+            let values: Vec<Value> = (0..offset + self.columns.len())
+                .map(|i| Ok(from_row(row.get_ref(i)?)))
+                .collect::<anyhow::Result<_>>()?;
+            let key = if self.key.is_empty() {
+                vec![values[0].clone()]
+            } else {
+                self.key.iter().map(|&i| values[i].clone()).collect()
+            };
+            each(RowChange(Op::Insert, key, values[offset..].to_vec()))?;
+            count += 1;
+        }
+        Ok(count)
+    }
+}
+
 #[cfg(test)]
 mod tests;

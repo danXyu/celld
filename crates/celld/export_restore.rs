@@ -146,8 +146,23 @@ impl std::fmt::Display for Stream {
 
 /// Restore `stream` from `bucket` without writing to it.
 pub async fn restore(bucket: &Bucket, stream: &Stream, target: Target) -> anyhow::Result<Restored> {
+    restore_paced(bucket, stream, target, None).await
+}
+
+/// [`restore`], with every bucket request after the epoch listing waiting
+/// its turn on `pace`, so a backfill over many streams holds a bucket
+/// request rate.
+pub async fn restore_paced(
+    bucket: &Bucket,
+    stream: &Stream,
+    target: Target,
+    pace: Option<Arc<Pace>>,
+) -> anyhow::Result<Restored> {
     let scope = stream.as_str();
-    let chain = chain(bucket, scope).await?;
+    if let Some(pace) = &pace {
+        pace.wait().await;
+    }
+    let chain = chain(bucket, scope, pace).await?;
     let spans = chain.spans();
     let cuts = replica::restorable_cuts(&chain)
         .await
@@ -192,7 +207,11 @@ pub async fn restore(bucket: &Bucket, stream: &Stream, target: Target) -> anyhow
 }
 
 /// The chain over every epoch of `scope` in the bucket, each read-only.
-async fn chain(bucket: &Bucket, scope: &str) -> anyhow::Result<EpochChain<ReadOnly>> {
+async fn chain(
+    bucket: &Bucket,
+    scope: &str,
+    pace: Option<Arc<Pace>>,
+) -> anyhow::Result<EpochChain<ReadOnly>> {
     let base = ObjectPath::from(format!("{}cells/{scope}/ltx", bucket.prefix));
     let listing = bucket.store.list_with_delimiter(Some(&base)).await?;
     let mut epochs: Vec<u64> = listing
@@ -210,7 +229,7 @@ async fn chain(bucket: &Bucket, scope: &str) -> anyhow::Result<EpochChain<ReadOn
                 ..Default::default()
             };
             let client = ObjectStoreClient::with_store(config, bucket.store.clone());
-            (epoch, ReadOnly(client))
+            (epoch, ReadOnly(client, pace.clone()))
         })
         .collect();
     EpochChain::build(clients)
@@ -272,9 +291,46 @@ fn uri_path(path: &Path) -> anyhow::Result<String> {
     Ok(out)
 }
 
+/// A shared bucket request rate: each request takes the next free slot,
+/// `interval` after the one before it.
+pub struct Pace {
+    interval: std::time::Duration,
+    next: tokio::sync::Mutex<tokio::time::Instant>,
+}
+
+impl Pace {
+    /// `None` for an unlimited rate.
+    pub fn per_second(requests: u32) -> Option<Arc<Pace>> {
+        (requests > 0).then(|| {
+            Arc::new(Pace {
+                interval: std::time::Duration::from_secs(1) / requests,
+                next: tokio::sync::Mutex::new(tokio::time::Instant::now()),
+            })
+        })
+    }
+
+    pub async fn wait(&self) {
+        let at = {
+            let mut next = self.next.lock().await;
+            let at = (*next).max(tokio::time::Instant::now());
+            *next = at + self.interval;
+            at
+        };
+        tokio::time::sleep_until(at).await;
+    }
+}
+
 /// A replica client that can only read. The chain routes every call by txid
 /// to one of these, so no path through a restore can reach a write.
-pub struct ReadOnly(ObjectStoreClient);
+pub struct ReadOnly(ObjectStoreClient, Option<Arc<Pace>>);
+
+impl ReadOnly {
+    async fn paced(&self) {
+        if let Some(pace) = &self.1 {
+            pace.wait().await;
+        }
+    }
+}
 
 fn refused(what: &str) -> LtxError {
     LtxError::Other(format!("export restore is read-only: refused {what}").into())
@@ -283,6 +339,7 @@ fn refused(what: &str) -> LtxError {
 #[async_trait]
 impl ReplicaClient for ReadOnly {
     async fn ltx_files(&self, level: i32, seek: TXID) -> LtxResult<Vec<FileInfo>> {
+        self.paced().await;
         self.0.ltx_files(level, seek).await
     }
 
@@ -292,6 +349,7 @@ impl ReplicaClient for ReadOnly {
         seek: TXID,
         limit: usize,
     ) -> LtxResult<Vec<FileInfo>> {
+        self.paced().await;
         self.0.ltx_files_bounded(level, seek, limit).await
     }
 
@@ -301,6 +359,7 @@ impl ReplicaClient for ReadOnly {
         min_txid: TXID,
         max_txid: TXID,
     ) -> LtxResult<Vec<u8>> {
+        self.paced().await;
         self.0.open_ltx_file(level, min_txid, max_txid).await
     }
 
@@ -312,6 +371,7 @@ impl ReplicaClient for ReadOnly {
         offset: u64,
         len: u64,
     ) -> LtxResult<Vec<u8>> {
+        self.paced().await;
         self.0
             .read_range(level, min_txid, max_txid, offset, len)
             .await

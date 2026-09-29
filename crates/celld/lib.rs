@@ -344,6 +344,7 @@ pub mod export_audit;
 pub mod export_cli;
 pub(crate) mod export_kv;
 pub mod export_live;
+pub mod export_repair;
 pub mod export_restore;
 pub mod export_sink;
 #[cfg(celld_internal_tests)]
