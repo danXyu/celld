@@ -27,7 +27,7 @@ fleet operation, use the [main celld documentation](https://celld.dev/docs/).
 | Actor storage | Roll back transactions left open by an aborted actor. | [Transaction fix](./fixes/#aborted-actor-transactions) |
 | Development previews | Deploy isolated previews and seed them from approved persisted object checkpoints. | [Preview workflow](./fork/previews/) |
 | Observability | Export node gauges and cell CPU and heap distributions through OTLP. | [Metrics](./fork/metrics/) |
-| Change export | SQLite change records and warehouse delivery components under development. | [Implementation status](./fork/export/) |
+| Change export | Stream every cell's SQLite changes to a bucket or blob-stream and load them into Snowflake, with repair for anything lost. On main, not yet released. | [User guide](./fork/export/) |
 
 ## Releases and compatibility
 

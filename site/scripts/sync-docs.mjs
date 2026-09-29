@@ -12,7 +12,7 @@ const pages = [
   { source: 'docs/previews.md', slug: 'previews', title: 'Application previews', description: 'Deploy isolated Kubernetes previews and clone approved persisted object state.' },
   { source: 'docs/preview-runtime.md', slug: 'preview-runtime', title: 'Snapshot seeding', description: 'Snapshot consistency, initialization authority, and restore boundaries for seeded previews.' },
   { source: 'docs/telemetry.md', slug: 'metrics', title: 'OTLP metrics', description: 'Node gauges and cell CPU and heap distributions added by the fork.', section: 'Metrics' },
-  { source: 'docs/export.md', slug: 'export', title: 'Change export', description: 'Work in progress: change-export settings and implementation status.' },
+  { source: 'docs/export.md', slug: 'export', title: 'Change export', description: 'User guide: stream cell changes to a warehouse, load them into Snowflake, and keep the copy complete.' },
 ];
 const routes = new Map(pages.map(p => [p.source, p.slug]));
 rmSync(out, { recursive: true, force: true });
@@ -48,7 +48,7 @@ for (const page of pages) {
     });
   }).join('\n');
   const notice = page.slug === 'export'
-    ? ':::caution[In progress — not in v0.6.0-ewhauser.2]\nThis page follows development on main. Components are landing separately; their presence does not establish an operational end-to-end exporter. See the status below before enabling it.\n:::\n\n'
+    ? ':::caution[On main — not in v0.6.0-ewhauser.2]\nThis page follows development on main. Change export is not in a fork release yet. See the status below before enabling it.\n:::\n\n'
     : '';
   const metadata = { title: page.title, description: page.description, editUrl: `${repo}/edit/main/${page.source}` };
   const frontmatter = Object.entries(metadata).map(([key, value]) => `${key}: ${JSON.stringify(value)}`).join('\n');
