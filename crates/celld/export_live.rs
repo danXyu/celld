@@ -153,6 +153,8 @@ enum Input {
         body: DeletedBody,
         at_ms: i64,
     },
+    /// The stream's facet was deleted: nothing it holds goes out.
+    Ended,
 }
 
 /// Tickets at or above this bit are relayed for a facet's stream; a stream's
@@ -178,7 +180,9 @@ fn stream_class(cell: &str) -> &str {
 
 /// A facet ticket the root's gate is settling.
 struct Relay {
-    facet: String,
+    /// The stream task that asked, which may have been replaced under its
+    /// key since (a facet deleted and recreated).
+    stream: mpsc::WeakUnboundedSender<Input>,
     ticket: u64,
     /// What the facet's own proof covered.
     txid: u64,
@@ -329,12 +333,27 @@ impl Exporter {
             },
             outcomes_tx,
         );
-        let exporter = Arc::new(Exporter {
+        let exporter = Exporter::new(config, Arc::new(sink), node, Box::new(ask), wake);
+        EXPORTER
+            .set(exporter.clone())
+            .map_err(|_| anyhow::anyhow!("the change exporter is already installed"))?;
+        crate::asyncrt::spawn(deliver(exporter.clone(), outcomes_rx));
+        Ok(exporter)
+    }
+
+    fn new(
+        config: Config,
+        sink: Arc<dyn ExportSink>,
+        node: String,
+        ask: Box<dyn Fn(TicketAsk) + Send + Sync>,
+        wake: mpsc::UnboundedSender<Outcome>,
+    ) -> Arc<Exporter> {
+        Arc::new(Exporter {
             node,
             config,
-            sink: Arc::new(sink),
+            sink,
             streams: Mutex::new(HashMap::new()),
-            ask: Box::new(ask),
+            ask,
             next_seq: AtomicU64::new(1),
             submitted: Mutex::new(BTreeMap::new()),
             advances: Mutex::new(BTreeMap::new()),
@@ -344,12 +363,7 @@ impl Exporter {
             relays: Mutex::new(HashMap::new()),
             next_relay: AtomicU64::new(RELAY_TICKET),
             next_ticket: AtomicU64::new(1),
-        });
-        EXPORTER
-            .set(exporter.clone())
-            .map_err(|_| anyhow::anyhow!("the change exporter is already installed"))?;
-        crate::asyncrt::spawn(deliver(exporter.clone(), outcomes_rx));
-        Ok(exporter)
+        })
     }
 
     /// Capture settings for every isolate on the node.
@@ -442,13 +456,12 @@ impl Exporter {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&ticket);
-            if let Some(relay) = relay {
-                self.proven(
-                    &relay.facet,
-                    epoch,
-                    relay.ticket,
-                    result.map(|_| relay.txid),
-                );
+            let route = relay.and_then(|relay| Some((relay.stream.upgrade()?, relay)));
+            if let Some((tx, relay)) = route {
+                let _ = tx.send(Input::Proven {
+                    ticket: relay.ticket,
+                    result: result.map(|_| relay.txid),
+                });
             }
             return;
         }
@@ -469,7 +482,7 @@ impl Exporter {
     /// checks the node's authority and the root's residency at `epoch` (a
     /// facet has neither ownership nor a fence of its own) after that proof.
     /// A failed proof fails the ticket, which the stream retries.
-    fn relay(self: &Arc<Self>, ask: TicketAsk) {
+    fn relay(self: &Arc<Self>, ask: TicketAsk, stream: mpsc::WeakUnboundedSender<Input>) {
         let exporter = self.clone();
         crate::asyncrt::spawn(async move {
             let TicketAsk {
@@ -497,7 +510,12 @@ impl Exporter {
                 Ok(txid) => txid,
                 Err(error) => {
                     tracing::debug!(%facet, epoch, %error, "export: facet proof failed; retrying");
-                    exporter.proven(&facet, epoch, ticket, Err(RequestError::DurabilityUnproven));
+                    if let Some(tx) = stream.upgrade() {
+                        let _ = tx.send(Input::Proven {
+                            ticket,
+                            result: Err(RequestError::DurabilityUnproven),
+                        });
+                    }
                     return;
                 }
             };
@@ -509,7 +527,7 @@ impl Exporter {
                 .insert(
                     relayed,
                     Relay {
-                        facet,
+                        stream,
                         ticket,
                         txid,
                     },
@@ -535,9 +553,17 @@ impl Exporter {
             let mut streams = self.streams.lock().unwrap_or_else(|e| e.into_inner());
             // The deleted facets' streams end with their residencies; a facet
             // recreated in this epoch opens a stream of its own.
+            // Each is told to stop, since a ticket in flight keeps its task
+            // alive and its pending commits counted against the budget.
             let below = format!("{}/", deleted.stream);
-            streams.retain(|(cell, at), _| {
-                *at != epoch || (*cell != deleted.stream && !cell.starts_with(&below))
+            streams.retain(|(cell, at), tx| {
+                let gone = *at == epoch && (*cell == deleted.stream || cell.starts_with(&below));
+                if gone {
+                    if let Some(tx) = tx.upgrade() {
+                        let _ = tx.send(Input::Ended);
+                    }
+                }
+                !gone
             });
             streams
                 .get(&(root.to_string(), epoch))
@@ -900,6 +926,7 @@ impl Stream {
         let counters = &exporter.counters;
         match input {
             None => {}
+            Some(Input::Ended) => return false,
             Some(Input::Identity(identity)) => {
                 self.identity.script = identity.script;
                 self.identity.incarnation = identity.incarnation;
@@ -1046,7 +1073,7 @@ impl Stream {
             ticket,
         };
         if self.identity.facet.is_some() {
-            self.exporter.relay(ask);
+            self.exporter.relay(ask, self.this.clone());
         } else {
             (self.exporter.ask)(ask);
         }
@@ -1573,6 +1600,125 @@ mod tests {
         assert!(seq.take(vec![], true).is_empty());
         seq.proven(1);
         assert_eq!(order(seq.take(vec![], true)), ["D1", "D2"]);
+    }
+
+    /// A sink that accepts every record and reports nothing.
+    struct Silent;
+
+    impl ExportSink for Silent {
+        fn name(&self) -> &'static str {
+            "silent"
+        }
+        fn submit(&self, _: Vec<SinkRecord>) -> Result<(), crate::export_sink::Closed> {
+            Ok(())
+        }
+        fn flush(&self) {}
+        fn buffered_bytes(&self) -> u64 {
+            0
+        }
+        fn close(&self) -> futures_util::future::BoxFuture<'static, ()> {
+            Box::pin(async {})
+        }
+    }
+
+    /// Run on a process-lived runtime: stream tasks spawn on the host
+    /// handle, which a `#[tokio::test]` runtime would not outlive.
+    fn run(future: impl std::future::Future<Output = ()>) {
+        static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+        let runtime = RUNTIME.get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap()
+        });
+        crate::asyncrt::set_host_handle(runtime.handle().clone());
+        runtime.block_on(future);
+    }
+
+    #[test]
+    fn a_deleted_facet_stream_ends_with_its_ticket_in_flight() {
+        run(async {
+            let config =
+                Config::from_lookup(|name| Ok((name == "CELLD_EXPORT").then(|| "1".into())))
+                    .unwrap()
+                    .unwrap();
+            let asks: Arc<Mutex<Vec<TicketAsk>>> = Arc::default();
+            let (wake, _outcomes) = mpsc::unbounded_channel();
+            let exporter = Exporter::new(
+                config,
+                Arc::new(Silent),
+                "n".into(),
+                Box::new({
+                    let asks = asks.clone();
+                    move |ask| asks.lock().unwrap().push(ask)
+                }),
+                wake,
+            );
+            let names = ["child".to_string()];
+            let facet = crate::engine_api::facet_cell("Room:1", &names);
+            let link = ActivationLink {
+                mode: ActivationMode::Fresh,
+                start_txid: 1,
+                prev_epoch: None,
+                prev_txid: None,
+            };
+            let observer = exporter.open_stream(&facet, 1, link).expect("exported");
+            let stream = exporter.attach(&facet, 1).expect("attached");
+            let task = exporter
+                .streams
+                .lock()
+                .unwrap()
+                .get(&(facet.clone(), 1))
+                .cloned()
+                .unwrap();
+            stream.identify(Identity {
+                script: "s".into(),
+                incarnation: 5,
+                cell_name: None,
+            });
+            stream.wrote(
+                WalStamp::At {
+                    salt1: 1,
+                    salt2: 2,
+                    frames: 3,
+                },
+                7,
+            );
+            // The relay proves the facet (no replication here) and asks the
+            // root's gate.
+            let relayed = loop {
+                if let Some(ask) = asks.lock().unwrap().first().cloned() {
+                    break ask;
+                }
+                crate::asyncrt::sleep(Duration::from_millis(5)).await;
+            };
+            assert_eq!(relayed.cell, "Room:1");
+            assert!(relayed.ticket >= RELAY_TICKET);
+            exporter.facet_deleted(
+                "Room:1",
+                1,
+                &FacetDeleted {
+                    stream: facet.clone(),
+                    through: 9,
+                },
+            );
+            drop(stream);
+            drop(observer);
+            // The task ends although its ticket is still in flight.
+            let deadline = crate::asyncrt::mono_ms() + 5_000;
+            while task.upgrade().is_some() {
+                assert!(
+                    crate::asyncrt::mono_ms() < deadline,
+                    "the deleted facet's stream task is still running"
+                );
+                crate::asyncrt::sleep(Duration::from_millis(5)).await;
+            }
+            // The root's late verdict finds no one and leaves nothing behind.
+            exporter.proven("Room:1", 1, relayed.ticket, Ok(0));
+            assert!(exporter.relays.lock().unwrap().is_empty());
+            assert!(!exporter.streams.lock().unwrap().contains_key(&(facet, 1)));
+        });
     }
 
     #[test]
