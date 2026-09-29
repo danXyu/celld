@@ -310,9 +310,15 @@ pub struct SchemaBody {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LinkMode {
+    /// Nothing restored; the cell starts empty.
     Fresh,
+    /// A whole image restored; the epoch's txids start after it.
     Clone,
+    /// The predecessor chain paged in; txids continue it.
     Paged,
+    /// The same epoch reopened from its local database (a clean reload);
+    /// the predecessor is this epoch's own earlier residency.
+    Resume,
 }
 
 /// Emitted by an activation before the cell serves. A fresh cell has no

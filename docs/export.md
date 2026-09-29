@@ -9,8 +9,10 @@ The feature is under construction. A node with `CELLD_EXPORT=1` exports
 the row changes of its root cells through the bucket sink: Parquet objects
 under `export/changes/<node>/` in the bucket, released only after the
 change is durable and the node still owns the cell, and followed by
-watermarks that certify what the bucket holds. Facets, schema records,
-activation links, the `kv` mapping of `_cf_KV`, repair and the blob-stream
+watermarks that certify what the bucket holds. Every activation of a cell
+starts its stream with a `link` record naming the state it restored, so a
+consumer sees a gap across a restart or a move between nodes. Facets,
+schema records, the `kv` mapping of `_cf_KV`, repair and the blob-stream
 sink are not built yet. A node with `CELLD_EXPORT_SINK=blob-stream` refuses
 to start.
 

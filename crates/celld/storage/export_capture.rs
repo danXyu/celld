@@ -137,6 +137,11 @@ pub(crate) enum WalStamp {
 struct WalState {
     /// The newest commit's stamp since the last pull.
     last: Cell<Option<WalStamp>>,
+    /// Queues the cell for a check point after any commit, so a write that
+    /// touched no exported table still reaches one: the live path proves
+    /// its position, and the delivered position passes its TXID.
+    scope: String,
+    queue: DirtyList,
 }
 
 /// SQLite calls this after each commit on the connection, with the number
@@ -159,6 +164,12 @@ unsafe extern "C" fn wal_hook(
         // the WAL in between; the frame's own salts catch that.
         let stamp = unsafe { read_stamp(database, u64::try_from(frames).unwrap_or(0)) };
         state.last.set(Some(stamp.unwrap_or(WalStamp::Unplaced)));
+        // Held only briefly by check points, never across a commit.
+        if let Ok(mut queue) = state.queue.try_borrow_mut() {
+            if !queue.contains(&state.scope) {
+                queue.push(state.scope.clone());
+            }
+        }
     }
     // The default hook's passive checkpoint, which this hook replaced.
     if frames >= AUTOCHECKPOINT_FRAMES {
@@ -390,7 +401,7 @@ impl Capture {
             generated: RefCell::new(HashMap::new()),
             untracked: RefCell::new(Vec::new()),
             dirty: Cell::new(false),
-            queue,
+            queue: queue.clone(),
             // SAFETY: as for `database` below.
             database: unsafe { connection.handle() },
         });
@@ -402,6 +413,8 @@ impl Capture {
             filter,
             wal: Box::new(WalState {
                 last: Cell::new(None),
+                scope: scope.to_string(),
+                queue,
             }),
             settings,
             overflowed: false,

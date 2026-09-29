@@ -36,14 +36,27 @@
 //!
 //! - root cells only. A facet's stream has its own replication and no gate
 //!   residency of its own, so facets are not exported yet;
-//! - the stream's incarnation is 0 and `cell_name` is absent, until
-//!   activation links (which know a cell's first epoch) land;
 //! - the shared queue budget is applied to the pending lists. The sink's
 //!   buffer counts against it but is bounded by its own early flush, so the
 //!   pending commits are what is shed;
 //! - commits pulled after the residency's last ticket can no longer be
 //!   proven (the cell is leaving) are not released; the next activation's
 //!   link or the reconciler reports that tail.
+//!
+//! **Links.** Each residency's stream starts with a `link` record naming the
+//! state the activation restored ([`ActivationLink`]): positions are per
+//! epoch, so the link is what joins an epoch to its predecessor, and a
+//! predecessor position beyond what the consumer certified is a gap. The
+//! link is submitted when the cell's connection attaches, before the cell
+//! serves and ahead of every commit of the residency, at `(epoch,
+//! start_txid, 0)`: after every position of an earlier residency of the same
+//! epoch and before every commit of this one. It is not gated; it states
+//! where the residency starts, not a write.
+//!
+//! **Incarnation.** A root cell's incarnation is the epoch its stream began
+//! in, stored in the cell's `_cf_METADATA` row at the first exported open so
+//! it moves and restores with the cell and survives `deleteAll`. A cell
+//! created before export was turned on takes the epoch export first saw.
 
 use crate::bucket::Bucket;
 use crate::export::Config;
@@ -51,10 +64,11 @@ use crate::export_sink::{
     BucketSink, BucketSinkConfig, Delivery as SinkDelivery, ExportSink, Outcome, Retention,
     SinkRecord,
 };
+use crate::replication::{ActivationLink, ActivationMode};
 use crate::storage::export_capture::{CapturedCommit, WalStamp};
 use celld_export_format::{
-    split, Body, BulkBody, Envelope, GapBody, Origin, Position, Record, RowsBody, Split, StreamId,
-    TableGen, WatermarkBody,
+    split, Body, BulkBody, Envelope, GapBody, LinkBody, LinkMode, Origin, Position, Record,
+    RowsBody, Split, StreamId, TableGen, WatermarkBody,
 };
 use celld_logic::export::{Attribution, Capture, CapturedWal, Released, WalGeneration, WalPoint};
 use celld_logic::RequestError;
@@ -88,16 +102,23 @@ pub struct TicketAsk {
 
 /// One input on a stream's FIFO.
 enum Input {
-    /// The script of the cell's deployment, sent when the cell's
-    /// connection attaches.
-    Identity {
-        script: String,
-    },
+    /// Who the stream is, sent when the cell's connection attaches.
+    Identity(Identity),
+    /// The cell's `idFromName` name, once it is known.
+    Named(String),
     /// A pulled commit and the committed-write position after it.
     Commit {
         stamp: WalStamp,
         position: u64,
         commit: CapturedCommit,
+    },
+    /// A commit that netted to no exported row, with its WAL point and the
+    /// committed-write position after it. Attributed like any commit, so
+    /// the released position (and with it the delivered one) passes its
+    /// TXID.
+    Wrote {
+        stamp: WalStamp,
+        position: u64,
     },
     CaughtUp,
     Captured(Capture),
@@ -106,6 +127,16 @@ enum Input {
         ticket: u64,
         result: Result<u64, RequestError>,
     },
+}
+
+/// The stream identity the cell thread reads from the cell itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Identity {
+    /// The script of the cell's deployment.
+    pub script: String,
+    pub incarnation: u64,
+    /// `_cf_METADATA.actor_name`, when the cell has one.
+    pub cell_name: Option<String>,
 }
 
 /// The cell thread's handle on its stream.
@@ -132,6 +163,21 @@ impl CellStream {
     pub(crate) fn caught_up(&self) {
         let _ = self.tx.send(Input::CaughtUp);
     }
+
+    pub(crate) fn wrote(&self, stamp: WalStamp, position: u64) {
+        let _ = self.tx.send(Input::Wrote { stamp, position });
+    }
+
+    /// Name the stream. Sent once, before the capture session installs, so
+    /// the link precedes every commit.
+    pub(crate) fn identify(&self, identity: Identity) {
+        let _ = self.tx.send(Input::Identity(identity));
+    }
+
+    /// The cell's name, persisted after it attached.
+    pub(crate) fn named(&self, name: &str) {
+        let _ = self.tx.send(Input::Named(name.to_string()));
+    }
 }
 
 /// Counters for `/state`.
@@ -151,6 +197,7 @@ struct Counters {
 struct Submitted {
     key: (String, u64),
     stream: StreamId,
+    cell_name: Option<String>,
     position: Position,
     /// The last fragment of a record: the record counts once when it lands.
     whole: bool,
@@ -167,7 +214,14 @@ pub struct Exporter {
     streams: Mutex<HashMap<(String, u64), mpsc::WeakUnboundedSender<Input>>>,
     ask: Box<dyn Fn(TicketAsk) + Send + Sync>,
     next_seq: AtomicU64,
-    submitted: Mutex<HashMap<u64, Submitted>>,
+    /// Records in flight, by sequence. Ordered, so an advance can tell
+    /// whether anything submitted before it is still outstanding.
+    submitted: Mutex<BTreeMap<u64, Submitted>>,
+    /// Released positions waiting for the records submitted before them,
+    /// by the sequence they were given. See [`Stream::advance`].
+    advances: Mutex<BTreeMap<u64, Submitted>>,
+    /// Wakes the delivery task when an advance is registered.
+    wake: mpsc::UnboundedSender<Outcome>,
     counters: Counters,
 }
 
@@ -186,6 +240,7 @@ impl Exporter {
             "CELLD_EXPORT_SINK=blob-stream is not available in this build yet; use bucket"
         );
         let (outcomes_tx, outcomes_rx) = mpsc::unbounded_channel();
+        let wake = outcomes_tx.clone();
         let sink = BucketSink::start(
             bucket,
             node.clone(),
@@ -207,7 +262,9 @@ impl Exporter {
             streams: Mutex::new(HashMap::new()),
             ask: Box::new(ask),
             next_seq: AtomicU64::new(1),
-            submitted: Mutex::new(HashMap::new()),
+            submitted: Mutex::new(BTreeMap::new()),
+            advances: Mutex::new(BTreeMap::new()),
+            wake,
             counters: Counters::default(),
         });
         EXPORTER
@@ -225,7 +282,7 @@ impl Exporter {
     }
 
     /// Whether `cell` is exported: a root cell of an exported class.
-    fn exports(&self, cell: &str) -> bool {
+    pub(crate) fn exports(&self, cell: &str) -> bool {
         if cell.contains("/facets/") {
             return false;
         }
@@ -235,11 +292,13 @@ impl Exporter {
 
     /// Open the stream of one residency when its replica opens, and return
     /// the capture observer that feeds it. `None` when the cell is not
-    /// exported.
+    /// exported. `link` is where the activation's state came from; the
+    /// stream submits it once the cell attaches.
     pub(crate) fn open_stream(
         self: &Arc<Self>,
         cell: &str,
         epoch: u64,
+        link: ActivationLink,
     ) -> Option<impl FnMut(&celld_ltx::CapturedFile) + Send + 'static> {
         if !self.exports(cell) {
             return None;
@@ -255,7 +314,7 @@ impl Exporter {
                 None => {
                     let (tx, rx) = mpsc::unbounded_channel();
                     streams.insert(key.clone(), tx.downgrade());
-                    let stream = Stream::new(self.clone(), key, tx.downgrade());
+                    let stream = Stream::new(self.clone(), key, link, tx.downgrade());
                     crate::asyncrt::spawn(stream.run(rx));
                     tx
                 }
@@ -267,17 +326,15 @@ impl Exporter {
     }
 
     /// The cell thread's handle on the stream of `scope` at `epoch`, when
-    /// its replica opened one.
-    pub(crate) fn attach(&self, scope: &str, epoch: u64, script: &str) -> Option<CellStream> {
+    /// its replica opened one. The caller names it with
+    /// [`CellStream::identify`].
+    pub(crate) fn attach(&self, scope: &str, epoch: u64) -> Option<CellStream> {
         let tx = self
             .streams
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&(scope.to_string(), epoch))
             .and_then(mpsc::WeakUnboundedSender::upgrade)?;
-        let _ = tx.send(Input::Identity {
-            script: script.to_string(),
-        });
         let class = scope.split_once(':').map_or(scope, |(class, _)| class);
         let denied = self
             .config
@@ -353,10 +410,33 @@ impl Exporter {
         }
     }
 
-    fn envelope(&self, stream: &StreamId, position: Position, committed_at: i64) -> Envelope {
+    /// Let the stream's delivered position reach `meta.position` once every
+    /// record submitted before now is acknowledged. It carries no record.
+    fn advance(&self, meta: Submitted) {
+        {
+            let _submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+            let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+            self.advances
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(seq, meta);
+        }
+        let _ = self.wake.send(Outcome {
+            sink: "advance",
+            results: Vec::new(),
+        });
+    }
+
+    fn envelope(
+        &self,
+        stream: &StreamId,
+        cell_name: &Option<String>,
+        position: Position,
+        committed_at: i64,
+    ) -> Envelope {
         Envelope {
             stream: stream.clone(),
-            cell_name: None,
+            cell_name: cell_name.clone(),
             position,
             committed_at,
             node: self.node.clone(),
@@ -398,12 +478,18 @@ struct Stream {
     exporter: Arc<Exporter>,
     key: (String, u64),
     identity: StreamId,
-    attribution: Attribution<CapturedCommit>,
+    cell_name: Option<String>,
+    /// Submitted when the cell attaches, then `None`.
+    link: Option<ActivationLink>,
+    /// `None` stands for a commit with no exported row.
+    attribution: Attribution<Option<CapturedCommit>>,
     /// Handed out as `commit` in positions, in release order.
     next_commit: u64,
     /// The TXID of the newest released position, so a gap never sorts
-    /// before a commit released ahead of it.
+    /// before a commit released ahead of it (or before an advance).
     last_txid: u64,
+    /// The newest position this stream has submitted or advanced to.
+    last_position: Position,
     next_ticket: u64,
     /// The ticket in flight and the position it asked for.
     outstanding: Option<(u64, u64)>,
@@ -423,12 +509,14 @@ impl Stream {
     fn new(
         exporter: Arc<Exporter>,
         key: (String, u64),
+        link: ActivationLink,
         this: mpsc::WeakUnboundedSender<Input>,
     ) -> Self {
         let (cell, _) = &key;
         let class = cell
             .split_once(':')
             .map_or(cell.as_str(), |(class, _)| class);
+        let epoch = key.1;
         let identity = StreamId {
             script: String::new(),
             class: class.to_string(),
@@ -440,9 +528,12 @@ impl Stream {
             exporter,
             key,
             identity,
+            cell_name: None,
+            link: Some(link),
             attribution: Attribution::new(),
             next_commit: 1,
             last_txid: 0,
+            last_position: Position::new(epoch, 0, 0),
             next_ticket: 1,
             outstanding: None,
             wanted: None,
@@ -496,7 +587,15 @@ impl Stream {
         let counters = &exporter.counters;
         match input {
             None => {}
-            Some(Input::Identity { script }) => self.identity.script = script,
+            Some(Input::Identity(identity)) => {
+                self.identity.script = identity.script;
+                self.identity.incarnation = identity.incarnation;
+                self.cell_name = identity.cell_name;
+                if let Some(link) = self.link.take() {
+                    self.submit_link(link);
+                }
+            }
+            Some(Input::Named(name)) => self.cell_name = Some(name),
             Some(Input::Commit {
                 stamp,
                 position,
@@ -517,12 +616,34 @@ impl Stream {
                             frames,
                         },
                         bytes,
-                        commit,
+                        Some(commit),
                     ),
-                    WalStamp::Unplaced => self.attribution.unplaced(bytes, commit),
+                    WalStamp::Unplaced => self.attribution.unplaced(bytes, Some(commit)),
                 }
                 self.wanted = Some(self.wanted.map_or(position, |wanted| wanted.max(position)));
             }
+            Some(Input::Wrote {
+                stamp:
+                    WalStamp::At {
+                        salt1,
+                        salt2,
+                        frames,
+                    },
+                position,
+            }) => {
+                self.attribution.commit(
+                    WalPoint {
+                        generation: WalGeneration { salt1, salt2 },
+                        frames,
+                    },
+                    0,
+                    None,
+                );
+                self.wanted = Some(self.wanted.map_or(position, |wanted| wanted.max(position)));
+            }
+            // Without a WAL point there is nothing to attribute: the commit's
+            // capture was already reported, and the next commit settles it.
+            Some(Input::Wrote { .. }) => {}
             Some(Input::CaughtUp) => self.attribution.caught_up(),
             Some(Input::Captured(capture)) => self.attribution.captured(&capture),
             Some(Input::Proven { ticket, result }) => {
@@ -562,6 +683,7 @@ impl Stream {
             .attribution_mismatches
             .fetch_add(mismatched, Ordering::Relaxed);
         self.release(released);
+        self.advance();
         self.account(
             self.attribution.pending_bytes(),
             self.attribution.pending_len() as u64,
@@ -622,12 +744,92 @@ impl Stream {
         self.counted_commits = commits;
     }
 
+    /// Move the delivered position over TXIDs that hold no exported commit.
+    ///
+    /// A commit's position carries the TXID of the capture that holds it,
+    /// but a cell also writes TXIDs no record stands for: writes to tables
+    /// the export skips, the capture loop's own bookkeeping. The released
+    /// position covers them, and a delivered position that stopped at the
+    /// last commit would put every later `link` (whose predecessor is the
+    /// restored chain's last TXID) beyond what the consumer certified.
+    /// Every later commit is labelled above the released position, and
+    /// every later gap sorts after it (see `last_txid`).
+    fn advance(&mut self) {
+        let released = self.attribution.released_position();
+        let position = Position::new(self.key.1, released, self.next_commit - 1);
+        if position <= self.last_position {
+            return;
+        }
+        self.last_position = position;
+        self.last_txid = self.last_txid.max(released);
+        self.exporter.advance(Submitted {
+            key: self.key.clone(),
+            stream: self.identity.clone(),
+            cell_name: self.cell_name.clone(),
+            position,
+            whole: false,
+            closes: true,
+            watermark: false,
+        });
+    }
+
+    /// Submit the residency's `link`, ahead of every commit.
+    fn submit_link(&mut self, link: ActivationLink) {
+        let position = link_position(self.key.1, &link);
+        self.last_position = self.last_position.max(position);
+        let record = Record {
+            envelope: self.exporter.envelope(
+                &self.identity,
+                &self.cell_name,
+                position,
+                crate::asyncrt::wall_ms(),
+            ),
+            body: Body::Link(link_body(&link)),
+        };
+        let meta = Submitted {
+            key: self.key.clone(),
+            stream: self.identity.clone(),
+            cell_name: self.cell_name.clone(),
+            position,
+            whole: true,
+            closes: true,
+            watermark: false,
+        };
+        self.exporter.submit(vec![(record, meta)]);
+    }
+
     /// Turn released commits and gaps into records and submit them.
-    fn release(&mut self, released: Vec<Released<CapturedCommit>>) {
+    fn release(&mut self, released: Vec<Released<Option<CapturedCommit>>>) {
         let epoch = self.key.1;
         let max_record = self.exporter.config.max_record_bytes;
         let mut out: Vec<(Record, Submitted)> = Vec::new();
         for entry in released {
+            let entry = match entry {
+                // A commit with no exported row takes no position; the
+                // released position covers its TXID.
+                Released::Commit {
+                    label,
+                    payload: None,
+                } => {
+                    self.last_txid = self.last_txid.max(label);
+                    continue;
+                }
+                Released::Commit {
+                    label,
+                    payload: Some(payload),
+                } => Released::Commit { label, payload },
+                Released::Gap {
+                    after,
+                    through,
+                    unmatched,
+                    overflowed,
+                } => Released::Gap {
+                    after,
+                    through,
+                    unmatched,
+                    overflowed,
+                },
+            };
             let number = self.next_commit;
             self.next_commit += 1;
             let mut records = Vec::new();
@@ -635,9 +837,12 @@ impl Stream {
                 Released::Commit { label, payload } => {
                     self.last_txid = self.last_txid.max(label);
                     let position = Position::new(epoch, label, number);
-                    let envelope =
-                        self.exporter
-                            .envelope(&self.identity, position, payload.committed_at);
+                    let envelope = self.exporter.envelope(
+                        &self.identity,
+                        &self.cell_name,
+                        position,
+                        payload.committed_at,
+                    );
                     let mut bulk: Vec<TableGen> = payload.bulk;
                     for table in payload.tables {
                         let record = Record {
@@ -673,6 +878,7 @@ impl Stream {
                     records.push(Record {
                         envelope: self.exporter.envelope(
                             &self.identity,
+                            &self.cell_name,
                             position,
                             crate::asyncrt::wall_ms(),
                         ),
@@ -687,10 +893,14 @@ impl Stream {
                 }
             }
             let last = records.len().saturating_sub(1);
+            if let Some(record) = records.last() {
+                self.last_position = self.last_position.max(record.envelope.position);
+            }
             for (index, record) in records.into_iter().enumerate() {
                 let meta = Submitted {
                     key: self.key.clone(),
                     stream: self.identity.clone(),
+                    cell_name: self.cell_name.clone(),
                     position: record.envelope.position,
                     whole: record.envelope.fragment == record.envelope.fragments,
                     closes: index == last,
@@ -706,7 +916,7 @@ impl Stream {
 /// What delivery knows about one stream.
 #[derive(Default)]
 struct Delivered {
-    stream: Option<StreamId>,
+    stream: Option<(StreamId, Option<String>)>,
     /// The newest position whose commit is wholly acknowledged.
     position: Option<Position>,
     /// The `through` of the last watermark submitted.
@@ -732,7 +942,7 @@ async fn deliver(exporter: Arc<Exporter>, mut outcomes: mpsc::UnboundedReceiver<
                 continue;
             };
             let state = streams.entry(meta.key.clone()).or_default();
-            state.stream.get_or_insert_with(|| meta.stream.clone());
+            state.stream = Some((meta.stream.clone(), meta.cell_name.clone()));
             if state.frozen {
                 continue;
             }
@@ -762,6 +972,7 @@ async fn deliver(exporter: Arc<Exporter>, mut outcomes: mpsc::UnboundedReceiver<
                     let record = Record {
                         envelope: exporter.envelope(
                             &meta.stream,
+                            &meta.cell_name,
                             meta.position,
                             crate::asyncrt::wall_ms(),
                         ),
@@ -781,8 +992,10 @@ async fn deliver(exporter: Arc<Exporter>, mut outcomes: mpsc::UnboundedReceiver<
                 }
             }
         }
+        resolve_advances(&exporter, &mut streams);
         for (key, state) in &mut streams {
-            let (Some(through), Some(stream)) = (state.position, state.stream.clone()) else {
+            let (Some(through), Some((stream, cell_name))) = (state.position, state.stream.clone())
+            else {
                 continue;
             };
             if state.frozen || state.marked.is_some_and(|marked| marked >= through) {
@@ -804,12 +1017,18 @@ async fn deliver(exporter: Arc<Exporter>, mut outcomes: mpsc::UnboundedReceiver<
             exporter.counters.watermarks.fetch_add(1, Ordering::Relaxed);
             follow_up.push((
                 Record {
-                    envelope: exporter.envelope(&stream, through, crate::asyncrt::wall_ms()),
+                    envelope: exporter.envelope(
+                        &stream,
+                        &cell_name,
+                        through,
+                        crate::asyncrt::wall_ms(),
+                    ),
                     body: Body::Watermark(body),
                 },
                 Submitted {
                     key: key.clone(),
                     stream,
+                    cell_name,
                     position: through,
                     whole: false,
                     closes: false,
@@ -822,9 +1041,81 @@ async fn deliver(exporter: Arc<Exporter>, mut outcomes: mpsc::UnboundedReceiver<
     }
 }
 
+/// Apply the advances that nothing submitted before them still holds up.
+fn resolve_advances(exporter: &Exporter, streams: &mut BTreeMap<(String, u64), Delivered>) {
+    let ready = {
+        let submitted = exporter.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let mut advances = exporter.advances.lock().unwrap_or_else(|e| e.into_inner());
+        match submitted.keys().next() {
+            Some(&oldest) => {
+                let later = advances.split_off(&oldest);
+                std::mem::replace(&mut *advances, later)
+            }
+            None => std::mem::take(&mut *advances),
+        }
+    };
+    for meta in ready.into_values() {
+        let state = streams.entry(meta.key).or_default();
+        state.stream = Some((meta.stream, meta.cell_name));
+        if !state.frozen && state.position.is_none_or(|at| at < meta.position) {
+            state.position = Some(meta.position);
+        }
+    }
+}
+
+/// Where a residency's link sits: after every position an earlier residency
+/// of the same epoch could hold (their txids are below `start_txid`), and
+/// before every commit of this one (numbered from one).
+fn link_position(epoch: u64, link: &ActivationLink) -> Position {
+    Position::new(epoch, link.start_txid, 0)
+}
+
+fn link_body(link: &ActivationLink) -> LinkBody {
+    LinkBody {
+        start_txid: link.start_txid,
+        prev_epoch: link.prev_epoch,
+        prev_txid: link.prev_txid,
+        mode: match link.mode {
+            ActivationMode::Fresh => LinkMode::Fresh,
+            ActivationMode::Clone => LinkMode::Clone,
+            ActivationMode::Paged => LinkMode::Paged,
+            ActivationMode::Resume => LinkMode::Resume,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_link_sorts_between_residencies() {
+        // A clean reload of epoch 7 whose earlier residency reached TXID 41.
+        let link = ActivationLink {
+            mode: ActivationMode::Resume,
+            start_txid: 42,
+            prev_epoch: Some(7),
+            prev_txid: Some(41),
+        };
+        let at = link_position(7, &link);
+        assert!(
+            Position::new(7, 41, u64::MAX) < at,
+            "after the earlier residency"
+        );
+        assert!(
+            at < Position::new(7, 42, 1),
+            "before this residency's first commit"
+        );
+        assert_eq!(
+            link_body(&link),
+            LinkBody {
+                start_txid: 42,
+                prev_epoch: Some(7),
+                prev_txid: Some(41),
+                mode: LinkMode::Resume,
+            }
+        );
+    }
 
     #[test]
     fn captured_files_keep_their_wal_range() {

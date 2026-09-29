@@ -480,6 +480,22 @@ pub fn schema(c: &Connection) -> anyhow::Result<()> {
             [],
         )?;
     }
+    // Change export's stream incarnation (`export_live`). Kept beside the
+    // actor name because `deleteAll` keeps this table.
+    let metadata_columns = {
+        let mut statement = c.prepare("PRAGMA table_info(_cf_METADATA)")?;
+        let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+        columns.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if !metadata_columns
+        .iter()
+        .any(|column| column == "incarnation")
+    {
+        c.execute(
+            "ALTER TABLE _cf_METADATA ADD COLUMN incarnation INTEGER",
+            [],
+        )?;
+    }
     // NORMAL, not the FULL default: with WAL, commits then skip the
     // per-commit WAL fsync (measured 1.4ms -> 19us per put on cloud
     // disks; the fsync was the entire single-cell write budget).
@@ -923,8 +939,19 @@ fn finish_open(
             return (None, None);
         };
         let export_stream = match crate::export_live::installed() {
-            Some(exporter) => match exporter.attach(scope, epoch, &cells.export_script.borrow()) {
-                Some(stream) => Some(stream),
+            Some(exporter) => match exporter.attach(scope, epoch) {
+                Some(stream) => {
+                    // Before the session installs: this write is the
+                    // engine's, and the link must precede every commit.
+                    match export_identity(&c, scope, epoch, &cells.export_script.borrow()) {
+                        Ok(identity) => stream.identify(identity),
+                        Err(error) => {
+                            tracing::error!(scope, %error, "export: read the stream identity");
+                            return (None, None);
+                        }
+                    }
+                    Some(stream)
+                }
                 None => return (None, None),
             },
             None => None,
@@ -963,6 +990,32 @@ fn finish_open(
         )
     });
     Ok(())
+}
+
+/// The export stream identity of the cell on `c`: its incarnation, stored at
+/// the first exported open as the epoch it opened in, and its name.
+fn export_identity(
+    c: &Connection,
+    scope: &str,
+    epoch: u64,
+    script: &str,
+) -> anyhow::Result<crate::export_live::Identity> {
+    let epoch = i64::try_from(epoch)?;
+    c.execute(
+        "INSERT INTO _cf_METADATA(scope, incarnation) VALUES(?1, ?2) \
+         ON CONFLICT(scope) DO UPDATE SET incarnation=?2 WHERE incarnation IS NULL",
+        rusqlite::params![scope, epoch],
+    )?;
+    let (incarnation, cell_name) = c.query_row(
+        "SELECT incarnation, actor_name FROM _cf_METADATA WHERE scope=?1",
+        [scope],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+    )?;
+    Ok(crate::export_live::Identity {
+        script: script.to_string(),
+        incarnation: u64::try_from(incarnation)?,
+        cell_name,
+    })
 }
 
 /// The facets of `root` this isolate holds: a facet of the root's own
@@ -1053,9 +1106,14 @@ fn export_checkpoint_scope(scope: &str) {
         // the commit, the way an output's barrier does.
         let live = cell.export_stream.clone().map(|stream| {
             let stamp = stamp.unwrap_or(export_capture::WalStamp::Unplaced);
-            let position = matches!(result, export_capture::Checkpoint::Pulled(_))
-                .then(|| fingerprint(scope, &cell.connection))
-                .unwrap_or(0);
+            // A write that netted to no exported row still moves the
+            // position, and its proof lets the delivered position pass it.
+            let position = matches!(
+                result,
+                export_capture::Checkpoint::Pulled(_) | export_capture::Checkpoint::Clean
+            )
+            .then(|| fingerprint(scope, &cell.connection))
+            .unwrap_or(0);
             (stream, stamp, position)
         });
         Some((result, caught_up, again, live))
@@ -1066,8 +1124,10 @@ fn export_checkpoint_scope(scope: &str) {
     let mut events = Vec::new();
     if let Some((stream, stamp, position)) = live {
         // Straight onto the stream's FIFO, in the order they happened.
-        if let export_capture::Checkpoint::Pulled(commit) = result {
-            stream.commit(stamp, position, commit);
+        match result {
+            export_capture::Checkpoint::Pulled(commit) => stream.commit(stamp, position, commit),
+            export_capture::Checkpoint::Clean => stream.wrote(stamp, position),
+            export_capture::Checkpoint::Deferred => {}
         }
         if caught_up {
             stream.caught_up();
@@ -4349,25 +4409,39 @@ pub fn set_actor_name(scope: &str, name: &str) -> anyhow::Result<()> {
 }
 
 fn set_actor_name_inner(scope: &str, name: &str) -> anyhow::Result<()> {
-    with(scope, |connection| -> anyhow::Result<()> {
-        connection.execute(
+    let named = with(scope, |connection| -> anyhow::Result<bool> {
+        // A row can exist without a name: change export stores the stream's
+        // incarnation in it at open.
+        let named = connection.execute(
             "INSERT INTO _cf_METADATA(scope, actor_name) VALUES(?1, ?2) \
-             ON CONFLICT(scope) DO NOTHING",
+             ON CONFLICT(scope) DO UPDATE SET actor_name=?2 WHERE actor_name IS NULL",
             rusqlite::params![scope, name],
         )?;
         let stored: Option<String> = connection
             .query_row(
                 "SELECT actor_name FROM _cf_METADATA WHERE scope=?1",
                 [scope],
-                |row| row.get(0),
+                |row| row.get::<_, Option<String>>(0),
             )
-            .optional()?;
+            .optional()?
+            .flatten();
         if stored.as_deref() != Some(name) {
             anyhow::bail!("actor name conflicts with persisted identity for {scope}");
         }
-        Ok(())
+        Ok(named > 0)
     })
-    .unwrap_or_else(|| Err(anyhow::anyhow!("no db for {scope}")))
+    .unwrap_or_else(|| Err(anyhow::anyhow!("no db for {scope}")))?;
+    if named {
+        let stream = dbs(|d| {
+            d.borrow()
+                .get(scope)
+                .and_then(|cell| cell.export_stream.clone())
+        });
+        if let Some(stream) = stream {
+            stream.named(name);
+        }
+    }
+    Ok(())
 }
 
 pub fn get_actor_name(scope: &str) -> anyhow::Result<Option<String>> {
@@ -4376,9 +4450,11 @@ pub fn get_actor_name(scope: &str) -> anyhow::Result<Option<String>> {
             .query_row(
                 "SELECT actor_name FROM _cf_METADATA WHERE scope=?1",
                 [scope],
-                |row| row.get(0),
+                // A row without a name holds only the export incarnation.
+                |row| row.get::<_, Option<String>>(0),
             )
             .optional()
+            .map(Option::flatten)
             .map_err(Into::into)
     })
     .unwrap_or_else(|| Err(anyhow::anyhow!("no db for {scope}")))

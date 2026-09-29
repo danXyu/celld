@@ -11,7 +11,7 @@
 //! from the same bucket. The node's watermarks must certify every commit,
 //! including across enough commits to pass the WAL's autocheckpoint.
 
-use celld_export_format::{Body, Consumer, Position, StreamState, Value};
+use celld_export_format::{Body, Consumer, LinkMode, Position, Record, StreamState, Value};
 use std::collections::BTreeMap;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -35,6 +35,7 @@ export class Items {
     this.sql.exec("CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY, name TEXT, qty REAL)");
     this.sql.exec("CREATE TABLE IF NOT EXISTS notes (body TEXT)");
   }
+  async alarm() {}
   async fetch(request) {
     const url = new URL(request.url);
     const op = url.searchParams.get("op");
@@ -53,6 +54,9 @@ export class Items {
         this.sql.exec("INSERT INTO items(id, name, qty) VALUES(?, ?, ?)", 1000 + i, "row " + i, i);
       }
       this.sql.exec("DELETE FROM items WHERE id >= 1000 AND id % 3 = 0");
+    } else if (op === "alarm") {
+      // A write to no exported table: its txid carries no record.
+      await this.storage.setAlarm(Date.now() + 3600 * 1000);
     } else if (op === "batch") {
       // Several statements in one transaction: one commit.
       this.storage.transactionSync(() => {
@@ -246,6 +250,51 @@ fn stream_state(
     Some((state, newest))
 }
 
+/// The `link` records of the cell `cell_id`, in position order.
+fn links(records: &[Record], cell_id: &str) -> Vec<Record> {
+    let mut links: Vec<Record> = records
+        .iter()
+        .filter(|r| r.envelope.stream.cell == cell_id && matches!(r.body, Body::Link(_)))
+        .cloned()
+        .collect();
+    links.sort_by_key(|r| r.envelope.position);
+    links.dedup_by_key(|r| r.envelope.position);
+    links
+}
+
+/// Checks the first residency of a stream: it opens with a fresh link, its
+/// incarnation is the epoch it began in, and its rows carry the cell's name.
+fn assert_opens_fresh(records: &[Record], cell_id: &str, name: &str) -> u64 {
+    let links = links(records, cell_id);
+    let [link] = &links[..] else {
+        panic!("one link for {cell_id}: {links:#?}");
+    };
+    let Body::Link(body) = &link.body else {
+        unreachable!()
+    };
+    assert_eq!(body.mode, LinkMode::Fresh);
+    assert_eq!((body.prev_epoch, body.prev_txid), (None, None));
+    let epoch = link.envelope.position.epoch;
+    assert_eq!(
+        link.envelope.position,
+        Position::new(epoch, body.start_txid, 0)
+    );
+    assert_eq!(link.envelope.stream.incarnation, epoch);
+    let first = records
+        .iter()
+        .filter(|r| r.envelope.stream.cell == cell_id)
+        .map(|r| r.envelope.position)
+        .min();
+    assert_eq!(first, Some(link.envelope.position), "the link comes first");
+    for record in records.iter().filter(|r| r.envelope.stream.cell == cell_id) {
+        assert_eq!(record.envelope.stream.incarnation, epoch);
+        if matches!(record.body, Body::Rows(_)) {
+            assert_eq!(record.envelope.cell_name.as_deref(), Some(name));
+        }
+    }
+    epoch
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn exported_rows_match_the_restored_cell() {
     let client = reqwest::Client::builder()
@@ -268,6 +317,7 @@ async fn exported_rows_match_the_restored_cell() {
         "cell=a&op=delete&id=2",
         "cell=b&op=put&id=2&name=kiwi&qty=0.5",
         "cell=b&op=delete&id=1",
+        "cell=b&op=alarm",
     ] {
         dev.call(&client, query).await;
     }
@@ -303,7 +353,7 @@ async fn exported_rows_match_the_restored_cell() {
                         exported_rows(&state, "items"),
                         exported_rows(&state, "notes"),
                     ) == want
-                        && state.certified_head() == Some(newest)
+                        && state.certified_head().is_some_and(|head| head >= newest)
                         && state.gaps.is_empty()
                         && state.uncertain.is_empty()
                 })
@@ -321,7 +371,47 @@ async fn exported_rows_match_the_restored_cell() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
+    // Cell b's last write set an alarm, a table the export skips. Its TXID
+    // carries no record, yet the watermarks must pass it, or the link of
+    // b's next residency would name a predecessor the consumer never
+    // certified.
+    let want_b = cell_rows(&live_b, "items", &["id", "name", "qty"]);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let records = exported(project.path());
+        let passed = cells.iter().any(|cell| {
+            stream_state(&records, cell).is_some_and(|(state, newest)| {
+                exported_rows(&state, "items") == want_b
+                    && state
+                        .certified_head()
+                        .is_some_and(|head| head.txid > newest.txid)
+            })
+        });
+        if passed {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the alarm's TXID was never certified:\n{}",
+            dev.log_text()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     drop(dev);
+    let first_epochs: Vec<(String, u64)> = [("a", &live_a), ("b", &live_b)]
+        .iter()
+        .map(|(name, live)| {
+            let want = cell_rows(live, "items", &["id", "name", "qty"]);
+            let cell = cells
+                .iter()
+                .find(|cell| {
+                    stream_state(&records, cell)
+                        .is_some_and(|(state, _)| exported_rows(&state, "items") == want)
+                })
+                .unwrap();
+            (cell.clone(), assert_opens_fresh(&records, cell, name))
+        })
+        .collect();
 
     // Restore both cells from the bucket and compare what they hold now
     // with what the export says they hold.
@@ -364,4 +454,57 @@ async fn exported_rows_match_the_restored_cell() {
         .find(|r| matches!(&r.body, Body::Rows(rows) if rows.data.table == "notes"))
         .expect("the rowid table is exported");
     assert_eq!(notes.envelope.position, batch[0].envelope.position);
+
+    // The restart's residencies link back to the first: same stream
+    // identity, a later epoch, and a predecessor position the consumer has
+    // certified, so the stream has no gap across the restart.
+    let live_a = dev
+        .call(&client, "cell=a&op=put&id=3&name=plum&qty=4")
+        .await;
+    let live_b = dev
+        .call(&client, "cell=b&op=put&id=3&name=date&qty=9")
+        .await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let records = exported(project.path());
+        let settled = [&live_a, &live_b]
+            .iter()
+            .zip(&first_epochs)
+            .all(|(live, (cell, _))| {
+                stream_state(&records, cell).is_some_and(|(state, newest)| {
+                    exported_rows(&state, "items")
+                        == cell_rows(live, "items", &["id", "name", "qty"])
+                        && state.certified_head().is_some_and(|head| head >= newest)
+                })
+            });
+        if settled {
+            for (cell, first) in &first_epochs {
+                let links = links(&records, cell);
+                let [_, link] = &links[..] else {
+                    panic!("two links for {cell}: {links:#?}");
+                };
+                let Body::Link(body) = &link.body else {
+                    unreachable!()
+                };
+                assert!(link.envelope.position.epoch > *first, "{link:#?}");
+                assert_eq!(link.envelope.stream.incarnation, *first);
+                assert_ne!(body.mode, LinkMode::Fresh, "{link:#?}");
+                assert_eq!(body.prev_epoch, Some(*first), "{link:#?}");
+                assert!(body.prev_txid.is_some(), "{link:#?}");
+                let (state, _) = stream_state(&records, cell).unwrap();
+                assert!(state.gaps.is_empty(), "{cell}: {:#?}", state.gaps);
+            }
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the restarted residencies did not export:\n{:#?}\nlog:\n{}",
+            records
+                .iter()
+                .filter(|r| !matches!(r.body, Body::Rows(_)))
+                .collect::<Vec<_>>(),
+            dev.log_text()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }

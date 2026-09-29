@@ -375,7 +375,8 @@ A `snapshot` record has the same shape as `rows` with `op` always `I`, and a
 set of table generations it covered, and its record count. A `schema` record
 adds `table`, `generation`, `sql`, `columns`, and `dropped` or `renamed_from`.
 A `link` record adds `start_txid`, `prev_epoch`, `prev_txid`, and `mode`
-(`fresh`, `clone`, or `paged`). A `recovered` record adds `session` and the
+(`fresh`, `clone`, `paged`, or `resume` for a clean reload of the same
+epoch). A `recovered` record adds `session` and the
 recovered head position. A `deleted` record names a stream and takes effect
 at its position. A `bulk` record adds `tables`. A `gap` record adds
 `from` and `to` positions and `reason`.
@@ -476,7 +477,10 @@ loss visible.
 - **Links.** Every activation emits a `link` before the cell serves, naming
   the predecessor position from the chain the activation builds in
   `activate_with`. A link whose `prev_txid` exceeds the predecessor epoch's
-  last certified position exposes a gap.
+  last certified position exposes a gap. Watermarks therefore certify up to
+  the released TXID, not only up to the last commit with a record: a write
+  to a table the export skips has a TXID but no record, and a link past it
+  would otherwise always look like a gap.
 - **Recovered records.** A node that acknowledged a write and died before
   export may never see that cell activate again. Dead-node recovery already
   visits every cell the dead session left behind when it folds tails. The
