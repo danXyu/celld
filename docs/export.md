@@ -9,8 +9,10 @@ The feature is under construction. A node with `CELLD_EXPORT=1` exports
 the row changes of its root cells through the bucket sink: Parquet objects
 under `export/changes/<node>/` in the bucket, released only after the
 change is durable and the node still owns the cell, and followed by
-watermarks that certify what the bucket holds. Facets, activation links and
-repair are not built yet.
+watermarks that certify what the bucket holds. Every activation of a cell
+starts its stream with a `link` record naming the state it restored, so a
+consumer sees a gap across a restart or a move between nodes. Facet streams
+are not built yet.
 
 The blob-stream sink sends each record to a
 [blob-stream](https://github.com/bitdriftlabs/blob-stream) topic instead. Its

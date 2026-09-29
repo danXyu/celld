@@ -50,10 +50,10 @@ use tracing::warn;
 use crate::asyncrt;
 use crate::replication::sqlite_snapshot;
 use crate::replication::ActivationOptions;
-use crate::replication::ActivationResult;
 use crate::replication::RestoredSnapshot;
 use crate::replication::StorageCredentials;
 use crate::replication::SyncWait;
+use crate::replication::{ActivationLink, ActivationMode, ActivationResult};
 use crate::replication::{EvictionAbandon, EvictionRestoreArtifact};
 use celld_logic::durability::{proof_deadline, ProofProgress, ProofWait};
 
@@ -1500,6 +1500,30 @@ impl LtxRepl {
     /// hole forever. Store errors also fail the proof instead of becoming zero.
     /// A zero would claim that the local directory can replay the complete
     /// epoch even though the store did not provide the required durable bound.
+    /// The last txid of `epoch`'s state as far as this node can prove it: the
+    /// bucket's contiguous per-cell coverage, or the acked tail an ending
+    /// left in bundles when that is higher. `None` when the listing fails:
+    /// the link then names the epoch without a position, and the reconciler
+    /// bounds what it cannot.
+    async fn previous_epoch_txid(&self, cell: &str, epoch: u64) -> Option<u64> {
+        let tail = self
+            .dirty_tails
+            .lock()
+            .unwrap()
+            .get(cell)
+            .and_then(|epochs| epochs.get(&epoch))
+            .map(|tail| tail.acked_txid);
+        match self.contiguous_covered_txid(cell, epoch).await {
+            Ok(covered) => Some(covered.max(tail.unwrap_or(0))),
+            Err(error) => {
+                // The tail alone could understate the position and hide a
+                // gap, so the link names no position at all.
+                warn!(cell, epoch, %error, "export link: predecessor position unknown");
+                None
+            }
+        }
+    }
+
     async fn contiguous_covered_txid(&self, cell: &str, epoch: u64) -> anyhow::Result<u64> {
         let client = self.client_for(cell, epoch);
         let mut files = Vec::new();
@@ -1779,6 +1803,14 @@ impl LtxRepl {
         // A paged activation continues its chain from the cut: (last txid of
         // the chain, page count at the cut).
         let mut continuation: Option<(TXID, u32)> = None;
+        // Change export's link: how this activation got its state, and the
+        // predecessor position when there is one.
+        let mut mode = if resume_local {
+            ActivationMode::Resume
+        } else {
+            ActivationMode::Fresh
+        };
+        let mut prev: Option<(u64, Option<u64>)> = None;
         if resume_local {
             anyhow::ensure!(
                 is_file(&dst),
@@ -1794,6 +1826,18 @@ impl LtxRepl {
                 .forget(&snapshot);
             info!(cell, epoch, "reused local eviction snapshot");
             restored = true;
+            mode = ActivationMode::Clone;
+            // Eviction removed the snapshot's LTX metadata, so its position
+            // is read from what the bucket proves of the previous epoch, and
+            // only when the cell is exported: it costs a listing.
+            let exported =
+                crate::export_live::installed().is_some_and(|exporter| exporter.exports(cell));
+            let prev_txid = if exported {
+                self.previous_epoch_txid(cell, epoch - 1).await
+            } else {
+                None
+            };
+            prev = Some((epoch - 1, prev_txid));
         } else if !fresh {
             // Restore the newest durable epoch's full contiguous chain. The
             // epoch seal that once capped this read is deleted: the
@@ -1833,6 +1877,8 @@ impl LtxRepl {
             if let Some(chain) = chain {
                 let spans = chain.spans();
                 let from = spans.last().map_or(0, |(e, _)| *e);
+                prev = Some((from, Some(chain.max_txid().0)));
+                mode = ActivationMode::Clone;
                 let _ = self.ltx_host.remove_file(&dst);
                 // Page the cell in on demand instead of downloading its
                 // chain when the chain is large enough to be worth it: build
@@ -1932,6 +1978,7 @@ impl LtxRepl {
                     );
                     paged_vfs_name = Some(name);
                     restored = true;
+                    mode = ActivationMode::Paged;
                 } else {
                     let stats = replica::restore_timed_with_host_and_download_slots(
                         &chain,
@@ -2027,6 +2074,20 @@ impl LtxRepl {
                 seed = Some(Pos::new(TXID(covered), 0));
             }
         }
+        if remote_seed.is_some() {
+            // A leftover image of this very epoch, clamped to the bucket.
+            mode = ActivationMode::Resume;
+        }
+        let seed_txid = seed.map_or(0, |pos| pos.txid.0);
+        if mode == ActivationMode::Resume {
+            prev = Some((epoch, Some(seed_txid)));
+        }
+        let link = ActivationLink {
+            mode,
+            start_txid: seed_txid + 1,
+            prev_epoch: prev.map(|(epoch, _)| epoch),
+            prev_txid: prev.and_then(|(_, txid)| txid),
+        };
         let db_open_us = asyncrt::mono_ms()
             .saturating_sub(db_open_started_mono_ms)
             .saturating_mul(1_000);
@@ -2055,8 +2116,8 @@ impl LtxRepl {
         // Change export: every file the capture loop writes for this
         // residency is reported to the cell's export stream.
         let mut db = db;
-        if let Some(observer) =
-            crate::export_live::installed().and_then(|exporter| exporter.open_stream(cell, epoch))
+        if let Some(observer) = crate::export_live::installed()
+            .and_then(|exporter| exporter.open_stream(cell, epoch, link))
         {
             db.set_capture_observer(observer);
         }
@@ -2195,6 +2256,7 @@ impl LtxRepl {
             path: dst,
             restored,
             vfs: paged_vfs_name,
+            link,
         })
     }
 
@@ -4820,3 +4882,6 @@ impl Drop for LtxRepl {
 
 #[cfg(celld_internal_tests)]
 include!(env!("CELLD_INTERNAL_LTX_REPL_OBSERVERS"));
+
+#[cfg(test)]
+mod link_tests;

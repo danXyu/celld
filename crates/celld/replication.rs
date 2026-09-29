@@ -156,6 +156,38 @@ pub struct ActivationResult {
     /// VFS; a plain open reads holes as zeros and SQLite reports a malformed
     /// database (the 2026-09-01 cold-whale fleet failure).
     pub vfs: Option<String>,
+    /// Where this activation's state came from, for change export's `link`.
+    pub link: ActivationLink,
+}
+
+/// How an activation obtained the state it serves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActivationMode {
+    /// Nothing to restore: the cell starts empty (or from the preview
+    /// baseline's absence).
+    Fresh,
+    /// A whole image, from the bucket or the previous epoch's local eviction
+    /// snapshot. The epoch's txids restart after the image's own position.
+    Clone,
+    /// The bucket chain paged in; the epoch continues its txids.
+    Paged,
+    /// The same epoch reopened from the local database, after a clean
+    /// reload or over a leftover image clamped to what the bucket holds.
+    Resume,
+}
+
+/// The predecessor an activation continues from (`docs/design/change-export.md`,
+/// "Completeness"). Positions are per epoch, so the link is what joins one
+/// epoch's stream to the one before it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ActivationLink {
+    pub mode: ActivationMode,
+    /// The first txid a commit of this activation can carry.
+    pub start_txid: u64,
+    /// The epoch the restored state ended in, when there was one.
+    pub prev_epoch: Option<u64>,
+    /// The last txid of that state, when the activation knows it.
+    pub prev_txid: Option<u64>,
 }
 
 /// Is this a preserved eviction snapshot? `.hibernated` is the pre-2026-08-05
