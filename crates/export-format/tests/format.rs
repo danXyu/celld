@@ -68,6 +68,8 @@ fn every_kind_round_trips() {
         Body::Recovered(RecoveredBody {
             session: "sess-9".into(),
             head: pos(12, 4),
+            loss: true,
+            cells: 3,
         }),
         Body::Deleted(DeletedBody {
             facet: None,
@@ -235,4 +237,24 @@ fn dedup_keys_separate_what_must_not_merge() {
     assert_eq!(keys.len(), 1);
     assert_eq!(keys[0].key, vec![Value::Integer(1)]);
     assert_eq!(keys[0].table, "t");
+}
+
+#[test]
+fn a_recovered_record_without_the_newer_fields_decodes_as_lossless() {
+    let r = live(
+        pos(3, u64::MAX),
+        Body::Recovered(RecoveredBody {
+            session: "node-a/g1".into(),
+            head: pos(3, u64::MAX),
+            loss: false,
+            cells: 0,
+        }),
+    );
+    let mut v: serde_json::Value = serde_json::from_slice(&r.to_json()).unwrap();
+    assert!(v.get("loss").is_none(), "no loss is not written: {v}");
+    v.as_object_mut().unwrap().remove("cells");
+    assert_eq!(
+        Record::from_json(&serde_json::to_vec(&v).unwrap()).unwrap(),
+        r
+    );
 }

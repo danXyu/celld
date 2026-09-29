@@ -20,6 +20,33 @@ pub struct StreamId {
 }
 
 impl StreamId {
+    /// True when a `recovered` record of `recovered` applies to this stream,
+    /// among the streams `candidates` the consumer holds. The record's own
+    /// stream names no script or incarnation (see [`RecoveredBody`]), so it
+    /// applies to the root stream of its class and cell whose incarnation is
+    /// the newest at or below the recovered epoch.
+    pub fn recovered_matches<'a>(
+        &self,
+        recovered: &StreamId,
+        head: &Position,
+        candidates: impl IntoIterator<Item = &'a StreamId>,
+    ) -> bool {
+        let fits = |s: &StreamId| {
+            s.facet.is_none()
+                && s.class == recovered.class
+                && s.cell == recovered.cell
+                && s.incarnation <= head.epoch
+                && (recovered.script.is_empty() || s.script == recovered.script)
+        };
+        if !fits(self) {
+            return false;
+        }
+        candidates
+            .into_iter()
+            .filter(|s| fits(s) && s.script == self.script)
+            .all(|s| s.incarnation <= self.incarnation)
+    }
+
     /// True when `self` is the facet at `path` of the same root, or a facet
     /// below it. A `None` path names the root, which contains every facet.
     pub fn is_at_or_under(
@@ -327,11 +354,38 @@ pub struct LinkBody {
     pub mode: LinkMode,
 }
 
-/// Emitted by dead-node recovery for a cell it folded.
+/// Emitted by dead-node recovery for a cell epoch it folded into the bucket.
+///
+/// Recovery visits only the cell epochs with rows in the dead session's
+/// bundles or follower tails, so a cell the session wrote and had already
+/// folded gets no record; the reconciler is the bound for those.
+///
+/// Recovery does not know a cell's script or first epoch. The envelope
+/// carries an empty `script` and incarnation 0, and a consumer applies the
+/// record to the root stream of the same class and cell whose incarnation is
+/// the newest at or below `head.epoch` ([`StreamId::recovered_matches`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveredBody {
+    /// The dead session, `<node>/<generation>`.
     pub session: String,
+    /// What the bucket holds for the cell epoch once recovery folded it:
+    /// every transaction of `head.epoch` through `head.txid`. Recovery sees
+    /// transactions, not commits, so `head.commit` is `u64::MAX`. The record
+    /// is emitted only after the uploads it describes, so a restore at the
+    /// bucket's head reaches `head`.
     pub head: Position,
+    /// Recovery declared a bounded loss for the session: no complete copy of
+    /// its log survived, so writes it acknowledged after `head` may be in no
+    /// copy, and the cell restores without them. A consumer certified past
+    /// `head` then holds changes the cell no longer has. The loss can also
+    /// touch cells that got no record; it is kept in the bucket at
+    /// `log/<session>.e<epoch>.loss.json`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub loss: bool,
+    /// How many `recovered` records the recovery emitted for the session, so
+    /// a consumer holding fewer knows some were lost.
+    #[serde(default)]
+    pub cells: u64,
 }
 
 /// Names a stream that no longer exists. With `facet` and `incarnation`

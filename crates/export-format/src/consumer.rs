@@ -54,10 +54,13 @@ pub enum Gap {
         prev_txid: u64,
         certified: Option<Position>,
     },
-    /// A `recovered` head beyond what was certified in its epoch.
+    /// A `recovered` head beyond what was certified in its epoch, or, when
+    /// recovery declared a loss, certification beyond the head: changes the
+    /// cell lost and the consumer still holds.
     Recovered {
         head: Position,
         certified: Option<Position>,
+        loss: bool,
     },
 }
 
@@ -166,23 +169,54 @@ impl Consumer {
     }
 
     /// Derive every live stream's state. Streams a facet `deleted` record
-    /// removed are absent.
+    /// removed are absent, and so is the scriptless stream of `recovered`
+    /// records once every one of them applies to a stream the consumer holds.
     pub fn state(&self) -> BTreeMap<StreamId, StreamState> {
         let gone = self.facet_deletions();
         self.records
-            .iter()
-            .filter(|(s, _)| !gone.contains(*s))
-            .map(|(s, rs)| (s.clone(), derive(rs)))
+            .keys()
+            .filter(|s| !gone.contains(*s) && !self.adopted(s))
+            .map(|s| (s.clone(), derive(&self.records_of(s))))
             .collect()
     }
 
     /// One stream's state; `None` when it was never seen or a facet
     /// `deleted` record removed it.
     pub fn stream(&self, stream: &StreamId) -> Option<StreamState> {
-        if self.facet_deletions().contains(stream) {
+        if self.facet_deletions().contains(stream) || !self.records.contains_key(stream) {
             return None;
         }
-        self.records.get(stream).map(|rs| derive(rs))
+        Some(derive(&self.records_of(stream)))
+    }
+
+    /// A stream's own records and the scriptless `recovered` records that
+    /// apply to it.
+    fn records_of(&self, stream: &StreamId) -> Vec<&Record> {
+        let mut out: Vec<&Record> = self.records.get(stream).into_iter().flatten().collect();
+        if stream.script.is_empty() {
+            return out;
+        }
+        for (s, rs) in self.records.iter().filter(|(s, _)| s.script.is_empty()) {
+            out.extend(rs.iter().filter(|r| match &r.body {
+                Body::Recovered(b) => stream.recovered_matches(s, &b.head, self.records.keys()),
+                _ => false,
+            }));
+        }
+        out
+    }
+
+    /// A scriptless stream whose records are all `recovered` records that
+    /// apply to other streams.
+    fn adopted(&self, stream: &StreamId) -> bool {
+        stream.script.is_empty()
+            && self.records[stream].iter().all(|r| match &r.body {
+                Body::Recovered(b) => self
+                    .records
+                    .keys()
+                    .filter(|s| !s.script.is_empty())
+                    .any(|s| s.recovered_matches(stream, &b.head, self.records.keys())),
+                _ => false,
+            })
     }
 }
 
@@ -199,18 +233,20 @@ impl Cut<'_> {
     }
 }
 
-fn derive(all: &[Record]) -> StreamState {
+fn derive(all: &[&Record]) -> StreamState {
     let mut state = StreamState::default();
 
     // A `deleted` naming this stream removes everything at or below it.
     let deleted_at = all
         .iter()
+        .copied()
         .filter(|r| matches!(&r.body, Body::Deleted(d) if d.facet.is_none()))
         .map(Record::position)
         .max();
     state.deleted_at = deleted_at;
     let records: Vec<&Record> = all
         .iter()
+        .copied()
         .filter(|r| deleted_at.is_none_or(|d| r.position() > d))
         .collect();
 
@@ -389,9 +425,15 @@ fn derive(all: &[Record]) -> StreamState {
             },
             Body::Recovered(rec) => {
                 let h = rec.head;
-                (beyond(h.epoch, h.txid) && !covered(h.epoch, h.txid)).then(|| Gap::Recovered {
+                let certified = state.certified.get(&h.epoch).copied();
+                let short = beyond(h.epoch, h.txid) && !covered(h.epoch, h.txid);
+                // Only a snapshot past the lost changes supersedes them.
+                let ahead = rec.loss
+                    && certified.is_some_and(|c| c.txid > h.txid && !covered(c.epoch, c.txid));
+                (short || ahead).then_some(Gap::Recovered {
                     head: h,
-                    certified: state.certified.get(&h.epoch).copied(),
+                    certified,
+                    loss: rec.loss,
                 })
             }
             _ => None,
@@ -405,12 +447,13 @@ fn derive(all: &[Record]) -> StreamState {
 /// `from == previous through`, accepting each only while its counts match the
 /// records held in its range.
 fn certify(records: &[&Record]) -> BTreeMap<u64, Position> {
-    // What the node's sink sent: everything but repair output and watermarks.
+    // What the node's sink sent: everything but repair output, watermarks,
+    // and the `recovered` records another node emits for the stream.
     let sent: Vec<&Record> = records
         .iter()
         .copied()
         .filter(|r| r.envelope.origin != Origin::Repair)
-        .filter(|r| !matches!(r.body, Body::Watermark(_)))
+        .filter(|r| !matches!(r.body, Body::Watermark(_) | Body::Recovered(_)))
         .collect();
     let mut certified = BTreeMap::new();
     let marks: Vec<(Position, &crate::record::WatermarkBody)> = records

@@ -375,8 +375,9 @@ A `snapshot` record has the same shape as `rows` with `op` always `I`, and a
 set of table generations it covered, and its record count. A `schema` record
 adds `table`, `generation`, `sql`, `columns`, and `dropped` or `renamed_from`.
 A `link` record adds `start_txid`, `prev_epoch`, `prev_txid`, and `mode`
-(`fresh`, `clone`, or `paged`). A `recovered` record adds `session` and the
-recovered head position. A `deleted` record names a stream and takes effect
+(`fresh`, `clone`, or `paged`). A `recovered` record adds `session`, the
+recovered head position, `loss` when recovery declared a bounded loss for the
+session, and `cells`, the number of `recovered` records the recovery emitted. A `deleted` record names a stream and takes effect
 at its position. A `bulk` record adds `tables`. A `gap` record adds
 `from` and `to` positions and `reason`.
 
@@ -478,11 +479,27 @@ loss visible.
   `activate_with`. A link whose `prev_txid` exceeds the predecessor epoch's
   last certified position exposes a gap.
 - **Recovered records.** A node that acknowledged a write and died before
-  export may never see that cell activate again. Dead-node recovery already
-  visits every cell the dead session left behind when it folds tails. The
-  recovering node emits a `recovered` record per visited cell with the head
-  position it established. A consumer compares it with its certified
-  position exactly as it does a link.
+  export may never see that cell activate again. Dead-node recovery visits
+  the cell epochs with rows in the dead session's bundles or follower tails
+  when it folds them into the bucket. It does not visit a cell whose writes
+  the session had already folded, so these records are best effort and the
+  reconciler is the bound. After its last upload and before it seals the
+  log, the recovering node emits a `recovered` record per visited cell epoch
+  whose head is what the bucket then holds for that epoch, so a repair at
+  the bucket's head reaches it; a recoverer that dies before emitting leaves
+  it to the node that takes the recovery over. Recovery knows neither the
+  cell's script nor its first epoch, so the record's stream carries an empty
+  `script` and incarnation 0, and the consumer applies it to the root
+  stream of the same class and cell whose incarnation is the newest at or
+  below the head's epoch. A consumer compares the head with its certified
+  position exactly as it does a link. With `loss`, writes acknowledged past
+  the head may be in no copy and the cell restores without them, so a
+  consumer certified past the head holds changes the cell lost; that is a
+  gap too, and only a snapshot past those changes, such as one in the
+  cell's next epoch, clears it. A loss can also touch cells recovery did
+  not visit; the bucket keeps it at `log/<session>.e<epoch>.loss.json` for
+  the reconciler. A consumer holding fewer records for a session than their
+  `cells` knows some were lost.
 - **Reconciliation.** A cell can be untouched by recovery and never
   activate again, or the `recovered` record itself can be lost. The
   reconciler runs on a schedule, daily by default. It reads the bucket's
