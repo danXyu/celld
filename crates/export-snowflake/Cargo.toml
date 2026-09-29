@@ -1,0 +1,18 @@
+# The change export's Snowflake side (docs/design/change-export.md#the-snowflake-loader):
+# the tables, the SQL that lands bucket-sink files into them, the views that
+# derive current state, and the Dynamic Table template. Pure: it renders SQL
+# and runs nothing. The loader (celld-export-loader) deploys and runs it; the
+# tests in sqltest/ run it against synthetic records on a Snowflake emulator.
+[package]
+name = "celld-export-snowflake"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.94.1"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+celld-export-format.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
