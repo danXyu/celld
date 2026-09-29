@@ -36,18 +36,30 @@ pub struct GateReq {
 }
 pub(crate) static GATE_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<GateReq>> = OnceLock::new();
 
+/// What a facet open answers: the facet's database file, whether
+/// replication restored it from a replica, and the incarnation the facet
+/// takes if its `_cf_METADATA` has none yet. `None` when no host loop runs
+/// the facet's streams.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FacetFile {
+    pub path: std::path::PathBuf,
+    pub restored: bool,
+    pub incarnation: Option<u64>,
+}
+
 /// A facet's stream, asked for by the isolate that runs the facet: a facet
 /// is a database and a replication stream of its own
 /// (`crate::facet_streams`), which only the runtime can activate, delete, or
 /// prove.
 pub enum FacetReq {
     /// Activate the stream of the facet at `names` below `root`, and answer
-    /// its database file and whether replication restored it.
+    /// its database file, whether replication restored it, and its
+    /// incarnation if it has none yet.
     Open {
         root: String,
         epoch: u64,
         names: Vec<String>,
-        reply: tokio::sync::oneshot::Sender<Result<(std::path::PathBuf, bool)>>,
+        reply: tokio::sync::oneshot::Sender<Result<FacetFile>>,
     },
     /// Delete the facet's stream and every stream below it.
     Delete {

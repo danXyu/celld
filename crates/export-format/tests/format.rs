@@ -73,11 +73,13 @@ fn every_kind_round_trips() {
             facet: None,
             incarnation: None,
             subtree: false,
+            through_incarnation: None,
         }),
         Body::Deleted(DeletedBody {
             facet: Some("a/b".into()),
             incarnation: Some(99),
             subtree: true,
+            through_incarnation: None,
         }),
         Body::Watermark(WatermarkBody {
             from: Some(pos(3, 1)),

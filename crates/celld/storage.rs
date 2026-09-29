@@ -480,6 +480,22 @@ pub fn schema(c: &Connection) -> anyhow::Result<()> {
             [],
         )?;
     }
+    let metadata_columns = {
+        let mut statement = c.prepare("PRAGMA table_info(_cf_METADATA)")?;
+        let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+        columns.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    // A facet's change-export incarnation (`crate::facet_streams`), stamped
+    // on its first open and kept for its life. Root cells leave it NULL.
+    if !metadata_columns
+        .iter()
+        .any(|column| column == "incarnation")
+    {
+        c.execute(
+            "ALTER TABLE _cf_METADATA ADD COLUMN incarnation INTEGER",
+            [],
+        )?;
+    }
     // NORMAL, not the FULL default: with WAL, commits then skip the
     // per-commit WAL fsync (measured 1.4ms -> 19us per put on cloud
     // disks; the fsync was the entire single-cell write budget).
@@ -1267,6 +1283,7 @@ pub(crate) fn open_embedded(
     name: &str,
     path: &std::path::Path,
     restored: bool,
+    incarnation: Option<u64>,
     sqlite_vec: bool,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(parent.facet_path.len() < 3, "Facet nesting depth limit exceeded. The maximum depth including the root Durable Object is 4.");
@@ -1306,6 +1323,9 @@ pub(crate) fn open_embedded(
     for table in ["_cf_KV", "_cf_ALARM", "_cf_METADATA"] {
         transaction.execute(&format!("UPDATE {table} SET scope=?1"), [scope])?;
     }
+    if let Some(incarnation) = incarnation {
+        stamp_incarnation(&transaction, scope, incarnation)?;
+    }
     transaction.commit()?;
     finish_open(
         scope,
@@ -1322,6 +1342,18 @@ pub(crate) fn open_embedded(
             root_observed: parent.root_observed,
         },
     )
+}
+
+/// Give a facet the incarnation `crate::facet_streams` handed out, unless
+/// it already has one: an incarnation is the facet's for its whole life.
+/// Runs before the export session is installed, so it is never a row event.
+fn stamp_incarnation(c: &Connection, scope: &str, incarnation: u64) -> anyhow::Result<()> {
+    c.execute(
+        "INSERT INTO _cf_METADATA(scope, incarnation) VALUES(?1, ?2) \
+         ON CONFLICT(scope) DO UPDATE SET incarnation=excluded.incarnation WHERE incarnation IS NULL",
+        rusqlite::params![scope, incarnation as i64],
+    )?;
+    Ok(())
 }
 
 /// Delete the legacy `_cf_FACETS` images of a facet and every facet below it,
@@ -4352,16 +4384,18 @@ fn set_actor_name_inner(scope: &str, name: &str) -> anyhow::Result<()> {
     with(scope, |connection| -> anyhow::Result<()> {
         connection.execute(
             "INSERT INTO _cf_METADATA(scope, actor_name) VALUES(?1, ?2) \
-             ON CONFLICT(scope) DO NOTHING",
+             ON CONFLICT(scope) DO UPDATE SET actor_name=excluded.actor_name \
+             WHERE actor_name IS NULL",
             rusqlite::params![scope, name],
         )?;
         let stored: Option<String> = connection
             .query_row(
                 "SELECT actor_name FROM _cf_METADATA WHERE scope=?1",
                 [scope],
-                |row| row.get(0),
+                |row| row.get::<_, Option<String>>(0),
             )
-            .optional()?;
+            .optional()?
+            .flatten();
         if stored.as_deref() != Some(name) {
             anyhow::bail!("actor name conflicts with persisted identity for {scope}");
         }
@@ -4372,13 +4406,15 @@ fn set_actor_name_inner(scope: &str, name: &str) -> anyhow::Result<()> {
 
 pub fn get_actor_name(scope: &str) -> anyhow::Result<Option<String>> {
     with(scope, |connection| {
+        // A facet's row can hold only its incarnation.
         connection
             .query_row(
                 "SELECT actor_name FROM _cf_METADATA WHERE scope=?1",
                 [scope],
-                |row| row.get(0),
+                |row| row.get::<_, Option<String>>(0),
             )
             .optional()
+            .map(Option::flatten)
             .map_err(Into::into)
     })
     .unwrap_or_else(|| Err(anyhow::anyhow!("no db for {scope}")))
