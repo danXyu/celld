@@ -134,38 +134,68 @@ fn a_facet_deleted_from_the_root_removes_that_incarnation_and_its_subtree() {
 }
 
 #[test]
-fn a_bounded_facet_delete_keeps_facets_recreated_after_it() {
-    let old = facet("facets/a", 11);
-    let old_nested = facet("facets/a/facets/b", 12);
-    let new = facet("facets/a", 21);
-    let new_nested = facet("facets/a/facets/b", 22);
-    let sibling = facet("facets/ab", 5);
+fn a_bounded_facet_delete_spares_facets_recreated_after_it() {
+    // Incarnations are ordered: 11 and 12 existed before the delete, 21 and
+    // 22 are the facet and its child recreated after it.
+    let old = facet("rooms/7", 11);
+    let old_child = facet("rooms/7/thread", 12);
+    let new = facet("rooms/7", 21);
+    let new_child = facet("rooms/7/thread", 22);
+    let sibling = facet("rooms/70", 5);
     let body = || {
         Body::Rows(RowsBody {
             data: table_rows("t", 1, vec![put(1, "x")]),
         })
     };
+    let delete = live(
+        pos(9, 9),
+        Body::Deleted(DeletedBody {
+            facet: Some("rooms/7".into()),
+            incarnation: None,
+            subtree: true,
+            through_incarnation: Some(20),
+        }),
+    );
+    let mut records: Vec<Record> = [&old, &old_child, &new, &new_child, &sibling]
+        .into_iter()
+        .map(|s| record(s, pos(1, 1), Origin::Live, body()))
+        .collect();
+    records.push(delete.clone());
+    // The same result whatever the arrival order, and a late record of the
+    // old incarnation stays gone.
+    for order in [records.clone(), records.into_iter().rev().collect()] {
+        let mut c = Consumer::new();
+        c.ingest_all(order).unwrap();
+        c.ingest(record(&old_child, pos(2, 2), Origin::Live, body()))
+            .unwrap();
+        let state = c.state();
+        assert!(!state.contains_key(&old));
+        assert!(!state.contains_key(&old_child));
+        assert!(state.contains_key(&new));
+        assert!(state.contains_key(&new_child));
+        assert!(state.contains_key(&sibling));
+        assert!(state.contains_key(&stream()));
+    }
+
+    // Without `subtree`, the bound applies at the path only.
     let mut c = Consumer::new();
-    for s in [&old, &old_nested, &new, &new_nested, &sibling] {
+    for s in [&old, &old_child] {
         c.ingest(record(s, pos(1, 1), Origin::Live, body()))
             .unwrap();
     }
     c.ingest(live(
         pos(9, 9),
         Body::Deleted(DeletedBody {
-            facet: Some("facets/a".into()),
+            facet: Some("rooms/7".into()),
             incarnation: None,
-            subtree: true,
+            subtree: false,
             through_incarnation: Some(20),
         }),
     ))
     .unwrap();
     let state = c.state();
     assert!(!state.contains_key(&old));
-    assert!(!state.contains_key(&old_nested));
-    assert!(state.contains_key(&new));
-    assert!(state.contains_key(&new_nested));
-    assert!(state.contains_key(&sibling));
+    assert!(state.contains_key(&old_child));
 }
 
 #[test]

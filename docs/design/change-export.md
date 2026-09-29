@@ -158,8 +158,8 @@ Every record names the state it belongs to with four identifiers.
   facet's `_cf_METADATA` when it first creates the stream. A facet
   deleted and recreated under the same path has a new incarnation, so its
   records cannot be confused with the old stream's. Facet incarnations are
-  ordered per root (the root's epoch, then a counter seeded from the
-  clock), so every facet created before a delete has a smaller incarnation
+  ordered per root (the root's epoch, then a counter kept durably
+  beside the root's epoch database), so every facet created before a delete has a smaller incarnation
   than every facet created after it. A root cell's incarnation is its
   first epoch.
 - **Position.** `(epoch, txid, commit)`: the cell epoch, the LTX transaction

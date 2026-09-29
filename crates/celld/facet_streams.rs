@@ -25,10 +25,11 @@
 //! An incarnation is the root's epoch in the top [`INCARNATION_EPOCH_BITS`]
 //! bits and a counter in the rest. Epochs grow with every activation, which
 //! orders incarnations across nodes whatever their clocks. Within an epoch
-//! the counter starts from the wall clock, in milliseconds, when the root
-//! registers, so a root that restarts in place at the same epoch (a clean
-//! reload) counts on from above what it handed out before, as long as it
-//! handed out fewer than one incarnation per millisecond of its residency.
+//! the counter is bounded by a durable mark beside the root's epoch
+//! database, so a root that registers again at the same epoch (a clean
+//! reload, or a restart in place) counts on from above everything it
+//! handed out before, whatever the clock did. The counter starts from the
+//! wall clock only for an epoch with no mark.
 
 use anyhow::anyhow;
 use anyhow::Context as _;
@@ -53,31 +54,90 @@ const INCARNATION_COUNTER_MAX: u64 = (1 << INCARNATION_COUNTER_BITS) - 1;
 /// from here, which leaves it room for about 34 years.
 const INCARNATION_CLOCK_BASE_MS: i64 = 1_767_225_600_000;
 
+/// How far ahead of the counter its durable mark is written, so a mark is
+/// written once per this many incarnations rather than for each one.
+const INCARNATION_RESERVE: u64 = 1024;
+
+/// The file beside a root's epoch database that keeps its incarnation mark.
+pub(crate) const INCARNATION_MARK_FILE: &str = "facet-incarnations";
+
 /// The incarnation counter of one root at one epoch.
-#[derive(Clone, Copy, Debug)]
+///
+/// The counter never hands out a value its durable mark does not cover: the
+/// mark (`<epoch> <reserved>`, in the root's epoch directory) is written and
+/// synced before the counter passes it. A root that registers again at the
+/// same epoch, in this process or after a clean reload, starts at the mark,
+/// so it never repeats or undercuts a value it handed out before, however
+/// fast it counted or wherever the clock went. The clock seed only matters
+/// for an epoch with no mark.
+#[derive(Clone, Debug)]
 struct Incarnations {
     epoch: u64,
     next: u64,
+    /// Every value below this is covered by the mark.
+    reserved: u64,
+    mark: Option<PathBuf>,
 }
 
 impl Incarnations {
-    fn new(epoch: u64, wall_ms: i64) -> Self {
+    fn new(epoch: u64, wall_ms: i64, mark: Option<PathBuf>) -> Self {
         let seed = wall_ms.saturating_sub(INCARNATION_CLOCK_BASE_MS).max(0) as u64;
+        let marked = mark
+            .as_deref()
+            .and_then(|path| crate::asyncrt::fs().read(path).ok())
+            .and_then(|bytes| {
+                let text = String::from_utf8(bytes).ok()?;
+                let (marked_epoch, reserved) = text.trim().split_once(' ')?;
+                (marked_epoch.parse::<u64>().ok()? == epoch).then_some(reserved.parse().ok()?)
+            })
+            .unwrap_or(0);
+        let next = seed.max(marked).min(INCARNATION_COUNTER_MAX);
         Self {
             epoch,
-            next: seed.min(INCARNATION_COUNTER_MAX),
+            next,
+            reserved: next,
+            mark,
         }
     }
 
-    /// The next incarnation, above every one this counter handed out. An
-    /// epoch past the epoch bits keeps the largest epoch value, and a
-    /// counter at its limit stays there: both are beyond any cell's life.
-    fn take(&mut self) -> u64 {
+    /// The next incarnation, above every one this counter or an earlier one
+    /// of the same epoch and mark handed out. An epoch past the epoch bits
+    /// keeps the largest epoch value, and a counter at its limit stays
+    /// there: both are beyond any cell's life.
+    fn take(&mut self) -> anyhow::Result<u64> {
+        if self.next >= self.reserved {
+            let reserved = self
+                .next
+                .saturating_add(INCARNATION_RESERVE)
+                .min(INCARNATION_COUNTER_MAX);
+            if let Some(mark) = &self.mark {
+                write_mark(mark, self.epoch, reserved)?;
+            }
+            self.reserved = reserved;
+        }
         let epoch = self.epoch.min((1 << INCARNATION_EPOCH_BITS) - 1);
         let value = (epoch << INCARNATION_COUNTER_BITS) | self.next;
         self.next = (self.next + 1).min(INCARNATION_COUNTER_MAX);
-        value
+        Ok(value)
     }
+}
+
+/// Write an incarnation mark durably: a synced temporary file renamed over
+/// the mark, then the directory synced.
+fn write_mark(mark: &std::path::Path, epoch: u64, reserved: u64) -> anyhow::Result<()> {
+    let fs = crate::asyncrt::fs();
+    let parent = mark.parent().context("incarnation mark has no parent")?;
+    fs.create_dir_all(parent)
+        .with_context(|| format!("create {}", parent.display()))?;
+    let temporary = mark.with_extension("tmp");
+    fs.write(&temporary, format!("{epoch} {reserved}\n").as_bytes())
+        .with_context(|| format!("write {}", temporary.display()))?;
+    fs.sync_all(&temporary)?;
+    fs.rename(&temporary, mark)
+        .with_context(|| format!("rename {}", mark.display()))?;
+    fs.sync_all(parent)
+        .with_context(|| format!("sync {}", parent.display()))?;
+    Ok(())
 }
 
 /// What a facet delete removed, for change export: the facet's stream and
@@ -111,13 +171,21 @@ struct FacetRoot {
 pub(crate) struct FacetStreams(Arc<Mutex<HashMap<String, FacetRoot>>>);
 
 impl FacetStreams {
-    /// A root's activation: its facets activate later with `spec`.
-    pub(crate) fn register(&self, root: &str, spec: &celld_logic::RestoreSpec) {
+    /// A root's activation: its facets activate later with `spec`. `mark`
+    /// is where the root's incarnation mark lives for this epoch
+    /// ([`INCARNATION_MARK_FILE`] beside its database); `None` keeps it in
+    /// memory only.
+    pub(crate) fn register(
+        &self,
+        root: &str,
+        spec: &celld_logic::RestoreSpec,
+        mark: Option<PathBuf>,
+    ) {
         self.0.lock().expect("facet streams poisoned").insert(
             root.to_string(),
             FacetRoot {
                 epoch: spec.epoch,
-                incarnations: Incarnations::new(spec.epoch, crate::asyncrt::wall_ms()),
+                incarnations: Incarnations::new(spec.epoch, crate::asyncrt::wall_ms(), mark),
                 spec: Some(spec.clone()),
                 streams: BTreeSet::new(),
                 stopping: false,
@@ -167,7 +235,7 @@ impl FacetStreams {
         let opening = {
             let mut roots = self.0.lock().expect("facet streams poisoned");
             let (incarnation, _, opening) = resident(&mut roots)?;
-            if let Some(incarnation) = incarnation {
+            if let Some(incarnation) = incarnation.transpose()? {
                 return Ok(open(path, incarnation));
             }
             opening
@@ -176,7 +244,7 @@ impl FacetStreams {
         let spec = {
             let mut roots = self.0.lock().expect("facet streams poisoned");
             let (incarnation, spec, _) = resident(&mut roots)?;
-            if let Some(incarnation) = incarnation {
+            if let Some(incarnation) = incarnation.transpose()? {
                 return Ok(open(path, incarnation));
             }
             spec
@@ -213,10 +281,19 @@ impl FacetStreams {
             .get_mut(root)
             .filter(|entry| entry.epoch == epoch && !entry.stopping)
         {
-            Some(entry) => {
-                entry.streams.insert(facet);
-                entry.incarnations.take()
-            }
+            Some(entry) => match entry.incarnations.take() {
+                Ok(incarnation) => {
+                    entry.streams.insert(facet);
+                    incarnation
+                }
+                Err(error) => {
+                    drop(roots);
+                    if let Some(replication) = replication {
+                        replication.ltx().discard(&facet, epoch);
+                    }
+                    return Err(error.context("take the facet's incarnation"));
+                }
+            },
             // The root stopped while the stream activated.
             None => {
                 drop(roots);
@@ -254,6 +331,10 @@ impl FacetStreams {
                 .get_mut(root)
                 .filter(|entry| entry.epoch == epoch && !entry.stopping)
                 .ok_or_else(|| anyhow!("{root} epoch {epoch} is not resident"))?;
+            let through = entry
+                .incarnations
+                .take()
+                .context("take the facet delete's incarnation bound")?;
             let doomed: Vec<String> = entry
                 .streams
                 .iter()
@@ -263,7 +344,7 @@ impl FacetStreams {
             for stream in &doomed {
                 entry.streams.remove(stream);
             }
-            (doomed, entry.incarnations.take())
+            (doomed, through)
         };
         match replication {
             Some(replication) => {
@@ -426,29 +507,83 @@ mod tests {
 
     #[test]
     fn incarnations_grow_within_an_epoch_and_across_epochs() {
-        let mut first = Incarnations::new(3, NOW_MS);
-        let a = first.take();
-        let b = first.take();
+        let mut first = Incarnations::new(3, NOW_MS, None);
+        let a = first.take().unwrap();
+        let b = first.take().unwrap();
         assert!(a < b);
         assert_eq!(a >> INCARNATION_COUNTER_BITS, 3);
         // A later epoch is above, even on a node whose clock is behind.
-        let mut later = Incarnations::new(4, NOW_MS - 100 * HOUR_MS);
-        assert!(later.take() > b);
-        // A root that restarts in place at the same epoch a second later
-        // counts on from the clock, above what it handed out before.
-        let mut again = Incarnations::new(3, NOW_MS + 1000);
-        assert!(again.take() > b);
+        let mut later = Incarnations::new(4, NOW_MS - 100 * HOUR_MS, None);
+        assert!(later.take().unwrap() > b);
     }
 
     #[test]
     fn incarnations_saturate_instead_of_wrapping() {
-        let mut past = Incarnations::new(1 << 30, i64::MAX);
-        let a = past.take();
-        let b = past.take();
+        let mut past = Incarnations::new(1 << 30, i64::MAX, None);
+        let a = past.take().unwrap();
+        let b = past.take().unwrap();
         assert_eq!(a, u64::MAX);
         assert_eq!(b, u64::MAX);
-        let mut early = Incarnations::new(1, 0);
-        assert_eq!(early.take(), 1 << INCARNATION_COUNTER_BITS);
+        let mut early = Incarnations::new(1, 0, None);
+        assert_eq!(early.take().unwrap(), 1 << INCARNATION_COUNTER_BITS);
+    }
+
+    #[test]
+    fn a_same_epoch_reload_counts_on_from_its_mark() {
+        run(async {
+            let dir = tempfile::tempdir().unwrap();
+            let mark = dir.path().join("e3").join(INCARNATION_MARK_FILE);
+            // Faster than one a millisecond, then a delete's bound.
+            let mut first = Incarnations::new(3, NOW_MS, Some(mark.clone()));
+            for _ in 0..2000 {
+                first.take().unwrap();
+            }
+            let bound = first.take().unwrap();
+            // Reloaded a second later: above the bound, not at the clock.
+            let mut again = Incarnations::new(3, NOW_MS + 1000, Some(mark.clone()));
+            assert!(again.take().unwrap() > bound);
+            // Reloaded after the clock went back.
+            let latest = again.take().unwrap();
+            let mut rolled = Incarnations::new(3, NOW_MS - HOUR_MS, Some(mark.clone()));
+            assert!(rolled.take().unwrap() > latest);
+            // One value, then a clock one millisecond behind.
+            let quiet_mark = dir.path().join("e5").join(INCARNATION_MARK_FILE);
+            let mut quiet = Incarnations::new(5, NOW_MS, Some(quiet_mark.clone()));
+            let only = quiet.take().unwrap();
+            let mut behind = Incarnations::new(5, NOW_MS - 1, Some(quiet_mark));
+            assert!(behind.take().unwrap() > only);
+            // Another epoch's mark is not this epoch's.
+            let mut other = Incarnations::new(4, NOW_MS, Some(mark));
+            assert_eq!(
+                other.take().unwrap(),
+                (4 << INCARNATION_COUNTER_BITS) | (1000 * HOUR_MS) as u64
+            );
+        });
+    }
+
+    #[test]
+    fn a_reregistered_root_keeps_its_delete_bounds() {
+        run(async {
+            let dir = tempfile::tempdir().unwrap();
+            let base = dir.path().to_path_buf();
+            let mark = base.join("Room:1/ltx/e2").join(INCARNATION_MARK_FILE);
+            let db_path = |cell: &str, epoch: u64| base.join(cell).join(format!("e{epoch}/db"));
+            let local = |cell: &str| base.join(cell);
+            let facets = FacetStreams::default();
+            facets.register("Room:1", &spec(2), Some(mark.clone()));
+            let deleted = facets
+                .delete(None, local, "Room:1", 2, &names(&["a"]))
+                .await
+                .unwrap();
+            // Restarted in place at the same epoch: the mark carries on.
+            facets.forget("Room:1", 2);
+            facets.register("Room:1", &spec(2), Some(mark));
+            let recreated = facets
+                .open(None, db_path, "Room:1", 2, &names(&["a"]))
+                .await
+                .unwrap();
+            assert!(recreated.incarnation.unwrap() > deleted.through);
+        });
     }
 
     /// Runs on a runtime that lives for the process, installed as the
@@ -478,7 +613,7 @@ mod tests {
         let db_path = |cell: &str, epoch: u64| base.join(cell).join(format!("e{epoch}/db"));
         let local = |cell: &str| base.join(cell);
         let facets = FacetStreams::default();
-        facets.register("Room:1", &spec(2));
+        facets.register("Room:1", &spec(2), None);
 
         let open = |path: &'static [&'static str]| {
             let facets = facets.clone();
@@ -515,7 +650,7 @@ mod tests {
         // The next activation's delete bounds everything the earlier one
         // handed out.
         facets.forget("Room:1", 2);
-        facets.register("Room:1", &spec(3));
+        facets.register("Room:1", &spec(3), None);
         let next = facets
             .delete(None, local, "Room:1", 3, &names(&["a"]))
             .await

@@ -154,9 +154,9 @@ impl Consumer {
                     let under = at_path
                         || (d.subtree
                             && s.is_at_or_under(&root.script, &root.class, &root.cell, Some(path)));
-                    // A node's delete bounds the incarnations it removed, so
-                    // a facet recreated after it survives.
                     let removed = match d.through_incarnation {
+                        // Ordered incarnations: a facet recreated after the
+                        // delete, at the path or below it, is above the bound.
                         Some(bound) => under && s.incarnation <= bound,
                         None => {
                             (at_path && d.incarnation.is_none_or(|i| i == s.incarnation))
