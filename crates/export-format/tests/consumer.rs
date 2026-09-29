@@ -541,3 +541,52 @@ fn a_loss_below_certification_is_a_gap_until_a_later_snapshot() {
     assert!(s.gaps.is_empty(), "{:?}", s.gaps);
     assert_eq!(rows_of(&s, "t"), vec![one(1, "a")]);
 }
+
+#[test]
+fn only_the_unadopted_recovered_records_stay_scriptless() {
+    // Recovery reported epochs 3 and 5; only incarnation 5 is known, and it
+    // is certified through its recovered head.
+    let known = StreamId {
+        incarnation: 5,
+        ..stream()
+    };
+    let at = |epoch: u64, txid: u64| Position::new(epoch, txid, u64::MAX);
+    let mut c = Consumer::new();
+    c.ingest_all(vec![
+        record(
+            &known,
+            Position::new(5, 2, 1),
+            Origin::Live,
+            Body::Rows(RowsBody {
+                data: table_rows("t", 1, vec![put(1, "a")]),
+            }),
+        ),
+        record(
+            &known,
+            Position::new(5, 2, 1),
+            Origin::Live,
+            Body::Watermark(WatermarkBody {
+                from: None,
+                through: Position::new(5, 2, 1),
+                commits: 1,
+                records: 1,
+            }),
+        ),
+        recovered(at(3, 7), false),
+        recovered(at(5, 2), false),
+    ])
+    .unwrap();
+    let state = c.state();
+    assert!(state[&known].gaps.is_empty(), "{:?}", state[&known].gaps);
+    let scriptless: Vec<&StreamState> = state
+        .iter()
+        .filter(|(s, _)| s.script.is_empty())
+        .map(|(_, st)| st)
+        .collect();
+    assert_eq!(scriptless.len(), 1);
+    assert!(
+        matches!(scriptless[0].gaps[..], [Gap::Recovered { head, .. }] if head == at(3, 7)),
+        "{:?}",
+        scriptless[0].gaps
+    );
+}
