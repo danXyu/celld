@@ -12,7 +12,9 @@
 -- statements the tests run.
 
 -- statement: export_file_format
-CREATE FILE FORMAT IF NOT EXISTS EXPORT_PARQUET TYPE = PARQUET;
+-- Without logical types a Parquet TIMESTAMP(MILLIS) column reads as its
+-- int64, which is what `committed_at` lands as.
+CREATE FILE FORMAT IF NOT EXISTS EXPORT_PARQUET TYPE = PARQUET USE_LOGICAL_TYPE = FALSE;
 
 -- statement: export_stage
 CREATE STAGE IF NOT EXISTS EXPORT_STAGE

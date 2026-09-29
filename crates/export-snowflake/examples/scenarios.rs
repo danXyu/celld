@@ -10,6 +10,7 @@
 //! `cargo run -q -p celld-export-snowflake --example scenarios [RANDOM_COUNT]`
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write as _;
 
 use celld_export_format::*;
 use celld_export_snowflake::{DynamicTable, StageRow};
@@ -267,9 +268,36 @@ fn basic() -> Scenario {
         pos(1, 1, 1),
         Origin::Live,
         items(vec![
-            ins(vec![i(1)], item(1, "apple", Value::Real(1.5), Value::Blob(vec![0, 1, 255]), Value::Null)),
-            ins(vec![i(2)], item(2, "it's \"quoted\" \\ ünï", Value::Real(f64::INFINITY), Value::Null, i(7))),
-            ins(vec![i(3)], item(3, "gone", Value::Real(f64::NEG_INFINITY), Value::Null, t("x"))),
+            ins(
+                vec![i(1)],
+                item(
+                    1,
+                    "apple",
+                    Value::Real(1.5),
+                    Value::Blob(vec![0, 1, 255]),
+                    Value::Null,
+                ),
+            ),
+            ins(
+                vec![i(2)],
+                item(
+                    2,
+                    "it's \"quoted\" \\ ünï",
+                    Value::Real(f64::INFINITY),
+                    Value::Null,
+                    i(7),
+                ),
+            ),
+            ins(
+                vec![i(3)],
+                item(
+                    3,
+                    "gone",
+                    Value::Real(f64::NEG_INFINITY),
+                    Value::Null,
+                    t("x"),
+                ),
+            ),
         ]),
     ));
     s.emit(record(
@@ -282,18 +310,42 @@ fn basic() -> Scenario {
         &a,
         pos(1, 1, 1),
         Origin::Live,
-        rows(table_rows("log", 1, &["msg"], &[ROWID_KEY_COLUMN], vec![
-            ins(vec![i(1)], vec![t("first")]),
-            ins(vec![i(2)], vec![t("second")]),
-        ])),
+        rows(table_rows(
+            "log",
+            1,
+            &["msg"],
+            &[ROWID_KEY_COLUMN],
+            vec![
+                ins(vec![i(1)], vec![t("first")]),
+                ins(vec![i(2)], vec![t("second")]),
+            ],
+        )),
     ));
     s.emit(record(
         &a,
         pos(1, 2, 2),
         Origin::Live,
         items(vec![
-            upd(vec![i(1)], item(1, "apple", Value::Real(-0.25), Value::Blob(vec![]), Value::Real(2.0))),
-            del(vec![i(3)], item(3, "gone", Value::Real(f64::NEG_INFINITY), Value::Null, t("x"))),
+            upd(
+                vec![i(1)],
+                item(
+                    1,
+                    "apple",
+                    Value::Real(-0.25),
+                    Value::Blob(vec![]),
+                    Value::Real(2.0),
+                ),
+            ),
+            del(
+                vec![i(3)],
+                item(
+                    3,
+                    "gone",
+                    Value::Real(f64::NEG_INFINITY),
+                    Value::Null,
+                    t("x"),
+                ),
+            ),
         ]),
     ));
     // A rowid change on a rowid table: a delete and an insert.
@@ -301,10 +353,16 @@ fn basic() -> Scenario {
         &a,
         pos(1, 2, 3),
         Origin::Live,
-        rows(table_rows("log", 1, &["msg"], &[ROWID_KEY_COLUMN], vec![
-            del(vec![i(2)], vec![t("second")]),
-            ins(vec![i(9)], vec![t("second")]),
-        ])),
+        rows(table_rows(
+            "log",
+            1,
+            &["msg"],
+            &[ROWID_KEY_COLUMN],
+            vec![
+                del(vec![i(2)], vec![t("second")]),
+                ins(vec![i(9)], vec![t("second")]),
+            ],
+        )),
     ));
     s.watermark(&a, None, pos(1, 2, 2));
     s.watermark(&a, Some(pos(1, 2, 2)), pos(1, 2, 3));
@@ -318,22 +376,55 @@ fn fragments() -> Scenario {
     let a = stream("r1");
     s.emit(record(&a, pos(1, 1, 1), Origin::Live, items_schema()));
     let big: Vec<RowChange> = (1..=12)
-        .map(|n| ins(vec![i(n)], item(n, &format!("row number {n}"), Value::Real(n as f64), Value::Null, Value::Null)))
+        .map(|n| {
+            ins(
+                vec![i(n)],
+                item(
+                    n,
+                    &format!("row number {n}"),
+                    Value::Real(n as f64),
+                    Value::Null,
+                    Value::Null,
+                ),
+            )
+        })
         .collect();
-    let n = s.emit_split(record(&a, pos(1, 1, 1), Origin::Live, items(big)), 520, None);
+    let n = s.emit_split(
+        record(&a, pos(1, 1, 1), Origin::Live, items(big)),
+        520,
+        None,
+    );
     assert!(n > 2, "the record must split");
     // Every fragment again.
     let again: Vec<Record> = s.delivered[1..].to_vec();
     s.delivered.extend(again);
     let later: Vec<RowChange> = (20..=30)
-        .map(|n| ins(vec![i(n)], item(n, &format!("never whole {n}"), Value::Null, Value::Null, Value::Null)))
+        .map(|n| {
+            ins(
+                vec![i(n)],
+                item(
+                    n,
+                    &format!("never whole {n}"),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                ),
+            )
+        })
         .collect();
-    s.emit_split(record(&a, pos(1, 2, 2), Origin::Live, items(later)), 520, Some(2));
+    s.emit_split(
+        record(&a, pos(1, 2, 2), Origin::Live, items(later)),
+        520,
+        Some(2),
+    );
     s.emit_twice(record(
         &a,
         pos(1, 3, 3),
         Origin::Live,
-        items(vec![upd(vec![i(4)], item(4, "updated", Value::Null, Value::Null, Value::Null))]),
+        items(vec![upd(
+            vec![i(4)],
+            item(4, "updated", Value::Null, Value::Null, Value::Null),
+        )]),
     ));
     // The missing fragment keeps this from certifying.
     s.watermark(&a, None, pos(1, 3, 3));
@@ -347,30 +438,156 @@ fn snapshots() -> Scenario {
     let mut s = Scenario::new("snapshots");
     let a = stream("r1");
     s.emit(record(&a, pos(1, 1, 1), Origin::Live, items_schema()));
-    s.emit(record(&a, pos(1, 1, 1), Origin::Live, items((1..=4).map(|n| ins(vec![i(n)], item(n, "live", Value::Null, Value::Null, Value::Null))).collect())));
-    s.emit(record(&a, pos(1, 3, 2), Origin::Live, items(vec![upd(vec![i(1)], item(1, "at the cut", Value::Null, Value::Null, Value::Null))])));
+    s.emit(record(
+        &a,
+        pos(1, 1, 1),
+        Origin::Live,
+        items(
+            (1..=4)
+                .map(|n| {
+                    ins(
+                        vec![i(n)],
+                        item(n, "live", Value::Null, Value::Null, Value::Null),
+                    )
+                })
+                .collect(),
+        ),
+    ));
+    s.emit(record(
+        &a,
+        pos(1, 3, 2),
+        Origin::Live,
+        items(vec![
+            upd(
+                vec![i(1)],
+                item(1, "at the cut", Value::Null, Value::Null, Value::Null),
+            ),
+            ins(
+                vec![i(9)],
+                item(9, "at the cut", Value::Null, Value::Null, Value::Null),
+            ),
+        ]),
+    ));
     // Repair at (1,3,2): rows 1 and 2 only; 3 and 4 are deleted by it, and
     // the live update at the same position loses to the repair.
     let at = pos(1, 3, 2);
     s.emit(record(&a, at, Origin::Repair, items_schema()));
-    s.emit(record(&a, at, Origin::Repair, snapshot("rep-1", table_rows("items", 1, &ITEMS, &["id"], vec![
-        ins(vec![i(1)], item(1, "repaired", Value::Null, Value::Null, Value::Null)),
-        ins(vec![i(2)], item(2, "repaired", Value::Null, Value::Null, Value::Null)),
-    ]))));
-    s.emit(record(&a, at, Origin::Repair, snapshot_end("rep-1", SnapshotScope::Stream, vec![("items", 1)], 1)));
+    s.emit(record(
+        &a,
+        at,
+        Origin::Repair,
+        snapshot(
+            "rep-1",
+            table_rows(
+                "items",
+                1,
+                &ITEMS,
+                &["id"],
+                vec![
+                    ins(
+                        vec![i(1)],
+                        item(1, "repaired", Value::Null, Value::Null, Value::Null),
+                    ),
+                    ins(
+                        vec![i(2)],
+                        item(2, "repaired", Value::Null, Value::Null, Value::Null),
+                    ),
+                ],
+            ),
+        ),
+    ));
+    s.emit(record(
+        &a,
+        at,
+        Origin::Repair,
+        snapshot_end("rep-1", SnapshotScope::Stream, vec![("items", 1)], 1),
+    ));
     // Above the cut.
-    s.emit(record(&a, pos(1, 4, 3), Origin::Live, items(vec![ins(vec![i(5)], item(5, "after", Value::Null, Value::Null, Value::Null))])));
+    s.emit(record(
+        &a,
+        pos(1, 4, 3),
+        Origin::Live,
+        items(vec![ins(
+            vec![i(5)],
+            item(5, "after", Value::Null, Value::Null, Value::Null),
+        )]),
+    ));
     // Incomplete: claims two records, delivers one.
-    s.emit(record(&a, pos(1, 5, 4), Origin::Repair, snapshot("rep-2", table_rows("items", 1, &ITEMS, &["id"], vec![]))));
-    s.emit(record(&a, pos(1, 5, 4), Origin::Repair, snapshot_end("rep-2", SnapshotScope::Stream, vec![("items", 1)], 2)));
+    s.emit(record(
+        &a,
+        pos(1, 5, 4),
+        Origin::Repair,
+        snapshot("rep-2", table_rows("items", 1, &ITEMS, &["id"], vec![])),
+    ));
+    s.emit(record(
+        &a,
+        pos(1, 5, 4),
+        Origin::Repair,
+        snapshot_end("rep-2", SnapshotScope::Stream, vec![("items", 1)], 2),
+    ));
     // A DDL: generation 2 of `notes` with its inline table snapshot.
-    s.emit(record(&a, pos(1, 2, 1), Origin::Live, schema("notes", 1, vec![col("k", "TEXT", 1), col("v", "", 0)])));
-    s.emit(record(&a, pos(1, 2, 1), Origin::Live, rows(table_rows("notes", 1, &["k", "v"], &["k"], vec![ins(vec![t("a")], vec![t("a"), i(1)])]))));
+    s.emit(record(
+        &a,
+        pos(1, 2, 1),
+        Origin::Live,
+        schema("notes", 1, vec![col("k", "TEXT", 1), col("v", "", 0)]),
+    ));
+    s.emit(record(
+        &a,
+        pos(1, 2, 1),
+        Origin::Live,
+        rows(table_rows(
+            "notes",
+            1,
+            &["k", "v"],
+            &["k"],
+            vec![ins(vec![t("a")], vec![t("a"), i(1)])],
+        )),
+    ));
     let ddl = pos(1, 6, 5);
-    s.emit(record(&a, ddl, Origin::Live, schema("notes", 2, vec![col("k", "TEXT", 1), col("v", "", 0), col("w", "INTEGER", 0)])));
-    s.emit(record(&a, ddl, Origin::Snapshot, snapshot("ddl-5", table_rows("notes", 2, &["k", "v", "w"], &["k"], vec![ins(vec![t("a")], vec![t("a"), i(1), Value::Null])]))));
-    s.emit(record(&a, ddl, Origin::Snapshot, snapshot_end("ddl-5", SnapshotScope::Tables, vec![("notes", 2)], 1)));
-    s.emit(record(&a, pos(1, 7, 6), Origin::Live, rows(table_rows("notes", 2, &["k", "v", "w"], &["k"], vec![ins(vec![t("b")], vec![t("b"), i(2), i(3)])]))));
+    s.emit(record(
+        &a,
+        ddl,
+        Origin::Live,
+        schema(
+            "notes",
+            2,
+            vec![col("k", "TEXT", 1), col("v", "", 0), col("w", "INTEGER", 0)],
+        ),
+    ));
+    s.emit(record(
+        &a,
+        ddl,
+        Origin::Snapshot,
+        snapshot(
+            "ddl-5",
+            table_rows(
+                "notes",
+                2,
+                &["k", "v", "w"],
+                &["k"],
+                vec![ins(vec![t("a")], vec![t("a"), i(1), Value::Null])],
+            ),
+        ),
+    ));
+    s.emit(record(
+        &a,
+        ddl,
+        Origin::Snapshot,
+        snapshot_end("ddl-5", SnapshotScope::Tables, vec![("notes", 2)], 1),
+    ));
+    s.emit(record(
+        &a,
+        pos(1, 7, 6),
+        Origin::Live,
+        rows(table_rows(
+            "notes",
+            2,
+            &["k", "v", "w"],
+            &["k"],
+            vec![ins(vec![t("b")], vec![t("b"), i(2), i(3)])],
+        )),
+    ));
     s
 }
 
@@ -378,8 +595,21 @@ fn snapshots() -> Scenario {
 fn generations() -> Scenario {
     let mut s = Scenario::new("generations");
     let a = stream("r1");
-    let one = |k: &str| rows(table_rows("t", 1, &["k"], &["k"], vec![ins(vec![t(k)], vec![t(k)])]));
-    s.emit(record(&a, pos(1, 1, 1), Origin::Live, schema("t", 1, vec![col("k", "TEXT", 1)])));
+    let one = |k: &str| {
+        rows(table_rows(
+            "t",
+            1,
+            &["k"],
+            &["k"],
+            vec![ins(vec![t(k)], vec![t(k)])],
+        ))
+    };
+    s.emit(record(
+        &a,
+        pos(1, 1, 1),
+        Origin::Live,
+        schema("t", 1, vec![col("k", "TEXT", 1)]),
+    ));
     s.emit(record(&a, pos(1, 1, 1), Origin::Live, one("x")));
     let mut dropped = schema("t", 1, vec![col("k", "TEXT", 1)]);
     if let Body::Schema(b) = &mut dropped {
@@ -387,20 +617,111 @@ fn generations() -> Scenario {
     }
     s.emit(record(&a, pos(1, 2, 2), Origin::Live, dropped));
     // u renamed to v.
-    s.emit(record(&a, pos(1, 1, 1), Origin::Live, schema("u", 1, vec![col("k", "TEXT", 1)])));
-    s.emit(record(&a, pos(1, 1, 1), Origin::Live, rows(table_rows("u", 1, &["k"], &["k"], vec![ins(vec![t("y")], vec![t("y")])]))));
+    s.emit(record(
+        &a,
+        pos(1, 1, 1),
+        Origin::Live,
+        schema("u", 1, vec![col("k", "TEXT", 1)]),
+    ));
+    s.emit(record(
+        &a,
+        pos(1, 1, 1),
+        Origin::Live,
+        rows(table_rows(
+            "u",
+            1,
+            &["k"],
+            &["k"],
+            vec![ins(vec![t("y")], vec![t("y")])],
+        )),
+    ));
     let mut renamed = schema("v", 1, vec![col("k", "TEXT", 1)]);
     if let Body::Schema(b) = &mut renamed {
         b.renamed_from = Some("u".into());
     }
     s.emit(record(&a, pos(1, 3, 3), Origin::Live, renamed));
-    s.emit(record(&a, pos(1, 3, 3), Origin::Snapshot, snapshot("ren", table_rows("v", 1, &["k"], &["k"], vec![ins(vec![t("y")], vec![t("y")])]))));
-    s.emit(record(&a, pos(1, 3, 3), Origin::Snapshot, snapshot_end("ren", SnapshotScope::Tables, vec![("v", 1)], 1)));
+    s.emit(record(
+        &a,
+        pos(1, 3, 3),
+        Origin::Snapshot,
+        snapshot(
+            "ren",
+            table_rows(
+                "v",
+                1,
+                &["k"],
+                &["k"],
+                vec![ins(vec![t("y")], vec![t("y")])],
+            ),
+        ),
+    ));
+    s.emit(record(
+        &a,
+        pos(1, 3, 3),
+        Origin::Snapshot,
+        snapshot_end("ren", SnapshotScope::Tables, vec![("v", 1)], 1),
+    ));
+    // z created and renamed away at one position.
+    s.emit(record(
+        &a,
+        pos(1, 6, 6),
+        Origin::Live,
+        schema("z", 1, vec![col("k", "TEXT", 1)]),
+    ));
+    s.emit(record(
+        &a,
+        pos(1, 6, 6),
+        Origin::Live,
+        rows(table_rows(
+            "z",
+            1,
+            &["k"],
+            &["k"],
+            vec![ins(vec![t("q")], vec![t("q")])],
+        )),
+    ));
+    let mut renamed = schema("zz", 1, vec![col("k", "TEXT", 1)]);
+    if let Body::Schema(b) = &mut renamed {
+        b.renamed_from = Some("z".into());
+    }
+    s.emit(record(&a, pos(1, 6, 6), Origin::Live, renamed));
     // w generation 1 superseded by generation 2, which has no rows yet.
-    s.emit(record(&a, pos(1, 1, 1), Origin::Live, schema("w", 1, vec![col("k", "INTEGER", 1)])));
-    s.emit(record(&a, pos(1, 1, 1), Origin::Live, rows(table_rows("w", 1, &["k"], &["k"], vec![ins(vec![i(1)], vec![i(1)])]))));
-    s.emit(record(&a, pos(1, 4, 4), Origin::Live, schema("w", 2, vec![col("k", "INTEGER", 1)])));
-    s.emit(record(&a, pos(1, 5, 5), Origin::Live, rows(table_rows("w", 2, &["k"], &["k"], vec![ins(vec![i(2)], vec![i(2)])]))));
+    s.emit(record(
+        &a,
+        pos(1, 1, 1),
+        Origin::Live,
+        schema("w", 1, vec![col("k", "INTEGER", 1)]),
+    ));
+    s.emit(record(
+        &a,
+        pos(1, 1, 1),
+        Origin::Live,
+        rows(table_rows(
+            "w",
+            1,
+            &["k"],
+            &["k"],
+            vec![ins(vec![i(1)], vec![i(1)])],
+        )),
+    ));
+    s.emit(record(
+        &a,
+        pos(1, 4, 4),
+        Origin::Live,
+        schema("w", 2, vec![col("k", "INTEGER", 1)]),
+    ));
+    s.emit(record(
+        &a,
+        pos(1, 5, 5),
+        Origin::Live,
+        rows(table_rows(
+            "w",
+            2,
+            &["k"],
+            &["k"],
+            vec![ins(vec![i(2)], vec![i(2)])],
+        )),
+    ));
     s
 }
 
@@ -410,11 +731,28 @@ fn deletions() -> Scenario {
     let mut s = Scenario::new("deletions");
     let put = |s: &mut Scenario, st: &StreamId, at: Position, id: i64| {
         s.emit(record(st, at, Origin::Live, items_schema()));
-        s.emit(record(st, at, Origin::Live, items(vec![ins(vec![i(id)], item(id, "x", Value::Null, Value::Null, Value::Null))])));
+        s.emit(record(
+            st,
+            at,
+            Origin::Live,
+            items(vec![ins(
+                vec![i(id)],
+                item(id, "x", Value::Null, Value::Null, Value::Null),
+            )]),
+        ));
     };
     let root = stream("r1");
     put(&mut s, &root, pos(1, 1, 1), 1);
-    s.emit(record(&root, pos(1, 2, 2), Origin::Live, Body::Deleted(DeletedBody { facet: None, incarnation: None, subtree: false })));
+    s.emit(record(
+        &root,
+        pos(1, 2, 2),
+        Origin::Live,
+        Body::Deleted(DeletedBody {
+            facet: None,
+            incarnation: None,
+            subtree: false,
+        }),
+    ));
     put(&mut s, &root, pos(1, 3, 3), 2);
     let f = facet("r1", "f", 70);
     let fb = facet("r1", "f/b", 71);
@@ -422,10 +760,22 @@ fn deletions() -> Scenario {
     let fother = facet("r1", "f", 69);
     let fsibling = facet("r1", "fx", 73);
     let elsewhere = facet("r2", "f", 70);
-    for (n, st) in [&f, &fb, &fbc, &fother, &fsibling, &elsewhere].into_iter().enumerate() {
+    for (n, st) in [&f, &fb, &fbc, &fother, &fsibling, &elsewhere]
+        .into_iter()
+        .enumerate()
+    {
         put(&mut s, st, pos(1, 1, 1), 10 + n as i64);
     }
-    s.emit(record(&root, pos(1, 4, 4), Origin::Live, Body::Deleted(DeletedBody { facet: Some("f".into()), incarnation: Some(70), subtree: true })));
+    s.emit(record(
+        &root,
+        pos(1, 4, 4),
+        Origin::Live,
+        Body::Deleted(DeletedBody {
+            facet: Some("f".into()),
+            incarnation: Some(70),
+            subtree: true,
+        }),
+    ));
     s
 }
 
@@ -435,7 +785,15 @@ fn certification() -> Scenario {
     let mut s = Scenario::new("certification");
     let a = stream("r1");
     let put = |s: &mut Scenario, at: Position, id: i64| {
-        s.emit(record(&a, at, Origin::Live, items(vec![ins(vec![i(id)], item(id, "x", Value::Null, Value::Null, Value::Null))])));
+        s.emit(record(
+            &a,
+            at,
+            Origin::Live,
+            items(vec![ins(
+                vec![i(id)],
+                item(id, "x", Value::Null, Value::Null, Value::Null),
+            )]),
+        ));
     };
     s.emit(record(&a, pos(1, 1, 1), Origin::Live, items_schema()));
     put(&mut s, pos(1, 1, 1), 1);
@@ -443,26 +801,130 @@ fn certification() -> Scenario {
     s.watermark(&a, None, pos(1, 1, 2));
     put(&mut s, pos(1, 2, 3), 3);
     s.watermark(&a, Some(pos(1, 1, 2)), pos(1, 2, 3));
-    s.lose(record(&a, pos(1, 3, 4), Origin::Live, items(vec![ins(vec![i(4)], item(4, "lost", Value::Null, Value::Null, Value::Null))])));
+    s.lose(record(
+        &a,
+        pos(1, 3, 4),
+        Origin::Live,
+        items(vec![ins(
+            vec![i(4)],
+            item(4, "lost", Value::Null, Value::Null, Value::Null),
+        )]),
+    ));
     s.watermark(&a, Some(pos(1, 2, 3)), pos(1, 3, 4));
     put(&mut s, pos(1, 4, 5), 5);
     s.watermark(&a, Some(pos(1, 3, 4)), pos(1, 4, 5));
     // Epoch 2 links back past the certified position.
-    s.emit(record(&a, pos(2, 1, 1), Origin::Live, Body::Link(LinkBody { start_txid: 1, prev_epoch: Some(1), prev_txid: Some(4), mode: LinkMode::Paged })));
+    s.emit(record(
+        &a,
+        pos(2, 1, 1),
+        Origin::Live,
+        Body::Link(LinkBody {
+            start_txid: 1,
+            prev_epoch: Some(1),
+            prev_txid: Some(4),
+            mode: LinkMode::Paged,
+        }),
+    ));
     put(&mut s, pos(2, 1, 1), 6);
     s.watermark(&a, None, pos(2, 1, 1));
-    s.emit(record(&a, pos(2, 2, 2), Origin::Live, Body::Gap(GapBody { from: pos(2, 1, 1), to: pos(2, 2, 2), reason: "queue_overflow".into() })));
-    s.emit(record(&a, pos(2, 2, 2), Origin::Live, Body::Recovered(RecoveredBody { session: "s-1".into(), head: pos(2, 1, 1) })));
-    s.emit(record(&a, pos(2, 3, 3), Origin::Live, Body::Recovered(RecoveredBody { session: "s-2".into(), head: pos(2, 3, 3) })));
-    s.emit(record(&a, pos(2, 4, 4), Origin::Live, Body::Bulk(BulkBody { tables: vec![TableGen { table: "items".into(), generation: 1 }] })));
+    s.emit(record(
+        &a,
+        pos(2, 2, 2),
+        Origin::Live,
+        Body::Gap(GapBody {
+            from: pos(2, 1, 1),
+            to: pos(2, 2, 2),
+            reason: "queue_overflow".into(),
+        }),
+    ));
+    s.emit(record(
+        &a,
+        pos(2, 2, 2),
+        Origin::Live,
+        Body::Recovered(RecoveredBody {
+            session: "s-1".into(),
+            head: pos(2, 1, 1),
+        }),
+    ));
+    s.emit(record(
+        &a,
+        pos(2, 3, 3),
+        Origin::Live,
+        Body::Recovered(RecoveredBody {
+            session: "s-2".into(),
+            head: pos(2, 3, 3),
+        }),
+    ));
+    s.emit(record(
+        &a,
+        pos(2, 4, 4),
+        Origin::Live,
+        Body::Bulk(BulkBody {
+            tables: vec![TableGen {
+                table: "items".into(),
+                generation: 1,
+            }],
+        }),
+    ));
     // A second stream whose link is covered by a stream snapshot.
     let b = stream("r2");
-    s.emit(record(&b, pos(3, 1, 1), Origin::Live, Body::Link(LinkBody { start_txid: 1, prev_epoch: Some(2), prev_txid: Some(9), mode: LinkMode::Clone })));
-    s.emit(record(&b, pos(3, 1, 1), Origin::Live, Body::Gap(GapBody { from: pos(2, 1, 1), to: pos(2, 9, 9), reason: "lost".into() })));
-    s.emit(record(&b, pos(3, 2, 2), Origin::Live, Body::Bulk(BulkBody { tables: vec![TableGen { table: "items".into(), generation: 1 }] })));
+    s.emit(record(
+        &b,
+        pos(3, 1, 1),
+        Origin::Live,
+        Body::Link(LinkBody {
+            start_txid: 1,
+            prev_epoch: Some(2),
+            prev_txid: Some(9),
+            mode: LinkMode::Clone,
+        }),
+    ));
+    s.emit(record(
+        &b,
+        pos(3, 1, 1),
+        Origin::Live,
+        Body::Gap(GapBody {
+            from: pos(2, 1, 1),
+            to: pos(2, 9, 9),
+            reason: "lost".into(),
+        }),
+    ));
+    s.emit(record(
+        &b,
+        pos(3, 2, 2),
+        Origin::Live,
+        Body::Bulk(BulkBody {
+            tables: vec![TableGen {
+                table: "items".into(),
+                generation: 1,
+            }],
+        }),
+    ));
     s.emit(record(&b, pos(3, 5, 5), Origin::Repair, items_schema()));
-    s.emit(record(&b, pos(3, 5, 5), Origin::Repair, snapshot("heal", table_rows("items", 1, &ITEMS, &["id"], vec![ins(vec![i(1)], item(1, "healed", Value::Null, Value::Null, Value::Null))]))));
-    s.emit(record(&b, pos(3, 5, 5), Origin::Repair, snapshot_end("heal", SnapshotScope::Stream, vec![("items", 1)], 1)));
+    s.emit(record(
+        &b,
+        pos(3, 5, 5),
+        Origin::Repair,
+        snapshot(
+            "heal",
+            table_rows(
+                "items",
+                1,
+                &ITEMS,
+                &["id"],
+                vec![ins(
+                    vec![i(1)],
+                    item(1, "healed", Value::Null, Value::Null, Value::Null),
+                )],
+            ),
+        ),
+    ));
+    s.emit(record(
+        &b,
+        pos(3, 5, 5),
+        Origin::Repair,
+        snapshot_end("heal", SnapshotScope::Stream, vec![("items", 1)], 1),
+    ));
     s
 }
 
@@ -471,9 +933,20 @@ fn certification() -> Scenario {
 fn tombstones() -> Scenario {
     let mut s = Scenario::new("tombstones");
     for (cell, inc) in [("r1", 1), ("r1", 2), ("r2", 1), ("r3", 1)] {
-        let st = StreamId { incarnation: inc, ..stream(cell) };
+        let st = StreamId {
+            incarnation: inc,
+            ..stream(cell)
+        };
         s.emit(record(&st, pos(1, 1, 1), Origin::Live, items_schema()));
-        s.emit(record(&st, pos(1, 1, 1), Origin::Live, items(vec![ins(vec![i(1)], item(1, cell, Value::Null, Value::Null, Value::Null))])));
+        s.emit(record(
+            &st,
+            pos(1, 1, 1),
+            Origin::Live,
+            items(vec![ins(
+                vec![i(1)],
+                item(1, cell, Value::Null, Value::Null, Value::Null),
+            )]),
+        ));
     }
     s.tombstones.push((stream("r1"), None));
     s.tombstones.push((stream("r2"), Some(5)));
@@ -502,7 +975,13 @@ impl Table {
         schema(self.name, self.generation, cols)
     }
     fn data(&self, rows: Vec<RowChange>) -> TableRows {
-        table_rows(self.name, self.generation, self.columns, self.key_columns, rows)
+        table_rows(
+            self.name,
+            self.generation,
+            self.columns,
+            self.key_columns,
+            rows,
+        )
     }
 }
 
@@ -515,7 +994,10 @@ fn random_value(rng: &mut Rng) -> Value {
             1 => f64::NEG_INFINITY,
             _ => (rng.below(20_000) as f64 - 10_000.0) / 8.0,
         }),
-        4 | 5 => t(&"xyz'\"\\é".chars().take(rng.below(8) as usize).collect::<String>()),
+        4 | 5 => t(&"xyz'\"\\é"
+            .chars()
+            .take(rng.below(8) as usize)
+            .collect::<String>()),
         _ => Value::Blob((0..rng.below(6)).map(|_| rng.below(256) as u8).collect()),
     }
 }
@@ -526,8 +1008,20 @@ fn random(seed: u64) -> Scenario {
     let streams = [stream("r1"), stream("r2"), facet("r1", "f", 77)];
     for st in &streams {
         let mut tables = vec![
-            Table { name: "a", generation: 1, columns: &["id", "v"], key_columns: &["id"], rows: Model::new() },
-            Table { name: "b", generation: 1, columns: &["v"], key_columns: &[ROWID_KEY_COLUMN], rows: Model::new() },
+            Table {
+                name: "a",
+                generation: 1,
+                columns: &["id", "v"],
+                key_columns: &["id"],
+                rows: Model::new(),
+            },
+            Table {
+                name: "b",
+                generation: 1,
+                columns: &["v"],
+                key_columns: &[ROWID_KEY_COLUMN],
+                rows: Model::new(),
+            },
         ];
         let (mut epoch, mut txid, mut commit) = (1u64, 1u64, 0u64);
         let mut last_mark: Option<Position> = None;
@@ -544,12 +1038,17 @@ fn random(seed: u64) -> Scenario {
                 txid = 1;
                 commit = 0;
                 last_mark = None;
-                s.emit(record(st, pos(epoch, 1, 1), Origin::Live, Body::Link(LinkBody {
-                    start_txid: 1,
-                    prev_epoch: Some(prev.epoch),
-                    prev_txid: Some(prev.txid),
-                    mode: LinkMode::Paged,
-                })));
+                s.emit(record(
+                    st,
+                    pos(epoch, 1, 1),
+                    Origin::Live,
+                    Body::Link(LinkBody {
+                        start_txid: 1,
+                        prev_epoch: Some(prev.epoch),
+                        prev_txid: Some(prev.txid),
+                        mode: LinkMode::Paged,
+                    }),
+                ));
             }
             commit += 1;
             txid += rng.below(2);
@@ -566,9 +1065,28 @@ fn random(seed: u64) -> Scenario {
                 }
                 s.emit(record(st, at, Origin::Live, tb.schema()));
                 let id = format!("ddl-{}-{}", st.cell, commit);
-                let snap: Vec<RowChange> = tb.rows.iter().map(|(k, r)| ins(k.clone(), r.clone())).collect();
-                s.emit(record(st, at, Origin::Snapshot, snapshot(&id, tb.data(snap))));
-                s.emit(record(st, at, Origin::Snapshot, snapshot_end(&id, SnapshotScope::Tables, vec![(tb.name, tb.generation)], 1)));
+                let snap: Vec<RowChange> = tb
+                    .rows
+                    .iter()
+                    .map(|(k, r)| ins(k.clone(), r.clone()))
+                    .collect();
+                s.emit(record(
+                    st,
+                    at,
+                    Origin::Snapshot,
+                    snapshot(&id, tb.data(snap)),
+                ));
+                s.emit(record(
+                    st,
+                    at,
+                    Origin::Snapshot,
+                    snapshot_end(
+                        &id,
+                        SnapshotScope::Tables,
+                        vec![(tb.name, tb.generation)],
+                        1,
+                    ),
+                ));
                 continue;
             }
 
@@ -578,18 +1096,25 @@ fn random(seed: u64) -> Scenario {
                 let tb = &mut tables[ti];
                 let key = vec![i(rng.below(8) as i64)];
                 let before = tb.rows.get(&key).cloned();
-                let change = if before.is_some() && rng.chance(35) {
+                let removable = before.clone().filter(|_| rng.chance(35));
+                let change = if let Some(before) = removable {
                     tb.rows.remove(&key);
                     // The net change against the commit's starting state.
                     match changes[ti].remove(&key) {
                         Some(RowChange(Op::Insert, ..)) => continue,
-                        Some(RowChange(_, _, _)) | None => del(key.clone(), before.unwrap()),
+                        Some(RowChange(_, _, _)) | None => del(key.clone(), before),
                     }
                 } else {
-                    let row = if ti == 0 { vec![key[0].clone(), random_value(&mut rng)] } else { vec![random_value(&mut rng)] };
+                    let row = if ti == 0 {
+                        vec![key[0].clone(), random_value(&mut rng)]
+                    } else {
+                        vec![random_value(&mut rng)]
+                    };
                     tb.rows.insert(key.clone(), row.clone());
                     match (changes[ti].remove(&key), before) {
-                        (Some(RowChange(Op::Insert, ..)), _) | (None, None) => ins(key.clone(), row),
+                        (Some(RowChange(Op::Insert, ..)), _) | (None, None) => {
+                            ins(key.clone(), row)
+                        }
                         (Some(RowChange(Op::Delete, ..)), _) => upd(key.clone(), row),
                         _ => upd(key.clone(), row),
                     }
@@ -601,16 +1126,29 @@ fn random(seed: u64) -> Scenario {
                     continue;
                 }
                 let tb = &tables[ti];
-                let r = record(st, at, Origin::Live, rows(tb.data(ch.into_values().collect())));
+                let r = record(
+                    st,
+                    at,
+                    Origin::Live,
+                    rows(tb.data(ch.into_values().collect())),
+                );
                 match rng.below(100) {
                     0..=4 => {
-                        let tg = TableGen { table: tb.name.into(), generation: tb.generation };
-                        s.emit(record(st, at, Origin::Live, Body::Bulk(BulkBody { tables: vec![tg] })));
+                        let tg = TableGen {
+                            table: tb.name.into(),
+                            generation: tb.generation,
+                        };
+                        s.emit(record(
+                            st,
+                            at,
+                            Origin::Live,
+                            Body::Bulk(BulkBody { tables: vec![tg] }),
+                        ));
                     }
                     5..=9 => s.lose(r),
                     10..=19 => s.emit_twice(r),
                     20..=34 => {
-                        let skip = rng.chance(20).then(|| 2);
+                        let skip = rng.chance(20).then_some(2);
                         s.emit_split(r, 420, skip);
                     }
                     _ => s.emit(r),
@@ -623,17 +1161,38 @@ fn random(seed: u64) -> Scenario {
         }
         let head = last.unwrap_or(first);
         if rng.chance(15) {
-            s.emit(record(st, head, Origin::Live, Body::Gap(GapBody { from: first, to: head, reason: "queue_overflow".into() })));
+            s.emit(record(
+                st,
+                head,
+                Origin::Live,
+                Body::Gap(GapBody {
+                    from: first,
+                    to: head,
+                    reason: "queue_overflow".into(),
+                }),
+            ));
         }
         if rng.chance(15) {
-            s.emit(record(st, head, Origin::Live, Body::Recovered(RecoveredBody { session: "dead".into(), head })));
+            s.emit(record(
+                st,
+                head,
+                Origin::Live,
+                Body::Recovered(RecoveredBody {
+                    session: "dead".into(),
+                    head,
+                }),
+            ));
         }
         if rng.chance(35) {
             // Repair at the head: every table, the whole stream.
             let id = format!("repair-{}", st.cell);
             for tb in &tables {
                 s.emit(record(st, head, Origin::Repair, tb.schema()));
-                let snap: Vec<RowChange> = tb.rows.iter().map(|(k, r)| ins(k.clone(), r.clone())).collect();
+                let snap: Vec<RowChange> = tb
+                    .rows
+                    .iter()
+                    .map(|(k, r)| ins(k.clone(), r.clone()))
+                    .collect();
                 let r = record(st, head, Origin::Repair, snapshot(&id, tb.data(snap)));
                 if rng.chance(30) {
                     s.emit_split(r, 420, None);
@@ -652,7 +1211,16 @@ fn random(seed: u64) -> Scenario {
         }
         if st.facet.is_none() && rng.chance(10) {
             let at = pos(epoch, txid, commit + 1);
-            s.emit(record(st, at, Origin::Live, Body::Deleted(DeletedBody { facet: Some("f".into()), incarnation: Some(77), subtree: false })));
+            s.emit(record(
+                st,
+                at,
+                Origin::Live,
+                Body::Deleted(DeletedBody {
+                    facet: Some("f".into()),
+                    incarnation: Some(77),
+                    subtree: false,
+                }),
+            ));
         }
     }
     // Arrival order means nothing; shuffle anyway.
@@ -741,7 +1309,11 @@ fn dynamic_tables(s: &Scenario) -> Vec<Json> {
     let mut schemas: BTreeMap<(String, String, String), Vec<SchemaBody>> = BTreeMap::new();
     for r in &s.whole {
         if let Body::Schema(b) = &r.body {
-            let k = (r.stream().script.clone(), r.stream().class.clone(), b.table.clone());
+            let k = (
+                r.stream().script.clone(),
+                r.stream().class.clone(),
+                b.table.clone(),
+            );
             schemas.entry(k).or_default().push(b.clone());
         }
     }
@@ -776,7 +1348,15 @@ fn main() {
         .nth(1)
         .map(|a| a.parse().expect("RANDOM_COUNT is a number"))
         .unwrap_or(16);
-    let mut all = vec![basic(), fragments(), snapshots(), generations(), deletions(), certification(), tombstones()];
+    let mut all = vec![
+        basic(),
+        fragments(),
+        snapshots(),
+        generations(),
+        deletions(),
+        certification(),
+        tombstones(),
+    ];
     all.extend((1..=random_count).map(random));
     let out: Vec<Json> = all
         .iter()
@@ -794,5 +1374,7 @@ fn main() {
             })
         })
         .collect();
-    println!("{}", json!({ "scenarios": out }));
+    let mut stdout = std::io::stdout().lock();
+    serde_json::to_writer(&mut stdout, &json!({ "scenarios": out })).expect("stdout");
+    stdout.write_all(b"\n").expect("stdout");
 }

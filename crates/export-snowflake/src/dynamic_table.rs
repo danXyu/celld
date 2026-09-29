@@ -117,8 +117,10 @@ impl DynamicTable {
         let lag_ok = self.target_lag.eq_ignore_ascii_case("DOWNSTREAM")
             || self.target_lag.split_once(' ').is_some_and(|(n, unit)| {
                 n.parse::<u32>().is_ok_and(|n| n > 0)
-                    && ["second", "seconds", "minute", "minutes", "hour", "hours", "day", "days"]
-                        .contains(&unit.to_ascii_lowercase().as_str())
+                    && [
+                        "second", "seconds", "minute", "minutes", "hour", "hours", "day", "days",
+                    ]
+                    .contains(&unit.to_ascii_lowercase().as_str())
             });
         if !lag_ok {
             return Err(RenderError::TargetLag(self.target_lag.clone()));
@@ -180,9 +182,9 @@ fn typed(v: &str, ty: ColumnType) -> String {
     );
     match ty {
         ColumnType::Integer => format!("TRY_TO_NUMBER({text})"),
-        ColumnType::Real => format!(
-            "COALESCE(TRY_TO_DOUBLE({v}:\"$real\"::STRING), TRY_TO_DOUBLE({text}))"
-        ),
+        ColumnType::Real => {
+            format!("COALESCE(TRY_TO_DOUBLE({v}:\"$real\"::STRING), TRY_TO_DOUBLE({text}))")
+        }
         ColumnType::Text => text,
         ColumnType::Blob => format!("TRY_BASE64_DECODE_BINARY({v}:\"$blob\"::STRING)"),
         ColumnType::Variant => v.to_string(),
@@ -243,24 +245,49 @@ mod tests {
     #[test]
     fn projection_unions_generations_and_widens_conflicts() {
         let schemas = vec![
-            schema("orders", 2, vec![col("id", "INTEGER"), col("total", "TEXT"), col("note", "TEXT")]),
-            schema("orders", 1, vec![col("id", "INTEGER"), col("total", "REAL")]),
+            schema(
+                "orders",
+                2,
+                vec![
+                    col("id", "INTEGER"),
+                    col("total", "TEXT"),
+                    col("note", "TEXT"),
+                ],
+            ),
+            schema(
+                "orders",
+                1,
+                vec![col("id", "INTEGER"), col("total", "REAL")],
+            ),
             schema("other", 1, vec![col("x", "INTEGER")]),
         ];
         let p = dt().projection(&schemas);
         assert_eq!(
             p,
             vec![
-                ProjectedColumn { name: "id".into(), ty: ColumnType::Integer },
-                ProjectedColumn { name: "total".into(), ty: ColumnType::Variant },
-                ProjectedColumn { name: "note".into(), ty: ColumnType::Text },
+                ProjectedColumn {
+                    name: "id".into(),
+                    ty: ColumnType::Integer
+                },
+                ProjectedColumn {
+                    name: "total".into(),
+                    ty: ColumnType::Variant
+                },
+                ProjectedColumn {
+                    name: "note".into(),
+                    ty: ColumnType::Text
+                },
             ]
         );
     }
 
     #[test]
     fn render_fills_the_template() {
-        let schemas = vec![schema("orders", 1, vec![col("id", "INTEGER"), col("{{NAME}}", "")])];
+        let schemas = vec![schema(
+            "orders",
+            1,
+            vec![col("id", "INTEGER"), col("{{NAME}}", "")],
+        )];
         let sql = dt().render(&schemas).unwrap();
         assert!(sql.starts_with("CREATE OR REPLACE DYNAMIC TABLE ORDERS_T"));
         assert!(sql.contains("TARGET_LAG = '1 minute'"));
@@ -279,8 +306,14 @@ mod tests {
         let mut d = dt();
         d.name = "a b".into();
         assert!(matches!(d.render(&ok), Err(RenderError::Identifier { .. })));
-        assert!(matches!(dt().render(&[]), Err(RenderError::NoSchema { .. })));
+        assert!(matches!(
+            dt().render(&[]),
+            Err(RenderError::NoSchema { .. })
+        ));
         let reserved = vec![schema("orders", 1, vec![col("_cf_key", "")])];
-        assert!(matches!(dt().render(&reserved), Err(RenderError::ReservedColumn(_))));
+        assert!(matches!(
+            dt().render(&reserved),
+            Err(RenderError::ReservedColumn(_))
+        ));
     }
 }
