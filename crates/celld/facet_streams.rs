@@ -451,8 +451,28 @@ mod tests {
         assert_eq!(early.take(), 1 << INCARNATION_COUNTER_BITS);
     }
 
-    #[tokio::test]
-    async fn a_delete_bounds_every_incarnation_before_it_and_none_after() {
+    /// Runs on a runtime that lives for the process, installed as the
+    /// host's: the process domain binds to the first runtime it sees, which
+    /// a `#[tokio::test]` would not outlive.
+    fn run(future: impl std::future::Future<Output = ()>) {
+        static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+        let runtime = RUNTIME.get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap()
+        });
+        crate::asyncrt::set_host_handle(runtime.handle().clone());
+        runtime.block_on(future);
+    }
+
+    #[test]
+    fn a_delete_bounds_every_incarnation_before_it_and_none_after() {
+        run(a_delete_bounds_every_incarnation());
+    }
+
+    async fn a_delete_bounds_every_incarnation() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().to_path_buf();
         let db_path = |cell: &str, epoch: u64| base.join(cell).join(format!("e{epoch}/db"));
