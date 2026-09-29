@@ -23,7 +23,7 @@ env:
   # A celld-tck commit, not a branch, so a TCK change cannot turn this gate
   # red on its own. Bump it deliberately.
   TCK_REPOSITORY: ewhauser/celld-tck
-  TCK_REF: 9e67dcc54420a222a50eaa01c13c0c2e0d6272c6
+  TCK_REF: f6f0b0e7ea48a06306444517c9161740939dd820
   TCK_CELLD_IMAGE: celld:tck
 
 jobs:
