@@ -627,10 +627,17 @@ each with its overflow policy.
 | stage | bound | on overflow |
 | --- | --- | --- |
 | session tracking | `CELLD_EXPORT_MAX_TX_BYTES`, checked after every writing statement; one statement can overshoot by the rows it touches, which is at most the table it touches | tracking stops for the rest of the transaction; the commit becomes `bulk` for the tables the transaction touched |
-| materialization | full images are read only for a tracked commit, so they are bounded by the same cap times a small constant | not reached |
+| materialization | bounded changeset output and a shared `CELLD_EXPORT_MAX_TX_BYTES` budget for full images and reshaped rows; one row can overshoot while being read | the affected table becomes `bulk` |
 | pending commits and node buffer | one shared budget, `CELLD_EXPORT_QUEUE_BYTES`, counted in encoded bytes | the oldest released `rows` records are dropped; the delivered position freezes; one gap note per affected stream, which is O(resident streams) and tiny |
 | meta records | bounded by streams with pending notes, one entry each | never dropped; the budget accounting excludes them because their total is bounded by the resident set |
 | pending commits with no proof | a fenced or partitioned node never releases; the pending list grows with writes | the same shared budget; dropped pending commits become a gap note released with the next proof, and a fenced node's notes die with it and surface through links |
+
+After an attribution gap, the residency stops submitting records and
+advances. Delivery tracks only streams touched by an acknowledgement batch,
+with a 256-entry hot cache and a process-local SQLite spill preserving
+older watermark chains. Offline audit commands use a separate incremental
+SQLite object index and evaluate one cell at a time; `docs/export.md`
+describes its scope and history limit.
 
 The exporter's memory is therefore bounded by the shared budget plus one
 transaction's overshoot plus the resident stream count.
@@ -644,7 +651,7 @@ transaction's overshoot plus the resident stream count.
 | `CELLD_EXPORT_BUCKET` | the fleet bucket | A different bucket for the bucket sink, same endpoint and credentials. |
 | `CELLD_EXPORT_CLASSES` | application classes, `__D1Database`, `__KvNamespace` | Allow list. `__Queue`, `__Workflow.*`, and cron scopes are never exported. Facets follow their root's class. |
 | `CELLD_EXPORT_TABLES` | unset | Deny list of `Class.table`. |
-| `CELLD_EXPORT_MAX_TX_BYTES` | `4194304` | Session memory above which a transaction becomes `bulk`; also the largest table snapshotted inline on DDL. |
+| `CELLD_EXPORT_MAX_TX_BYTES` | `4194304` | Session, changeset output and materialized row budget above which a transaction becomes `bulk`; also the largest table snapshotted inline on DDL. |
 | `CELLD_EXPORT_MAX_RECORD_BYTES` | `1048576` | Fragment size. |
 | `CELLD_EXPORT_QUEUE_BYTES` | `268435456` | Shared budget for pending commits and the node buffer. |
 | `CELLD_EXPORT_FLUSH_MS` | `10000` | Bucket sink flush interval and watermark cadence. |

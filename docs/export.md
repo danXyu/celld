@@ -370,6 +370,12 @@ does not decode, such as one that refers to itself, one stored in more than
 sparse array), is exported as its stored bytes, a `{"$blob": …}` in the
 record. `CELLD_EXPORT_TABLES` names the table as `Class.kv`.
 
+An application SQL table literally named `kv` exports as `_cf_SQL_kv`,
+so it cannot collide with the storage API table. Its deny rule is
+`Class._cf_SQL_kv`; denying `Class.kv` affects only the storage API table.
+If a previous exporter already published a SQL `kv` table, run a repair
+snapshot after upgrading to replace the old ambiguous table identity.
+
 A KV namespace's `__kv` table keeps its columns and gains `blob_key`: the
 bucket object that holds a value too large to store inline, such as
 `kv/blobs-v2/<cell>/e<epoch>/<digest>`, or `NULL`. The export does not copy
@@ -657,6 +663,23 @@ reference consumer over the records under `export/changes/`, not the
 Snowflake tables. They answer "does the bucket sink's output cover the
 cells", which is what the loader then loads.
 
+These commands index export objects in SQLite on local disk. Use
+`--cache /path/to/export-audit.sqlite` to reuse unchanged objects across
+invocations. The index is bound to the endpoint, bucket and prefix; choose
+one path per destination. A scheduled reconciler reuses a temporary index
+when no path is supplied. Each refresh still lists the export prefix to
+find late arrivals, replacements and retention deletes, but downloads only
+new or changed objects. Tombstone changes invalidate and filter the index.
+The cache contains exported data, so keep it on appropriate local storage.
+
+Consumer evaluation loads one cell's history at a time; `verify --cell`
+and `erase --cell` evaluate only that cell. Histories over 64 MiB of
+encoded records per cell fail with an explicit diagnostic instead of
+exhausting memory. Set `--max-cell-history N` (bytes) to raise this budget
+when the audit host has sufficient memory. This local audit limit is separate from the warehouse
+consumer. The first index build must read all export objects, since an
+object may contain several cells.
+
 #### verify
 
 ```sh
@@ -746,9 +769,21 @@ statement that crossed it), plus a small record per resident stream.
 
 | stage | limit | when it is exceeded |
 | --- | --- | --- |
-| capturing a transaction | `CELLD_EXPORT_MAX_TX_BYTES` | capture stops for that transaction and the commit becomes `bulk` for the tables it touched |
+| capturing a transaction and materializing its changes | `CELLD_EXPORT_MAX_TX_BYTES` | capture stops for that transaction and the commit becomes `bulk` for the tables it touched |
 | commits waiting for durability, records waiting for the sink | `CELLD_EXPORT_QUEUE_BYTES` | the oldest `rows` records are dropped, the stream stops advancing, and one `gap` per affected stream is emitted |
 | a record | `CELLD_EXPORT_MAX_RECORD_BYTES` | the record is split into fragments; a single row that does not fit becomes `bulk` for its table |
+
+After the first attribution/overflow gap, a residency emits no more row,
+metadata or advance records. This prevents a sink outage from accumulating
+one gap record per transaction. A later activation resumes capture; repair
+and reconciliation cover the missing tail.
+
+Delivery bookkeeping keeps at most 256 stream entries in memory and spills
+older entries to a process-local SQLite file. It evaluates only streams
+changed by the current acknowledgement batch. Spilled watermark counts
+survive same-epoch reopenings. If the spill fails, export stops and
+`/state` reports `export.delivery_failed: true`; restart after correcting
+the local disk problem, then reconcile and repair.
 
 ## Failure modes
 
