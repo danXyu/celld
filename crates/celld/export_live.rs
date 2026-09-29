@@ -1127,38 +1127,40 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(Input::Commit { .. })));
     }
 
-    #[tokio::test]
-    async fn close_writes_the_watermark_before_closing_the_sink() {
-        let (exporter, sink, outcomes) = exporter(1024 * 1024);
-        #[allow(clippy::disallowed_methods)]
-        tokio::spawn(deliver(exporter.clone(), outcomes));
-        let stream = StreamId {
-            script: "app".to_string(),
-            class: "Items".to_string(),
-            cell: "Items:a".to_string(),
-            facet: None,
-            incarnation: 0,
-        };
-        let position = Position::new(1, 0, 1);
-        exporter.submit(vec![(
-            Record {
-                envelope: exporter.envelope(&stream, position, 0),
-                body: Body::Rows(RowsBody {
-                    data: commit_of(8).tables.remove(0),
-                }),
-            },
-            Submitted {
-                key: ("Items:a".to_string(), 1),
-                stream,
-                position,
-                whole: true,
-                closes: true,
-                watermark: false,
-            },
-        )]);
-        exporter.close().await;
-        assert_eq!(*sink.log.lock().unwrap(), ["rows", "watermark", "close"]);
-        assert_eq!(exporter.state()["watermarks"], 1);
+    #[test]
+    fn close_writes_the_watermark_before_closing_the_sink() {
+        crate::asyncrt::test_block_on(async {
+            let (exporter, sink, outcomes) = exporter(1024 * 1024);
+            #[allow(clippy::disallowed_methods)]
+            tokio::spawn(deliver(exporter.clone(), outcomes));
+            let stream = StreamId {
+                script: "app".to_string(),
+                class: "Items".to_string(),
+                cell: "Items:a".to_string(),
+                facet: None,
+                incarnation: 0,
+            };
+            let position = Position::new(1, 0, 1);
+            exporter.submit(vec![(
+                Record {
+                    envelope: exporter.envelope(&stream, position, 0),
+                    body: Body::Rows(RowsBody {
+                        data: commit_of(8).tables.remove(0),
+                    }),
+                },
+                Submitted {
+                    key: ("Items:a".to_string(), 1),
+                    stream,
+                    position,
+                    whole: true,
+                    closes: true,
+                    watermark: false,
+                },
+            )]);
+            exporter.close().await;
+            assert_eq!(*sink.log.lock().unwrap(), ["rows", "watermark", "close"]);
+            assert_eq!(exporter.state()["watermarks"], 1);
+        });
     }
 
     #[test]
