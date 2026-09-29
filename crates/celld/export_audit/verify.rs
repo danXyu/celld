@@ -168,7 +168,7 @@ pub fn compare(
         if !crate::storage::export_capture::exported_table(&table) {
             continue;
         }
-        if denied(&table) {
+        if denied(crate::storage::export_capture::kv::exported_name(&table)) {
             skipped.push((table, "denied by CELLD_EXPORT_TABLES".into()));
             continue;
         }
@@ -176,15 +176,16 @@ pub fn compare(
             skipped.push((table, "exported through the KV decoder".into()));
             continue;
         }
-        if uncertain.contains(table.as_str()) {
+        let exported = crate::storage::export_capture::kv::exported_name(&table);
+        if uncertain.contains(exported) {
             skipped.push((table, "a bulk record left it uncertain".into()));
             continue;
         }
-        compared.insert(table.clone());
+        compared.insert(exported.to_string());
         let cell = read_table(db, &table)?;
         rows += cell.len();
         let held: BTreeMap<Vec<Value>, BTreeMap<&str, &Value>> = state
-            .table(&table)
+            .table(exported)
             .map(|t| {
                 t.rows
                     .iter()

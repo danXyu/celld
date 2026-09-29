@@ -352,7 +352,7 @@ async fn run_snapshots(mode: Mode, arguments: Vec<String>) -> anyhow::Result<()>
     };
     let (outcomes_tx, outcomes) = tokio::sync::mpsc::unbounded_channel();
     let sink = BucketSink::start(
-        destination,
+        destination.clone(),
         options.node.clone(),
         BucketSinkConfig {
             flush: config.flush,
@@ -371,6 +371,7 @@ async fn run_snapshots(mode: Mode, arguments: Vec<String>) -> anyhow::Result<()>
     let total = jobs.len();
     let reports = export_repair::run(
         &source,
+        &destination,
         Arc::new(sink),
         outcomes,
         jobs,

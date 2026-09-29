@@ -31,10 +31,10 @@
 //! did then. A cell that has never opened with export on has no stream yet
 //! and is skipped.
 //!
-//! **Not yet.** Table generations are the capture's first generation until
-//! piece 11 records real ones, facet streams are refused because restoring
-//! a facet's state is not built, and tombstoned streams (piece 16) are not
-//! checked.
+//! Table generations are read from the restored capture catalog. Legacy
+//! images without that catalog start at the first generation.
+//! Erasure tombstones are read from the destination bucket before scanning.
+//! Facet streams are refused because restoring a facet's state is not built.
 #![allow(clippy::disallowed_methods)] // Offline operator path, outside Actor execution.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -443,7 +443,7 @@ impl Snapshot<'_> {
                 .iter()
                 .map(|scan| TableGen {
                     table: scan.name.clone(),
-                    generation: FIRST_GENERATION,
+                    generation: scan.generation,
                 })
                 .collect(),
             records: scans.len() as u64,
@@ -455,7 +455,7 @@ impl Snapshot<'_> {
 
     /// The exported tables of the image, as capture chooses them: ordinary
     /// tables of `main`, not virtual or shadow, not internal, not denied
-    /// under their own or their exported name.
+    /// under their exported name.
     fn tables(&self, db: &Connection) -> anyhow::Result<Vec<String>> {
         let mut statement = db.prepare("PRAGMA table_list")?;
         let mut rows = statement.query([])?;
@@ -466,13 +466,10 @@ impl Snapshot<'_> {
             if schema == "main"
                 && kind == "table"
                 && exported_table(&name)
-                && ![name.as_str(), kv::exported_name(&name)]
-                    .iter()
-                    .any(|table| {
-                        self.settings
-                            .denied_tables
-                            .contains(&(self.stream.class.clone(), table.to_string()))
-                    })
+                && !self.settings.denied_tables.contains(&(
+                    self.stream.class.clone(),
+                    kv::exported_name(&name).to_string(),
+                ))
             {
                 tables.push(name);
             }
@@ -495,7 +492,7 @@ impl Snapshot<'_> {
         let table = scan.name.as_str();
         let data = |rows: Vec<RowChange>| TableRows {
             table: table.to_string(),
-            generation: FIRST_GENERATION,
+            generation: scan.generation,
             columns: scan.columns.clone(),
             key_columns: scan.key_columns.clone(),
             rows,
@@ -568,6 +565,7 @@ impl Snapshot<'_> {
 struct ExportedScan {
     /// The table in SQLite.
     source: String,
+    generation: u64,
     /// The table's exported name.
     name: String,
     columns: Vec<String>,
@@ -582,6 +580,19 @@ const RESHAPE_BATCH: usize = 256;
 
 impl ExportedScan {
     fn new(db: &Connection, table: &str, scope: &str) -> anyhow::Result<Self> {
+        let has_generations: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = '_cf_EXPORT' AND type = 'table')", [], |r| r.get(0))?;
+        let generation = if has_generations {
+            db.query_row(
+                "SELECT generation FROM _cf_EXPORT WHERE name = ?1 AND schema_sql IS NOT NULL",
+                [table],
+                |r| r.get::<_, u64>(0),
+            )
+            .optional()?
+            .unwrap_or(FIRST_GENERATION)
+        } else {
+            FIRST_GENERATION
+        };
         let scan = table_scan(db, table)?;
         let (name, columns, key_columns) = if table == kv::KV_SOURCE {
             (
@@ -592,7 +603,7 @@ impl ExportedScan {
         } else {
             let empty = TableRows {
                 table: table.to_string(),
-                generation: FIRST_GENERATION,
+                generation,
                 columns: scan.columns.clone(),
                 key_columns: scan.key_columns.clone(),
                 rows: Vec::new(),
@@ -603,6 +614,7 @@ impl ExportedScan {
         };
         Ok(ExportedScan {
             source: table.to_string(),
+            generation,
             name,
             columns,
             key_columns,
@@ -626,7 +638,7 @@ impl ExportedScan {
             }
             let rows = TableRows {
                 table: self.source.clone(),
-                generation: FIRST_GENERATION,
+                generation: self.generation,
                 columns: self.scan.columns.clone(),
                 key_columns: self.scan.key_columns.clone(),
                 rows: std::mem::take(batch),
@@ -713,7 +725,7 @@ fn schema_of(db: &Connection, scan: &ExportedScan) -> anyhow::Result<SchemaBody>
     };
     Ok(SchemaBody {
         table: scan.name.clone(),
-        generation: FIRST_GENERATION,
+        generation: scan.generation,
         sql,
         columns,
         dropped: false,
@@ -795,8 +807,10 @@ impl Tracker {
 /// time, and report on each once the sink has written everything. `sink`'s
 /// results must arrive on `outcomes`. `pace` limits the restore's bucket
 /// requests across all jobs. Reports come back in job order.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     source: &Bucket,
+    export_bucket: &Bucket,
     sink: Arc<dyn ExportSink>,
     mut outcomes: mpsc::UnboundedReceiver<Outcome>,
     jobs: Vec<Job>,
@@ -818,7 +832,17 @@ pub async fn run(
         .map(|(index, job)| {
             let (sink, tracker, pace) = (sink.clone(), tracker.clone(), pace.clone());
             async move {
-                let report = run_job(source, &sink, &tracker, index, job, settings, pace).await;
+                let report = run_job(
+                    source,
+                    &sink,
+                    &tracker,
+                    index,
+                    job,
+                    settings,
+                    pace,
+                    export_bucket,
+                )
+                .await;
                 (index, report)
             }
         })
@@ -847,6 +871,7 @@ pub async fn run(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_job(
     source: &Bucket,
     sink: &Arc<dyn ExportSink>,
@@ -855,6 +880,7 @@ async fn run_job(
     job: &Job,
     settings: &Settings,
     pace: Option<Arc<Pace>>,
+    export_bucket: &Bucket,
 ) -> Report {
     let mut report = Report::new(job);
     if crate::export::is_never_exported(&job.stream.class) {
@@ -876,6 +902,7 @@ async fn run_job(
         settings,
         pace,
         &mut report,
+        export_bucket,
     )
     .await
     {
@@ -902,6 +929,7 @@ async fn snapshot_job(
     settings: &Settings,
     pace: Option<Arc<Pace>>,
     report: &mut Report,
+    export_bucket: &Bucket,
 ) -> anyhow::Result<Option<String>> {
     let stream = Stream::cell(&job.stream.cell)?;
     let restored = restore(source, &stream, job.target, pace).await?;
@@ -925,9 +953,12 @@ async fn snapshot_job(
 
     // The scan is synchronous SQLite work: it runs on a blocking thread
     // and hands records back through a bounded channel.
+    let tombstones = crate::export_audit::tombstone::load(export_bucket)
+        .await
+        .context("read destination erasure tombstones")?;
     let (tx, mut rx) = mpsc::channel::<Record>(RECORDS_IN_FLIGHT);
     let scan = {
-        let (job, settings) = (job.clone(), settings.clone());
+        let (job, settings, tombstones) = (job.clone(), settings.clone(), tombstones.to_vec());
         tokio::task::spawn_blocking(move || -> anyhow::Result<Scanned> {
             let db = restored.open()?;
             let image = image_identity(&db, &job.stream.cell)?;
@@ -935,6 +966,9 @@ async fn snapshot_job(
                 Ok(stream) => stream,
                 Err(reason) => return Ok(Scanned::Skipped(reason)),
             };
+            if tombstones.iter().any(|t| t.matches(&stream)) {
+                return Ok(Scanned::Skipped("the export stream is tombstoned".into()));
+            }
             let snapshot = Snapshot {
                 stream: &stream,
                 position: reached,

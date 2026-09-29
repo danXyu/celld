@@ -22,6 +22,8 @@ use celld_logic::kv::BlobRef;
 pub(crate) const KV_SOURCE: &str = "_cf_KV";
 /// The name `_cf_KV` is exported under.
 pub(crate) const KV_TABLE: &str = "kv";
+/// Application SQL `kv`; `_cf_` source tables are reserved and not exported.
+pub(crate) const SQL_KV_TABLE: &str = "_cf_SQL_kv";
 /// A KV namespace cell's table.
 pub(crate) const NAMESPACE_TABLE: &str = "__kv";
 /// The column `__kv` gains.
@@ -35,6 +37,8 @@ pub(crate) type Decoder = fn(Vec<Vec<u8>>) -> Vec<Option<String>>;
 pub(crate) fn exported_name(table: &str) -> &str {
     if table == KV_SOURCE {
         KV_TABLE
+    } else if table == KV_TABLE {
+        SQL_KV_TABLE
     } else {
         table
     }
@@ -50,7 +54,10 @@ pub(crate) fn reshape(
     match rows.table.as_str() {
         KV_SOURCE => kv(rows, scope, decode),
         NAMESPACE_TABLE => Ok(Some(namespace(rows, scope))),
-        _ => Ok(Some(rows)),
+        _ => Ok(Some(TableRows {
+            table: exported_name(&rows.table).to_string(),
+            ..rows
+        })),
     }
 }
 

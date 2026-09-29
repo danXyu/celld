@@ -109,7 +109,15 @@ async fn snapshot(
     jobs: Vec<Job>,
     settings: &Settings,
 ) -> (Vec<Report>, Vec<Record>) {
-    let destination = bucket("export");
+    snapshot_into(source, &bucket("export"), jobs, settings).await
+}
+
+async fn snapshot_into(
+    source: &Bucket,
+    destination: &Bucket,
+    jobs: Vec<Job>,
+    settings: &Settings,
+) -> (Vec<Report>, Vec<Record>) {
     let (tx, rx) = mpsc::unbounded_channel();
     let sink = BucketSink::start(
         destination.clone(),
@@ -121,7 +129,17 @@ async fn snapshot(
         },
         tx,
     );
-    let reports = run(source, Arc::new(sink), rx, jobs, settings, None, |_| {}).await;
+    let reports = run(
+        source,
+        destination,
+        Arc::new(sink),
+        rx,
+        jobs,
+        settings,
+        None,
+        |_| {},
+    )
+    .await;
     let mut records = Vec::new();
     for object in destination.list("export/changes/").await.unwrap() {
         let key = object.location.to_string();
@@ -590,6 +608,7 @@ fn a_dropped_record_fails_its_stream() {
         let (tx, rx) = mpsc::unbounded_channel();
         let reports = run(
             &source,
+            &source,
             Arc::new(Refusing(tx)),
             rx,
             vec![job(Target::Head)],
@@ -825,6 +844,7 @@ fn a_pace_spaces_bucket_reads_across_jobs() {
         let sink = BucketSink::start(destination, "paced".into(), BucketSinkConfig::default(), tx);
         let reports = run(
             &source,
+            &source,
             Arc::new(sink),
             rx,
             vec![job(Target::Head)],
@@ -890,5 +910,141 @@ fn the_key_value_table_is_snapshotted_as_capture_exports_it() {
         let obj: serde_json::Value = serde_json::from_str(obj).unwrap();
         assert_eq!(obj["a"], 1);
         assert_eq!(obj["when"]["$date"], "1970-01-01T00:00:00.000Z");
+    });
+}
+
+#[test]
+fn repair_preserves_persisted_generation() {
+    crate::asyncrt::test_block_on(async {
+        let source = bucket("fleet");
+        let sql = "CREATE TABLE items(id INTEGER PRIMARY KEY, v TEXT);
+            INSERT INTO items VALUES(1, 'authoritative');
+            CREATE TABLE _cf_EXPORT(name TEXT PRIMARY KEY, generation INTEGER, schema_sql TEXT, rootpage INTEGER);
+            INSERT INTO _cf_EXPORT VALUES('items', 2, 'CREATE TABLE items(id INTEGER PRIMARY KEY, v TEXT)', 2);";
+        put(&source, SCOPE, 3, 1, 4, sql).await;
+        let (reports, records) =
+            snapshot(&source, vec![job(Target::Head)], &settings(1 << 20)).await;
+        assert_eq!(reports[0].status, Status::Written);
+        let mut earlier = live(
+            Position::new(3, 2, 1),
+            "items",
+            &["id"],
+            &["id", "v"],
+            vec![RowChange(
+                Op::Insert,
+                vec![int(1)],
+                vec![int(1), text("old")],
+            )],
+        );
+        if let Body::Rows(b) = &mut earlier.body {
+            b.data.generation = 2;
+        }
+        let mut c = Consumer::new();
+        c.ingest(earlier).unwrap();
+        c.ingest_all(records).unwrap();
+        let state = c.stream(&job(Target::Head).stream).unwrap();
+        assert_eq!(
+            table(&state, "items").len(),
+            1,
+            "repair erased the entire generation-2 table: {state:?}"
+        );
+    });
+}
+
+#[test]
+fn repair_skips_tombstoned_stream() {
+    crate::asyncrt::test_block_on(async {
+        let source = source().await;
+        let tombstone = crate::export_audit::Tombstone {
+            script: SCRIPT.into(),
+            class: "Cart".into(),
+            cell: SCOPE.into(),
+            facet: None,
+            incarnation: None,
+            erased_at_ms: 1,
+            reason: None,
+            cleared_at_ms: None,
+        };
+        let destination = bucket("separate-export-bucket");
+        crate::export_audit::tombstone::put(&destination, &tombstone)
+            .await
+            .unwrap();
+        let (reports, records) = snapshot_into(
+            &source,
+            &destination,
+            vec![job(Target::Head)],
+            &settings(1 << 20),
+        )
+        .await;
+        assert!(records.is_empty());
+        assert_eq!(
+            reports[0].status,
+            Status::Skipped,
+            "emitted {} records after erasure",
+            records.len()
+        );
+    });
+}
+
+#[test]
+fn repair_tombstones_match_the_restored_identity() {
+    crate::asyncrt::test_block_on(async {
+        let source = bucket("fleet");
+        put(
+            &source,
+            SCOPE,
+            7,
+            1,
+            1,
+            &format!(
+                "{SCHEMA}
+ALTER TABLE _cf_METADATA ADD COLUMN incarnation INTEGER;
+UPDATE _cf_METADATA SET incarnation=7;"
+            ),
+        )
+        .await;
+        let destination = bucket("export");
+        crate::export_audit::tombstone::put(
+            &destination,
+            &crate::export_audit::Tombstone {
+                script: SCRIPT.into(),
+                class: "Cart".into(),
+                cell: SCOPE.into(),
+                facet: None,
+                incarnation: Some(7),
+                erased_at_ms: 1,
+                cleared_at_ms: None,
+                reason: None,
+            },
+        )
+        .await
+        .unwrap();
+        let (reports, records) = snapshot_into(
+            &source,
+            &destination,
+            vec![job(Target::Head)],
+            &settings(1 << 20),
+        )
+        .await;
+        assert_eq!(reports[0].status, Status::Skipped);
+        assert!(records.is_empty());
+    });
+}
+
+#[test]
+fn repair_keeps_sql_kv_distinct_when_storage_kv_is_denied() {
+    crate::asyncrt::test_block_on(async {
+        let source = bucket("fleet");
+        put(&source, SCOPE, 3, 1, 4, "CREATE TABLE kv(id INTEGER PRIMARY KEY, v TEXT); INSERT INTO kv VALUES (1, 'sql');
+CREATE TABLE _cf_KV(scope TEXT, k TEXT, v, PRIMARY KEY(scope,k)) WITHOUT ROWID; INSERT INTO _cf_KV VALUES ('Cart:one', 'api', '42');").await;
+        let mut settings = settings(1 << 20);
+        settings.denied_tables.insert(("Cart".into(), "kv".into()));
+        let (reports, records) = snapshot(&source, vec![job(Target::Head)], &settings).await;
+        assert_eq!(reports[0].status, Status::Written);
+        let mut consumer = Consumer::new();
+        consumer.ingest_all(records).unwrap();
+        let state = consumer.stream(&job(Target::Head).stream).unwrap();
+        assert!(state.table("kv").is_none());
+        assert_eq!(state.table("_cf_SQL_kv").unwrap().rows.len(), 1);
     });
 }
