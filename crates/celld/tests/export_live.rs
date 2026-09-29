@@ -10,8 +10,16 @@
 //! objects must hold exactly what the cell holds after a restart restores it
 //! from the same bucket. The node's watermarks must certify every commit,
 //! including across enough commits to pass the WAL's autocheckpoint.
+//!
+//! One cell also writes to a facet and a facet nested in it, deletes both,
+//! and recreates them. Each facet exports on a stream of its own that opens
+//! with a link, the root's stream carries the `deleted` record, and the
+//! consumer keeps only the recreated facets, whose rows match what they hold,
+//! before and after the restart.
 
-use celld_export_format::{Body, Consumer, LinkMode, Position, Record, StreamState, Value};
+use celld_export_format::{
+    Body, Consumer, LinkMode, Position, Record, StreamId, StreamState, Value,
+};
 use std::collections::BTreeMap;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -28,8 +36,41 @@ const CONFIG: &str = r#"{
 }"#;
 
 const WORKER: &str = r#"
+import { DurableObject } from "cloudflare:workers";
+
+const ROWS = "CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY, name TEXT, qty REAL)";
+
+// A facet: rows of its own, and optionally a nested facet below it.
+export class Leaf extends DurableObject {
+  constructor(state, env) {
+    super(state, env);
+    this.state = state;
+    this.sql = state.storage.sql;
+    this.sql.exec(ROWS);
+  }
+  async fetch(request) {
+    const url = new URL(request.url);
+    const [head, ...rest] = (url.searchParams.get("path") ?? "").split("/").filter(Boolean);
+    if (head) {
+      const facet = this.state.facets.get(head, () => ({ class: this.state.exports.Leaf }));
+      url.searchParams.set("path", rest.join("/"));
+      return facet.fetch(url.toString());
+    }
+    if (url.searchParams.get("op") === "facet") {
+      this.sql.exec(
+        "INSERT INTO items(id, name, qty) VALUES(?, ?, 1) " +
+          "ON CONFLICT(id) DO UPDATE SET name=excluded.name",
+        Number(url.searchParams.get("id")), url.searchParams.get("name"));
+    }
+    return Response.json({
+      items: this.sql.exec("SELECT id, name, qty FROM items ORDER BY id").toArray(),
+    });
+  }
+}
+
 export class Items {
   constructor(state) {
+    this.state = state;
     this.storage = state.storage;
     this.sql = state.storage.sql;
     this.sql.exec("CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY, name TEXT, qty REAL)");
@@ -40,6 +81,15 @@ export class Items {
     const url = new URL(request.url);
     const op = url.searchParams.get("op");
     const id = Number(url.searchParams.get("id"));
+    if (op === "facet" || op === "flist") {
+      // `path` names the facet below this cell: `child` or `child/nested`.
+      const [head, ...rest] = url.searchParams.get("path").split("/");
+      const facet = this.state.facets.get(head, () => ({ class: this.state.exports.Leaf }));
+      url.searchParams.set("path", rest.join("/"));
+      return facet.fetch(url.toString());
+    } else if (op === "fdelete") {
+      this.state.facets.delete("child");
+    }
     if (op === "put") {
       this.sql.exec(
         "INSERT INTO items(id, name, qty) VALUES(?, ?, ?) " +
@@ -85,6 +135,7 @@ struct Dev {
     child: Child,
     url: String,
     log: PathBuf,
+    project: PathBuf,
 }
 
 impl Drop for Dev {
@@ -124,6 +175,7 @@ impl Dev {
             child,
             url: format!("http://127.0.0.1:{port}"),
             log,
+            project: project.to_path_buf(),
         };
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
@@ -152,12 +204,14 @@ impl Dev {
             .send()
             .await
             .unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
         assert!(
-            response.status().is_success(),
-            "{query}: {}",
-            response.status()
+            status.is_success(),
+            "{query}: {status} {body}\n{}",
+            self.log_text()
         );
-        response.json().await.unwrap()
+        serde_json::from_str(&body).unwrap()
     }
 }
 
@@ -241,7 +295,7 @@ fn stream_state(
     let (stream, state) = consumer
         .state()
         .into_iter()
-        .find(|(stream, _)| stream.cell == cell_id)?;
+        .find(|(stream, _)| stream.cell == cell_id && stream.facet.is_none())?;
     let newest = records
         .iter()
         .filter(|r| r.envelope.stream == stream && !matches!(r.body, Body::Watermark(_)))
@@ -250,11 +304,16 @@ fn stream_state(
     Some((state, newest))
 }
 
-/// The `link` records of the cell `cell_id`, in position order.
+/// The `link` records of the root stream of the cell `cell_id`, in position
+/// order.
 fn links(records: &[Record], cell_id: &str) -> Vec<Record> {
     let mut links: Vec<Record> = records
         .iter()
-        .filter(|r| r.envelope.stream.cell == cell_id && matches!(r.body, Body::Link(_)))
+        .filter(|r| {
+            r.envelope.stream.cell == cell_id
+                && r.envelope.stream.facet.is_none()
+                && matches!(r.body, Body::Link(_))
+        })
         .cloned()
         .collect();
     links.sort_by_key(|r| r.envelope.position);
@@ -280,19 +339,157 @@ fn assert_opens_fresh(records: &[Record], cell_id: &str, name: &str) -> u64 {
         Position::new(epoch, body.start_txid, 0)
     );
     assert_eq!(link.envelope.stream.incarnation, epoch);
+    let root = |r: &&Record| r.envelope.stream.cell == cell_id && r.envelope.stream.facet.is_none();
     let first = records
         .iter()
-        .filter(|r| r.envelope.stream.cell == cell_id)
+        .filter(root)
         .map(|r| r.envelope.position)
         .min();
     assert_eq!(first, Some(link.envelope.position), "the link comes first");
-    for record in records.iter().filter(|r| r.envelope.stream.cell == cell_id) {
+    for record in records.iter().filter(root) {
         assert_eq!(record.envelope.stream.incarnation, epoch);
         if matches!(record.body, Body::Rows(_)) {
             assert_eq!(record.envelope.cell_name.as_deref(), Some(name));
         }
     }
     epoch
+}
+
+/// The facets of the root cell that the consumer keeps, with their state
+/// and newest position.
+fn facet_states(records: &[Record]) -> BTreeMap<StreamId, (StreamState, Position)> {
+    let mut consumer = Consumer::new();
+    consumer.ingest_all(records.iter().cloned()).unwrap();
+    consumer
+        .state()
+        .into_iter()
+        .filter(|(stream, _)| stream.facet.is_some())
+        .map(|(stream, state)| {
+            let newest = records
+                .iter()
+                .filter(|r| r.envelope.stream == stream && !matches!(r.body, Body::Watermark(_)))
+                .map(|r| r.envelope.position)
+                .max()
+                .unwrap();
+            (stream, (state, newest))
+        })
+        .collect()
+}
+
+/// The `link` records of one stream, in position order.
+fn facet_links(records: &[Record], stream: &StreamId) -> Vec<Record> {
+    let mut links: Vec<Record> = records
+        .iter()
+        .filter(|r| r.envelope.stream == *stream && matches!(r.body, Body::Link(_)))
+        .cloned()
+        .collect();
+    links.sort_by_key(|r| r.envelope.position);
+    links.dedup_by_key(|r| r.envelope.position);
+    links
+}
+
+/// Wait until the consumer keeps exactly the child and nested facets, each
+/// holding what the facet answered (`live`, child first), certified through
+/// its newest record and without gaps. Answers every record exported.
+async fn settled_facets(dev: &Dev, live: &[serde_json::Value; 2]) -> Vec<Record> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let records = exported(&dev.project);
+        let states = facet_states(&records);
+        // The child's path is a prefix of the nested facet's.
+        let mut by_depth: Vec<_> = states.iter().collect();
+        by_depth.sort_by_key(|(stream, _)| stream.facet.as_deref().unwrap().len());
+        let settled = by_depth.len() == 2
+            && by_depth
+                .iter()
+                .zip(live)
+                .all(|((_, (state, newest)), live)| {
+                    exported_rows(state, "items")
+                        == cell_rows(live, "items", &["id", "name", "qty"])
+                        && state.certified_head().is_some_and(|head| head >= *newest)
+                        && state.gaps.is_empty()
+                        && state.uncertain.is_empty()
+                });
+        if settled {
+            return records;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the facets did not converge on {live:#?}; the consumer keeps {states:#?}\nrecords:\n{:#?}\nlog:\n{}",
+            records
+                .iter()
+                .filter(|r| r.envelope.stream.facet.is_some() || matches!(r.body, Body::Deleted(_)))
+                .collect::<Vec<_>>(),
+            dev.log_text()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// The facet half of the first run: cell `c` wrote to `child` and
+/// `child/nested`, deleted `child`, and wrote to both again. Answers the
+/// surviving facet streams with the epoch each began in.
+async fn assert_facets_deleted_and_recreated(
+    dev: &Dev,
+    live: &[serde_json::Value; 2],
+) -> Vec<(StreamId, u64)> {
+    let records = settled_facets(dev, live).await;
+    let mut deletes: Vec<&Record> = records
+        .iter()
+        .filter(|r| matches!(r.body, Body::Deleted(_)))
+        .collect();
+    deletes.dedup_by_key(|r| r.envelope.position);
+    let [deleted] = &deletes[..] else {
+        panic!("one deleted record: {deletes:#?}");
+    };
+    let Body::Deleted(body) = &deleted.body else {
+        unreachable!()
+    };
+    let root = &deleted.envelope.stream;
+    assert_eq!(root.facet, None, "the delete rides the root's stream");
+    let through = body.through_incarnation.expect("the delete is bounded");
+    // Every facet stream of the root, the deleted ones included.
+    let streams: std::collections::BTreeSet<&StreamId> = records
+        .iter()
+        .map(|r| &r.envelope.stream)
+        .filter(|s| s.facet.is_some() && s.cell == root.cell)
+        .collect();
+    assert_eq!(streams.len(), 4, "two facets, twice: {streams:#?}");
+    let child = body.facet.as_deref().unwrap();
+    let kept = facet_states(&records);
+    for stream in &streams {
+        let path = stream.facet.as_deref().unwrap();
+        assert!(
+            path == child || path.starts_with(&format!("{child}/")),
+            "{path} is at or under {child}"
+        );
+        assert_eq!((&stream.class, &stream.script), (&root.class, &root.script));
+        // Created before the delete: removed. After: kept.
+        assert_eq!(
+            kept.contains_key(*stream),
+            stream.incarnation > through,
+            "{stream:?} against the bound {through}"
+        );
+        // Each stream opens with its link, ahead of every record.
+        let links = facet_links(&records, stream);
+        let first = records
+            .iter()
+            .filter(|r| r.envelope.stream == **stream)
+            .map(|r| r.envelope.position)
+            .min();
+        assert!(!links.is_empty(), "{stream:?} has a link");
+        assert_eq!(first, Some(links[0].envelope.position), "{stream:?}");
+        let Body::Link(link) = &links[0].body else {
+            unreachable!()
+        };
+        assert_eq!(link.mode, LinkMode::Fresh, "{stream:?}");
+    }
+    kept.keys()
+        .map(|stream| {
+            let links = facet_links(&records, stream);
+            (stream.clone(), links[0].envelope.position.epoch)
+        })
+        .collect()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -318,11 +515,23 @@ async fn exported_rows_match_the_restored_cell() {
         "cell=b&op=put&id=2&name=kiwi&qty=0.5",
         "cell=b&op=delete&id=1",
         "cell=b&op=alarm",
+        // A facet and a nested facet, deleted and recreated.
+        "cell=c&op=put&id=1&name=root&qty=1",
+        "cell=c&op=facet&path=child&id=1&name=old-child",
+        "cell=c&op=facet&path=child/nested&id=1&name=old-nested",
+        "cell=c&op=facet&path=child&id=2&name=old-child-2",
+        "cell=c&op=fdelete",
+        "cell=c&op=facet&path=child&id=3&name=new-child",
+        "cell=c&op=facet&path=child/nested&id=4&name=new-nested",
     ] {
         dev.call(&client, query).await;
     }
     let live_a = dev.call(&client, "cell=a&op=list").await;
     let live_b = dev.call(&client, "cell=b&op=list").await;
+    let live_facets = [
+        dev.call(&client, "cell=c&op=flist&path=child").await,
+        dev.call(&client, "cell=c&op=flist&path=child/nested").await,
+    ];
     let log = dev.log_text();
     // The cell ids, from the node's activation log.
     let cells: Vec<String> = log
@@ -397,6 +606,7 @@ async fn exported_rows_match_the_restored_cell() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    let facet_epochs = assert_facets_deleted_and_recreated(&dev, &live_facets).await;
     drop(dev);
     let first_epochs: Vec<(String, u64)> = [("a", &live_a), ("b", &live_b)]
         .iter()
@@ -506,5 +716,35 @@ async fn exported_rows_match_the_restored_cell() {
             dev.log_text()
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // The recreated facets reopen after the restart: each stream links back
+    // to its first residency, with the same incarnation and no gap.
+    dev.call(
+        &client,
+        "cell=c&op=facet&path=child&id=5&name=after-restart",
+    )
+    .await;
+    dev.call(
+        &client,
+        "cell=c&op=facet&path=child/nested&id=6&name=after-restart",
+    )
+    .await;
+    let live_facets = [
+        dev.call(&client, "cell=c&op=flist&path=child").await,
+        dev.call(&client, "cell=c&op=flist&path=child/nested").await,
+    ];
+    let records = settled_facets(&dev, &live_facets).await;
+    for (stream, first) in &facet_epochs {
+        let links = facet_links(&records, stream);
+        let [_, link] = &links[..] else {
+            panic!("two links for {stream:?}: {links:#?}");
+        };
+        let Body::Link(body) = &link.body else {
+            unreachable!()
+        };
+        assert!(link.envelope.position.epoch > *first, "{link:#?}");
+        assert_ne!(body.mode, LinkMode::Fresh, "{link:#?}");
+        assert_eq!(body.prev_epoch, Some(*first), "{link:#?}");
+        assert!(body.prev_txid.is_some(), "{link:#?}");
     }
 }

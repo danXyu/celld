@@ -40,12 +40,21 @@
 //! `deleted` record passes the same authority check as the root's commits
 //! and no commit that arrived after it goes out first ([`Sequencer`]).
 //!
+//! **Facets.** A facet of an exported root is exported on a stream of its
+//! own: its database, connection, and LTX stream are its own, so its commits
+//! are captured, attributed against its own captures, and released like a
+//! root's. The stream is keyed by the facet's stream name
+//! (`engine_api::facet_cell`) and names the root's class and cell, the
+//! [`facet_path`] below the root, and the incarnation `crate::facet_streams`
+//! stamped in the facet's `_cf_METADATA`. A facet has no gate residency of
+//! its own, so its ticket is relayed ([`Exporter::relay`]): the facet's
+//! stream is proven durable first, then the root's ticket, at position 0,
+//! checks the node's authority and the root's residency the same way a
+//! root's ticket does, and the facet's stream releases up to the TXID its
+//! own proof covered.
+//!
 //! Scope of this first wiring:
 //!
-//! - root cells only. A facet's stream has its own replication and no gate
-//!   residency of its own, so facets are not exported yet; their `deleted`
-//!   records are, on the root's stream, naming the facet by
-//!   [`facet_path`];
 //! - the shared queue budget is applied to the pending lists. The sink's
 //!   buffer counts against it but is bounded by its own early flush, so the
 //!   pending commits are what is shed;
@@ -102,7 +111,8 @@ pub fn installed() -> Option<&'static Arc<Exporter>> {
 }
 
 /// What the stream asks of the output gate. The actor feeds it to the core
-/// as [`celld_logic::Event::ExportTicket`].
+/// as [`celld_logic::Event::ExportTicket`]. A facet's stream asks in its
+/// root's name (see [`Exporter::relay`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TicketAsk {
     pub cell: String,
@@ -143,6 +153,35 @@ enum Input {
         body: DeletedBody,
         at_ms: i64,
     },
+}
+
+/// Tickets at or above this bit are relayed for a facet's stream; a stream's
+/// own tickets count up from 1.
+const RELAY_TICKET: u64 = 1 << 63;
+
+/// The root cell of a stream name, and the facet path below it for a facet.
+pub(crate) fn stream_root(cell: &str) -> (&str, Option<&str>) {
+    match cell.find("/facets/") {
+        Some(at) => {
+            let root = &cell[..at];
+            (root, facet_path(root, cell))
+        }
+        None => (cell, None),
+    }
+}
+
+/// The class of a stream name: its root's, which a facet follows.
+fn stream_class(cell: &str) -> &str {
+    let (root, _) = stream_root(cell);
+    root.split_once(':').map_or(root, |(class, _)| class)
+}
+
+/// A facet ticket the root's gate is settling.
+struct Relay {
+    facet: String,
+    ticket: u64,
+    /// What the facet's own proof covered.
+    txid: u64,
 }
 
 /// The `facet` of a facet stream's records and of the `deleted` records
@@ -251,6 +290,13 @@ pub struct Exporter {
     /// Wakes the delivery task when an advance is registered.
     wake: mpsc::UnboundedSender<Outcome>,
     counters: Counters,
+    /// Proves facet streams durable; installed by the cell runtime.
+    replication: OnceLock<crate::ltx_replication::Replication>,
+    /// Facet tickets waiting on their root's gate, by relayed ticket.
+    relays: Mutex<HashMap<u64, Relay>>,
+    next_relay: AtomicU64,
+    /// Every stream's tickets, below [`RELAY_TICKET`].
+    next_ticket: AtomicU64,
 }
 
 impl Exporter {
@@ -294,6 +340,10 @@ impl Exporter {
             advances: Mutex::new(BTreeMap::new()),
             wake,
             counters: Counters::default(),
+            replication: OnceLock::new(),
+            relays: Mutex::new(HashMap::new()),
+            next_relay: AtomicU64::new(RELAY_TICKET),
+            next_ticket: AtomicU64::new(1),
         });
         EXPORTER
             .set(exporter.clone())
@@ -309,13 +359,16 @@ impl Exporter {
         }
     }
 
-    /// Whether `cell` is exported: a root cell of an exported class.
+    /// Whether `cell` is exported: a root cell of an exported class, or a
+    /// facet of one.
     pub(crate) fn exports(&self, cell: &str) -> bool {
-        if cell.contains("/facets/") {
-            return false;
-        }
-        let class = cell.split_once(':').map_or(cell, |(class, _)| class);
-        self.config.exports_class(class)
+        self.config.exports_class(stream_class(cell))
+    }
+
+    /// The node's replication, which proves facet streams. The first cell
+    /// runtime installs it; every runtime of the node shares one.
+    pub(crate) fn set_replication(&self, replication: crate::ltx_replication::Replication) {
+        let _ = self.replication.set(replication);
     }
 
     /// Open the stream of one residency when its replica opens, and return
@@ -363,7 +416,7 @@ impl Exporter {
             .unwrap_or_else(|e| e.into_inner())
             .get(&(scope.to_string(), epoch))
             .and_then(mpsc::WeakUnboundedSender::upgrade)?;
-        let class = scope.split_once(':').map_or(scope, |(class, _)| class);
+        let class = stream_class(scope);
         let denied = self
             .config
             .denied_tables
@@ -374,7 +427,8 @@ impl Exporter {
         Some(CellStream { tx, denied })
     }
 
-    /// The actor's verdict on a ticket.
+    /// The actor's verdict on a ticket. A relayed ticket's verdict goes to
+    /// its facet's stream, with the TXID the facet's proof covered.
     pub(crate) fn proven(
         &self,
         cell: &str,
@@ -382,6 +436,22 @@ impl Exporter {
         ticket: u64,
         result: Result<u64, RequestError>,
     ) {
+        if ticket >= RELAY_TICKET {
+            let relay = self
+                .relays
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&ticket);
+            if let Some(relay) = relay {
+                self.proven(
+                    &relay.facet,
+                    epoch,
+                    relay.ticket,
+                    result.map(|_| relay.txid),
+                );
+            }
+            return;
+        }
         let tx = self
             .streams
             .lock()
@@ -393,6 +463,66 @@ impl Exporter {
         }
     }
 
+    /// Ask for a facet stream's ticket. The facet's stream is proven durable
+    /// and its TXID read first, as the actor reads a root's once its proof
+    /// lands; then the root's gate takes a ticket at position 0, which
+    /// checks the node's authority and the root's residency at `epoch` (a
+    /// facet has neither ownership nor a fence of its own) after that proof.
+    /// A failed proof fails the ticket, which the stream retries.
+    fn relay(self: &Arc<Self>, ask: TicketAsk) {
+        let exporter = self.clone();
+        crate::asyncrt::spawn(async move {
+            let TicketAsk {
+                cell: facet,
+                epoch,
+                ticket,
+                ..
+            } = ask;
+            let (root, _) = stream_root(&facet);
+            let root = root.to_string();
+            let proof =
+                match exporter.replication.get() {
+                    Some(replication) => replication
+                        .await_durable(&facet, epoch, 0)
+                        .await
+                        .and_then(|_| {
+                            replication
+                                .export_proven_txid(&facet, epoch)
+                                .ok_or_else(|| anyhow::anyhow!("the facet's stream is gone"))
+                        }),
+                    // No replication proves nothing, as for a root cell.
+                    None => Ok(0),
+                };
+            let txid = match proof {
+                Ok(txid) => txid,
+                Err(error) => {
+                    tracing::debug!(%facet, epoch, %error, "export: facet proof failed; retrying");
+                    exporter.proven(&facet, epoch, ticket, Err(RequestError::DurabilityUnproven));
+                    return;
+                }
+            };
+            let relayed = exporter.next_relay.fetch_add(1, Ordering::Relaxed);
+            exporter
+                .relays
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(
+                    relayed,
+                    Relay {
+                        facet,
+                        ticket,
+                        txid,
+                    },
+                );
+            (exporter.ask)(TicketAsk {
+                cell: root,
+                epoch,
+                position: 0,
+                ticket: relayed,
+            });
+        });
+    }
+
     /// A facet delete that succeeded, for the root's stream at `epoch`.
     /// Nothing is recorded when the root is not exported or its stream is
     /// gone; the reconciler reports a consumer stream with no bucket prefix.
@@ -401,12 +531,18 @@ impl Exporter {
             tracing::warn!(root, stream = %deleted.stream, "export: a facet delete names no facet of its root");
             return;
         };
-        let tx = self
-            .streams
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&(root.to_string(), epoch))
-            .and_then(mpsc::WeakUnboundedSender::upgrade);
+        let tx = {
+            let mut streams = self.streams.lock().unwrap_or_else(|e| e.into_inner());
+            // The deleted facets' streams end with their residencies; a facet
+            // recreated in this epoch opens a stream of its own.
+            let below = format!("{}/", deleted.stream);
+            streams.retain(|(cell, at), _| {
+                *at != epoch || (*cell != deleted.stream && !cell.starts_with(&below))
+            });
+            streams
+                .get(&(root.to_string(), epoch))
+                .and_then(mpsc::WeakUnboundedSender::upgrade)
+        };
         let Some(tx) = tx else {
             return;
         };
@@ -546,6 +682,7 @@ struct Stream {
     last_txid: u64,
     /// The newest position this stream has submitted or advanced to.
     last_position: Position,
+    /// No ticket this stream asks for later is below this.
     next_ticket: u64,
     /// The ticket in flight and the position it asked for.
     outstanding: Option<(u64, u64)>,
@@ -681,15 +818,13 @@ impl Stream {
         this: mpsc::WeakUnboundedSender<Input>,
     ) -> Self {
         let (cell, _) = &key;
-        let class = cell
-            .split_once(':')
-            .map_or(cell.as_str(), |(class, _)| class);
+        let (root, facet) = stream_root(cell);
         let epoch = key.1;
         let identity = StreamId {
             script: String::new(),
-            class: class.to_string(),
-            cell: cell.clone(),
-            facet: None,
+            class: stream_class(cell).to_string(),
+            cell: root.to_string(),
+            facet: facet.map(str::to_string),
             incarnation: 0,
         };
         Stream {
@@ -897,16 +1032,24 @@ impl Stream {
     }
 
     fn ask(&mut self, position: u64) {
-        let ticket = self.next_ticket;
-        self.next_ticket += 1;
+        // Tickets are unique across the node's streams, so a verdict for a
+        // stream that ended (a deleted facet) cannot settle the ticket of
+        // the stream that replaced it under the same key.
+        let ticket = self.exporter.next_ticket.fetch_add(1, Ordering::Relaxed);
+        self.next_ticket = ticket + 1;
         self.outstanding = Some((ticket, position));
         self.keepalive = self.this.upgrade();
-        (self.exporter.ask)(TicketAsk {
+        let ask = TicketAsk {
             cell: self.key.0.clone(),
             epoch: self.key.1,
             position,
             ticket,
-        });
+        };
+        if self.identity.facet.is_some() {
+            self.exporter.relay(ask);
+        } else {
+            (self.exporter.ask)(ask);
+        }
     }
 
     /// Hold the pending list and the sink's buffer under the shared budget.
@@ -1160,10 +1303,19 @@ struct Delivered {
     frozen: bool,
 }
 
+/// A stream as delivery tracks it: the residency and its incarnation. A
+/// facet deleted and recreated in one epoch has the same residency key and
+/// a new incarnation, and its positions start over.
+type DeliveryKey = (String, u64, u64);
+
+fn delivery_key(meta: &Submitted) -> DeliveryKey {
+    (meta.key.0.clone(), meta.key.1, meta.stream.incarnation)
+}
+
 /// Read the sink's results, advance delivered positions, and submit
 /// watermarks and gaps.
 async fn deliver(exporter: Arc<Exporter>, mut outcomes: mpsc::UnboundedReceiver<Outcome>) {
-    let mut streams: BTreeMap<(String, u64), Delivered> = BTreeMap::new();
+    let mut streams: BTreeMap<DeliveryKey, Delivered> = BTreeMap::new();
     while let Some(outcome) = outcomes.recv().await {
         let mut follow_up: Vec<(Record, Submitted)> = Vec::new();
         for (seq, result) in outcome.results {
@@ -1175,7 +1327,7 @@ async fn deliver(exporter: Arc<Exporter>, mut outcomes: mpsc::UnboundedReceiver<
             else {
                 continue;
             };
-            let state = streams.entry(meta.key.clone()).or_default();
+            let state = streams.entry(delivery_key(&meta)).or_default();
             state.stream = Some((meta.stream.clone(), meta.cell_name.clone()));
             if state.frozen {
                 continue;
@@ -1260,7 +1412,7 @@ async fn deliver(exporter: Arc<Exporter>, mut outcomes: mpsc::UnboundedReceiver<
                     body: Body::Watermark(body),
                 },
                 Submitted {
-                    key: key.clone(),
+                    key: (key.0.clone(), key.1),
                     stream,
                     cell_name,
                     position: through,
@@ -1276,7 +1428,7 @@ async fn deliver(exporter: Arc<Exporter>, mut outcomes: mpsc::UnboundedReceiver<
 }
 
 /// Apply the advances that nothing submitted before them still holds up.
-fn resolve_advances(exporter: &Exporter, streams: &mut BTreeMap<(String, u64), Delivered>) {
+fn resolve_advances(exporter: &Exporter, streams: &mut BTreeMap<DeliveryKey, Delivered>) {
     let ready = {
         let submitted = exporter.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let mut advances = exporter.advances.lock().unwrap_or_else(|e| e.into_inner());
@@ -1289,7 +1441,7 @@ fn resolve_advances(exporter: &Exporter, streams: &mut BTreeMap<(String, u64), D
         }
     };
     for meta in ready.into_values() {
-        let state = streams.entry(meta.key).or_default();
+        let state = streams.entry(delivery_key(&meta)).or_default();
         state.stream = Some((meta.stream, meta.cell_name));
         if !state.frozen && state.position.is_none_or(|at| at < meta.position) {
             state.position = Some(meta.position);
@@ -1421,6 +1573,19 @@ mod tests {
         assert!(seq.take(vec![], true).is_empty());
         seq.proven(1);
         assert_eq!(order(seq.take(vec![], true)), ["D1", "D2"]);
+    }
+
+    #[test]
+    fn a_facet_stream_names_its_root_and_path() {
+        let names = |path: &[&str]| path.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        let root = "Room:1";
+        let nested = crate::engine_api::facet_cell(root, &names(&["a", "b"]));
+        let (cell, path) = stream_root(&nested);
+        assert_eq!(cell, root);
+        assert_eq!(path, facet_path(root, &nested));
+        assert_eq!(stream_class(&nested), "Room");
+        assert_eq!(stream_root(root), (root, None));
+        assert_eq!(stream_class(root), "Room");
     }
 
     #[test]

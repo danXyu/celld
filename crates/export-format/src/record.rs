@@ -7,7 +7,7 @@ use crate::value::Value;
 
 /// Which state a record belongs to. For a root cell `facet` is `None` and
 /// `incarnation` is the cell's first epoch; for a facet it is the root's
-/// scope, the facet path, and the random incarnation stamped in the facet's
+/// scope, the facet path, and the ordered incarnation stamped in the facet's
 /// `_cf_METADATA` when it was first created.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct StreamId {

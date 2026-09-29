@@ -134,6 +134,41 @@ fn a_facet_deleted_from_the_root_removes_that_incarnation_and_its_subtree() {
 }
 
 #[test]
+fn a_bounded_facet_delete_keeps_facets_recreated_after_it() {
+    let old = facet("facets/a", 11);
+    let old_nested = facet("facets/a/facets/b", 12);
+    let new = facet("facets/a", 21);
+    let new_nested = facet("facets/a/facets/b", 22);
+    let sibling = facet("facets/ab", 5);
+    let body = || {
+        Body::Rows(RowsBody {
+            data: table_rows("t", 1, vec![put(1, "x")]),
+        })
+    };
+    let mut c = Consumer::new();
+    for s in [&old, &old_nested, &new, &new_nested, &sibling] {
+        c.ingest(record(s, pos(1, 1), Origin::Live, body()))
+            .unwrap();
+    }
+    c.ingest(live(
+        pos(9, 9),
+        Body::Deleted(DeletedBody {
+            facet: Some("facets/a".into()),
+            incarnation: None,
+            subtree: true,
+            through_incarnation: Some(20),
+        }),
+    ))
+    .unwrap();
+    let state = c.state();
+    assert!(!state.contains_key(&old));
+    assert!(!state.contains_key(&old_nested));
+    assert!(state.contains_key(&new));
+    assert!(state.contains_key(&new_nested));
+    assert!(state.contains_key(&sibling));
+}
+
+#[test]
 fn closed_generations_have_no_rows() {
     let dropped = SchemaBody {
         dropped: true,
