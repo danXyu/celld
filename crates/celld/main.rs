@@ -3515,6 +3515,8 @@ fn main() -> anyhow::Result<()> {
     // Parse the telemetry group once, before any command or runtime work.
     // Its specialized values share the strict scalar parsers in env_vars.
     let telemetry_config = celld::telemetry::Config::from_env()?;
+    // Change export, likewise: `None` unless CELLD_EXPORT=1.
+    let export_config = celld::export::Config::from_env()?;
     rustls::crypto::ring::default_provider()
         .install_default()
         .ok();
@@ -3526,10 +3528,15 @@ fn main() -> anyhow::Result<()> {
     if let Some(workers) = celld::env_vars::positive::<usize>("CELLD_TOKIO_THREADS")? {
         builder.worker_threads(workers);
     }
-    builder.build()?.block_on(async_main(telemetry_config))
+    builder
+        .build()?
+        .block_on(async_main(telemetry_config, export_config))
 }
 
-async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyhow::Result<()> {
+async fn async_main(
+    telemetry_config: Option<celld::telemetry::Config>,
+    export_config: Option<celld::export::Config>,
+) -> anyhow::Result<()> {
     #[cfg(all(test, celld_internal_tests))]
     let shutdown_accept_failure_test_active =
         std::env::var_os("CELLD_DRAIN_ACCEPT_FAILURE_CHILD").is_some();
@@ -4197,6 +4204,20 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             celld::telemetry::SinkChoice::Otlp { .. } => None,
         };
         celld::telemetry::init(config, sink_bucket, node.clone(), settings.region.clone())?;
+    }
+    // With export off nothing below is constructed. The exporter itself
+    // starts here once its sinks exist; until then an enabled node only
+    // refuses a configuration it could never serve.
+    if let Some(config) = &export_config {
+        // Like telemetry, CELLD_EXPORT_BUCKET borrows the fleet bucket's
+        // endpoint and credentials, so it needs a fleet bucket too.
+        if config.sinks.bucket && settings.bucket.is_none() {
+            anyhow::bail!(
+                "CELLD_EXPORT=1 with the bucket sink but this node has no \
+                 bucket (CELLD_BUCKET); choose CELLD_EXPORT_SINK=blob-stream \
+                 for a node without one"
+            );
+        }
     }
     let peer_auth = Arc::new(PeerAuth::new(peer_key, node.clone())?);
     // Connect-only timeout: a peer request may legitimately run through a
