@@ -6,6 +6,17 @@ rust-version = "1.94.1"
 license = "Apache-2.0"
 
 
+[features]
+# The blob-stream sink for change export. Off by default: it pulls in the
+# bitdrift client crates and a patched protobuf that a default build does not
+# carry. Without it, `CELLD_EXPORT_SINK=blob-stream` refuses to start.
+export-blob-stream = [
+    "dep:bd-server-stats",
+    "dep:blob-stream-producer",
+    "dep:blob-stream-proto",
+    "dep:blob-stream-types",
+]
+
 [lib]
 path = "lib.rs"
 
@@ -31,6 +42,10 @@ anyhow.workspace = true
 axum.workspace = true
 base64.workspace = true
 bytes.workspace = true
+bd-server-stats = { workspace = true, optional = true }
+blob-stream-producer = { workspace = true, optional = true }
+blob-stream-proto = { workspace = true, optional = true }
+blob-stream-types = { workspace = true, optional = true }
 celld-export-format.workspace = true
 celld-logic.workspace = true
 celld-ltx = { workspace = true, features = ["s3"] }

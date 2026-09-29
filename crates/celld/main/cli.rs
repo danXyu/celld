@@ -339,6 +339,7 @@ ENVIRONMENT:
   CELLD_TRUST_FORWARDED_HEADERS   `1` trusts X-Forwarded-Host and
                                   X-Forwarded-Proto
   CELLD_NODE                      Node-session ID (default: generated)
+  CELLD_ZONE                      The node's availability zone
   CELLD_WATCH                     Local SQLite/replication working directory
   CELLD_ESBUILD                   Override esbuild executable path
   CELLD_ACTIVATIONS               Concurrent cold activations
