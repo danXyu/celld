@@ -1,0 +1,50 @@
+---
+// Brand lockup shared with celld-tck: four-square mark, "celld / fork".
+const { siteTitleHref } = Astro.locals.starlightRoute;
+---
+
+<a href={siteTitleHref} class="brand" aria-label="celld fork home">
+	<span class="mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+	<span translate="no">celld<span class="brand-divider">/</span><span class="muted">fork</span></span>
+</a>
+
+<style>
+	.brand {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		font-size: 21px;
+		font-weight: 650;
+		letter-spacing: -0.8px;
+		color: var(--sl-color-white);
+		text-decoration: none;
+		white-space: nowrap;
+	}
+	.brand:hover {
+		text-decoration: none;
+	}
+	.brand-divider {
+		font-weight: 300;
+		color: var(--brand-divider);
+		padding: 0 2px;
+	}
+	.muted {
+		color: var(--sl-color-gray-3);
+		font-weight: 550;
+	}
+	.mark {
+		display: grid;
+		grid-template-columns: repeat(2, 8px);
+		grid-template-rows: repeat(2, 8px);
+		gap: 3px;
+		margin-right: 4px;
+		transform: rotate(-5deg);
+	}
+	.mark i {
+		background: var(--green);
+		border-radius: 2px;
+	}
+	.mark i:last-child {
+		opacity: 0.35;
+	}
+</style>

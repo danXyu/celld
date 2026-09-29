@@ -2,7 +2,13 @@
 
 use super::*;
 
-use celld_export_format::{Body, Consumer, Envelope, Origin, Position, Record, RowsBody, StreamId};
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+
+use celld_export_format::{
+    Body, BulkBody, Consumer, Envelope, Origin, Position, Record, RowsBody, SnapshotBody,
+    SnapshotEndBody, SnapshotScope, StreamId,
+};
 use proptest::prelude::*;
 
 const SCOPE: &str = "cell-a";
@@ -17,6 +23,9 @@ struct Fixture {
     connection: Connection,
     capture: Capture,
     queue: DirtyList,
+    /// `DROP TABLE`s and `ALTER TABLE`s the authorizer saw, as `storage`
+    /// collects them.
+    drops: Arc<Mutex<Vec<String>>>,
 }
 
 impl Fixture {
@@ -27,6 +36,22 @@ impl Fixture {
     fn with_settings(schema: &str, settings: Settings) -> Self {
         let connection = Connection::open_in_memory().unwrap();
         connection.execute_batch(schema).unwrap();
+        Self::install(connection, settings)
+    }
+
+    /// Capture on `connection`, as a cell open does.
+    fn install(connection: Connection, settings: Settings) -> Self {
+        let drops = Arc::new(Mutex::new(Vec::new()));
+        let seen = drops.clone();
+        connection.authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
+            use rusqlite::hooks::AuthAction;
+            if let AuthAction::DropTable { table_name }
+            | AuthAction::AlterTable { table_name, .. } = context.action
+            {
+                seen.lock().unwrap().push(table_name.to_string());
+            }
+            rusqlite::hooks::Authorization::Allow
+        }));
         let queue = DirtyList::default();
         let capture = Capture::install(
             &connection,
@@ -40,7 +65,20 @@ impl Fixture {
             connection,
             capture,
             queue,
+            drops,
         }
+    }
+
+    /// Drop the capture and install a new one on the same connection: the
+    /// cell's next residency.
+    fn reinstall(self) -> Self {
+        let Self {
+            connection,
+            capture,
+            ..
+        } = self;
+        drop(capture);
+        Self::install(connection, settings())
     }
 
     fn run(&self, sql: &str) {
@@ -48,6 +86,8 @@ impl Fixture {
     }
 
     fn checkpoint(&mut self) -> Checkpoint {
+        let drops = std::mem::take(&mut *self.drops.lock().unwrap());
+        self.capture.hint_dropped(&drops);
         self.capture.checkpoint(&self.connection, 1_790_000_000_000)
     }
 
@@ -344,7 +384,7 @@ fn an_open_read_cursor_does_not_block_the_pull() {
 }
 
 #[test]
-fn excluded_tables_are_neither_captured_nor_marked_dirty() {
+fn excluded_tables_are_not_captured() {
     let mut f = Fixture::new(
         "CREATE TABLE _cf_METADATA (scope TEXT PRIMARY KEY, actor_name TEXT);
          CREATE TABLE _litestream_seq (id INTEGER PRIMARY KEY, seq INTEGER);
@@ -358,7 +398,10 @@ fn excluded_tables_are_neither_captured_nor_marked_dirty() {
          INSERT INTO __queue_messages VALUES (1, x'00');
          INSERT INTO __kv_meta VALUES ('k', 'v');",
     );
-    assert!(f.queued().is_empty());
+    // Every commit is visited, since only a visit sees schema changes, and
+    // the visit finds nothing to export.
+    assert_eq!(f.queued(), [SCOPE]);
+    assert_eq!(f.checkpoint(), Checkpoint::Clean);
     assert!(!f.capture.needs_visit());
     // AUTOINCREMENT writes `sqlite_sequence` beside the row.
     f.run("INSERT INTO counters(n) VALUES (1);");
@@ -625,6 +668,104 @@ fn the_consumer_holds_the_decoded_kv_state() {
     );
 }
 
+/// The key-value tables are described in the shape they are exported in:
+/// `_cf_KV` as `kv (key, value)`, and `__kv` with its `blob_key` when its
+/// rows carry one.
+#[test]
+fn key_value_tables_are_described_as_exported() {
+    let mut f = Fixture::new(&format!("{KV_SCHEMA} {NAMESPACE_SCHEMA}"));
+    put(&f, SCOPE, "key", &v8("1"));
+    f.run("INSERT INTO __kv VALUES ('a', x'00', NULL, 1, 'bytes', NULL, NULL);");
+    let commit = f.pull();
+    // One description of `kv`, under its exported name.
+    let names: Vec<_> = commit.schemas.iter().map(|s| s.table.as_str()).collect();
+    assert_eq!(names, ["kv", "__kv"]);
+    let kv = schema(&commit, "kv");
+    assert_eq!(kv.generation, 1);
+    let columns: Vec<_> = kv
+        .columns
+        .iter()
+        .map(|c| (c.name.as_str(), c.decl_type.as_str(), c.pk))
+        .collect();
+    assert_eq!(columns, [("key", "TEXT", 1), ("value", "", 0)]);
+    let namespace: Vec<_> = schema(&commit, "__kv")
+        .columns
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
+    assert_eq!(
+        namespace,
+        [
+            "name",
+            "value",
+            "blob_id",
+            "size",
+            "tag",
+            "metadata",
+            "expires_at",
+            "blob_key"
+        ]
+    );
+    assert_eq!(table(&commit, "__kv").columns, namespace);
+
+    // deleteAll drops and recreates `_cf_KV`: the new generation is
+    // snapshotted as `kv`, holding only the cell's rows.
+    f.run(&format!(
+        "DROP TABLE _cf_KV; {KV_SCHEMA}
+         INSERT INTO _cf_KV VALUES ('another', 'x', 'true');"
+    ));
+    put(&f, SCOPE, "after", &v8("2"));
+    let commit = f.pull();
+    let kv: Vec<_> = commit
+        .schemas
+        .iter()
+        .map(|s| (s.table.as_str(), s.generation))
+        .collect();
+    assert_eq!(kv, [("kv", 2)]);
+    let snapshot = snapshotted(&commit, "kv");
+    assert_eq!(snapshot.generation, 2);
+    assert_eq!(snapshot.columns, ["key", "value"]);
+    assert_eq!(snapshot.rows, [kv_row(Op::Insert, "after", text("2"))]);
+    assert!(
+        commit.tables.is_empty() && commit.bulk.is_empty(),
+        "{commit:?}"
+    );
+
+    // Recreated with none of the cell's rows, the snapshot still covers it.
+    f.run(&format!(
+        "DROP TABLE _cf_KV; {KV_SCHEMA}
+         INSERT INTO _cf_KV VALUES ('another', 'x', 'true');"
+    ));
+    let commit = f.pull();
+    let snapshot = snapshotted(&commit, "kv");
+    assert_eq!((snapshot.generation, snapshot.rows.len()), (3, 0));
+    let covered: Vec<_> = commit
+        .snapshot
+        .iter()
+        .flat_map(|s| &s.tables)
+        .map(|t| t.table.as_str())
+        .collect();
+    assert_eq!(covered, ["kv"]);
+}
+
+/// A namespace table from the first release, without `blob_id`, is exported
+/// with its own columns only, and described so.
+#[test]
+fn a_namespace_table_without_blob_ids_gains_no_blob_key() {
+    let mut f = Fixture::new(
+        "CREATE TABLE __kv (key TEXT PRIMARY KEY, value BLOB, metadata TEXT, expiration INTEGER);",
+    );
+    f.run("INSERT INTO __kv VALUES ('a', x'00', NULL, NULL);");
+    let commit = f.pull();
+    let described: Vec<_> = schema(&commit, "__kv")
+        .columns
+        .iter()
+        .map(|c| c.name.clone())
+        .collect();
+    assert_eq!(described, ["key", "value", "metadata", "expiration"]);
+    assert_eq!(table(&commit, "__kv").columns, described);
+}
+
 #[test]
 fn virtual_tables_and_their_shadow_tables_are_excluded() {
     let mut f = Fixture::new(
@@ -641,12 +782,18 @@ fn virtual_tables_and_their_shadow_tables_are_excluded() {
             .collect::<Vec<_>>(),
         ["notes"]
     );
-    // Created mid-session: its shadow writes are filtered at the pull.
+    // Created mid-session: its shadow writes are filtered at the pull, and a
+    // schema record names it unsupported.
     f.run(
         "CREATE VIRTUAL TABLE later USING fts5(body);
          INSERT INTO later VALUES ('x');",
     );
-    assert_eq!(f.checkpoint(), Checkpoint::Clean);
+    let commit = f.pull();
+    assert!(commit.tables.is_empty() && commit.bulk.is_empty() && commit.snapshot.is_none());
+    assert_eq!(commit.schemas.len(), 1, "{commit:?}");
+    let later = &commit.schemas[0];
+    assert!(later.unsupported && later.table == "later" && later.generation == 1);
+    assert_eq!(later.columns.len(), 1);
 }
 
 /// A table with a generated column fails a session's whole changeset with
@@ -741,18 +888,158 @@ fn a_transaction_over_budget_becomes_bulk_for_every_exported_table() {
     assert_eq!(table(&commit, "plain").rows.len(), 1);
 }
 
+fn schema<'a>(commit: &'a CapturedCommit, name: &str) -> &'a SchemaBody {
+    commit
+        .schemas
+        .iter()
+        .find(|s| s.table == name)
+        .unwrap_or_else(|| panic!("no schema for {name} in {commit:?}"))
+}
+
+fn snapshotted<'a>(commit: &'a CapturedCommit, name: &str) -> &'a TableRows {
+    commit
+        .snapshot
+        .as_ref()
+        .and_then(|s| s.tables.iter().find(|t| t.table == name))
+        .unwrap_or_else(|| panic!("no snapshot of {name} in {commit:?}"))
+}
+
+fn stored(f: &Fixture) -> Vec<(String, i64, Option<String>)> {
+    let mut statement = f
+        .connection
+        .prepare(
+            "SELECT name, generation, schema_sql FROM _cf_EXPORT
+             WHERE name != 'sqlite_schema' ORDER BY name",
+        )
+        .unwrap();
+    statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+/// A cell's first capture starts every table at generation one without a
+/// record, stores the generations, and describes each generation once, with
+/// its first rows.
 #[test]
-fn an_added_column_is_carried() {
+fn first_rows_of_a_generation_carry_its_definition() {
+    let mut f = Fixture::new(SHAPES);
+    assert_eq!(f.checkpoint(), Checkpoint::Clean);
+    assert_eq!(
+        stored(&f)
+            .into_iter()
+            .map(|(name, generation, _)| (name, generation))
+            .collect::<Vec<_>>(),
+        [
+            ("keyed".to_string(), 1),
+            ("norowid".to_string(), 1),
+            ("plain".to_string(), 1)
+        ]
+    );
+    f.run("INSERT INTO keyed VALUES ('a', 1);");
+    let commit = f.pull();
+    let keyed = schema(&commit, "keyed");
+    assert_eq!(keyed.generation, 1);
+    assert_eq!(
+        keyed.sql,
+        "CREATE TABLE keyed (id TEXT PRIMARY KEY, v INTEGER)"
+    );
+    assert_eq!(
+        keyed.columns,
+        [
+            ColumnDef {
+                name: "id".into(),
+                decl_type: "TEXT".into(),
+                pk: 1,
+                not_null: false,
+                generated: false,
+            },
+            ColumnDef {
+                name: "v".into(),
+                decl_type: "INTEGER".into(),
+                pk: 0,
+                not_null: false,
+                generated: false,
+            }
+        ]
+    );
+    assert_eq!(commit.schemas.len(), 1);
+    f.run("INSERT INTO keyed VALUES ('b', 2);");
+    assert!(f.pull().schemas.is_empty());
+}
+
+/// A create opens generation one with a schema record and a snapshot of
+/// what the table holds at the commit; later commits carry its rows.
+#[test]
+fn a_created_table_opens_its_first_generation() {
     let mut f = Fixture::new(SHAPES);
     f.run(
-        "INSERT INTO plain VALUES (1, 'x');
+        "INSERT INTO keyed VALUES ('a', 1);
+         CREATE TABLE fresh (id INTEGER PRIMARY KEY, v TEXT);
+         INSERT INTO fresh VALUES (1, 'a');",
+    );
+    let commit = f.pull();
+    let fresh = schema(&commit, "fresh");
+    assert_eq!((fresh.generation, fresh.dropped), (1, false));
+    assert_eq!(fresh.renamed_from, None);
+    assert_eq!(
+        snapshotted(&commit, "fresh").rows,
+        [RowChange(Op::Insert, vec![int(1)], vec![int(1), text("a")])]
+    );
+    assert_eq!(commit.tables.len(), 1);
+    assert_eq!(table(&commit, "keyed").rows.len(), 1);
+    // A create alone, with no rows, is reported with an empty snapshot.
+    f.run("CREATE TABLE empty (id INTEGER PRIMARY KEY);");
+    let commit = f.pull();
+    assert_eq!(schema(&commit, "empty").generation, 1);
+    assert!(snapshotted(&commit, "empty").rows.is_empty());
+    assert!(commit.tables.is_empty());
+    f.run("INSERT INTO fresh VALUES (2, 'b');");
+    assert_eq!(table(&f.pull(), "fresh").rows.len(), 1);
+}
+
+/// A table created, written and renamed between two pulls: the session
+/// tracked its rows under the first name, which never reached the schema.
+#[test]
+fn a_table_created_and_renamed_in_one_interval_keeps_its_rows() {
+    let mut f = Fixture::new(SHAPES);
+    f.run(
+        "CREATE TABLE first (id INTEGER PRIMARY KEY, v TEXT);
+         INSERT INTO first VALUES (1, 'a');
+         ALTER TABLE first RENAME TO second;",
+    );
+    let commit = f.pull();
+    assert_eq!(schema(&commit, "second").generation, 1);
+    assert_eq!(snapshotted(&commit, "second").rows.len(), 1);
+    assert!(commit.bulk.is_empty());
+}
+
+/// An added column changes every row's logical value without a row event,
+/// so it opens a new generation and snapshots the table under it.
+#[test]
+fn an_added_column_opens_a_generation_with_a_snapshot() {
+    let mut f = Fixture::new(SHAPES);
+    f.run("INSERT INTO plain VALUES (1, 'x'); INSERT INTO keyed VALUES ('a', 1);");
+    f.pull();
+    f.run(
+        "INSERT INTO keyed VALUES ('b', 2);
          ALTER TABLE plain ADD COLUMN extra INTEGER DEFAULT 9;
          INSERT INTO plain VALUES (2, 'y', 3);",
     );
     let commit = f.pull();
-    let plain = table(&commit, "plain");
-    assert_eq!(plain.columns, ["v", "w", "extra"]);
-    let rows: Vec<_> = plain.rows.iter().map(|r| r.row().to_vec()).collect();
+    let plain = schema(&commit, "plain");
+    assert_eq!(plain.generation, 2);
+    assert!(
+        plain.sql.contains("extra INTEGER DEFAULT 9"),
+        "{}",
+        plain.sql
+    );
+    assert_eq!(plain.columns.len(), 3);
+    let snapshot = snapshotted(&commit, "plain");
+    assert_eq!(snapshot.generation, 2);
+    assert_eq!(snapshot.columns, ["v", "w", "extra"]);
+    let rows: Vec<_> = snapshot.rows.iter().map(|r| r.row().to_vec()).collect();
     assert_eq!(
         rows,
         [
@@ -760,13 +1047,18 @@ fn an_added_column_is_carried() {
             vec![int(2), text("y"), int(3)]
         ]
     );
+    assert!(snapshot.rows.iter().all(|r| r.op() == Op::Insert));
+    // The untouched table keeps its generation and its rows.
+    assert_eq!(table(&commit, "keyed").generation, 1);
+    assert!(commit.tables.iter().all(|t| t.table != "plain"));
+    assert_eq!(stored(&f)[2], ("plain".into(), 2, Some(plain.sql.clone())));
 }
 
-/// DDL is tracked by table generations, which are not here yet. Until then a
-/// table dropped under the session fails the changeset, and the commit
-/// conservatively names every remaining exported table as `bulk`.
+/// A drop closes the generation. A table written and then dropped in one
+/// interval fails the changeset as a whole; the remaining tables are
+/// snapshotted rather than all becoming `bulk`.
 #[test]
-fn a_dropped_table_falls_back_to_bulk() {
+fn a_dropped_table_closes_its_generation() {
     let mut f = Fixture::new(SHAPES);
     f.run(
         "INSERT INTO keyed VALUES ('a', 1);
@@ -774,16 +1066,248 @@ fn a_dropped_table_falls_back_to_bulk() {
          DROP TABLE plain;",
     );
     let commit = f.pull();
-    let covered: Vec<_> = commit
-        .tables
-        .iter()
-        .map(|t| t.table.as_str())
-        .chain(commit.bulk.iter().map(|t| t.table.as_str()))
-        .collect();
-    assert!(covered.contains(&"keyed"), "{commit:?}");
+    let plain = schema(&commit, "plain");
+    assert!(plain.dropped);
+    assert_eq!(plain.generation, 1);
+    assert!(commit.bulk.is_empty(), "{commit:?}");
+    let keyed = snapshotted(&commit, "keyed");
+    assert_eq!((keyed.generation, keyed.rows.len()), (1, 1));
     // The next commit is captured normally.
     f.run("INSERT INTO keyed VALUES ('b', 2);");
     assert_eq!(table(&f.pull(), "keyed").rows.len(), 1);
+    // A drop alone, with nothing written, is reported too.
+    f.run("DROP TABLE norowid;");
+    let commit = f.pull();
+    assert!(schema(&commit, "norowid").dropped);
+    assert_eq!(stored(&f)[1], ("norowid".into(), 1, None));
+}
+
+/// Dropping a column from a table the session recorded stops the session
+/// for the rest of the interval, so a table written after it was never seen.
+/// Every table is snapshotted instead.
+#[test]
+fn a_dropped_column_stops_the_session_and_every_table_is_snapshotted() {
+    let mut f = Fixture::new(SHAPES);
+    f.run("ALTER TABLE plain ADD COLUMN extra INTEGER;");
+    f.pull();
+    f.run(
+        "BEGIN;
+         INSERT INTO plain VALUES (1, 'x', 2);
+         ALTER TABLE plain DROP COLUMN extra;
+         INSERT INTO keyed VALUES ('a', 1);
+         COMMIT;",
+    );
+    let commit = f.pull();
+    assert_eq!(schema(&commit, "plain").generation, 3);
+    assert_eq!(snapshotted(&commit, "plain").rows.len(), 1);
+    assert_eq!(snapshotted(&commit, "keyed").rows.len(), 1);
+    assert!(snapshotted(&commit, "norowid").rows.is_empty());
+    assert!(commit.tables.is_empty() && commit.bulk.is_empty());
+}
+
+/// A recreated table continues from the old generation, so rows of the old
+/// one cannot resurrect.
+#[test]
+fn a_recreated_table_is_a_new_generation() {
+    let mut f = Fixture::new(SHAPES);
+    f.run("INSERT INTO plain VALUES (1, 'x'); DROP TABLE plain;");
+    f.pull();
+    f.run("CREATE TABLE plain (v INTEGER, w TEXT); INSERT INTO plain VALUES (2, 'y');");
+    let commit = f.pull();
+    assert_eq!(schema(&commit, "plain").generation, 2);
+    assert_eq!(snapshotted(&commit, "plain").rows.len(), 1);
+
+    // Dropped and recreated with the same definition between two pulls:
+    // `sqlite_schema` looks the same, and only the dropped hint tells.
+    f.run(
+        "INSERT INTO plain VALUES (3, 'z');
+         DROP TABLE plain;
+         CREATE TABLE plain (v INTEGER, w TEXT);
+         INSERT INTO plain VALUES (4, 'w');",
+    );
+    let commit = f.pull();
+    assert_eq!(schema(&commit, "plain").generation, 3);
+    let plain = snapshotted(&commit, "plain");
+    assert_eq!(plain.generation, 3);
+    assert_eq!(plain.rows.len(), 1);
+    assert_eq!(plain.rows[0].row(), [int(4), text("w")]);
+}
+
+/// A rename keeps the root page: the new name opens a generation with
+/// `renamed_from`, is snapshotted, and the old name gets no record of its
+/// own.
+#[test]
+fn a_rename_opens_a_generation_renamed_from_the_old_name() {
+    let mut f = Fixture::new(SHAPES);
+    f.run("INSERT INTO keyed VALUES ('a', 1);");
+    f.pull();
+    f.run("ALTER TABLE keyed RENAME TO renamed; INSERT INTO renamed VALUES ('b', 2);");
+    let commit = f.pull();
+    assert_eq!(commit.schemas.len(), 1, "{commit:?}");
+    let renamed = schema(&commit, "renamed");
+    assert_eq!(renamed.generation, 1);
+    assert_eq!(renamed.renamed_from.as_deref(), Some("keyed"));
+    assert_eq!(snapshotted(&commit, "renamed").rows.len(), 2);
+    assert!(commit.tables.is_empty() && commit.bulk.is_empty());
+    // Back to the old name: that name continues from its old generation.
+    f.run("ALTER TABLE renamed RENAME TO keyed;");
+    let commit = f.pull();
+    let keyed = schema(&commit, "keyed");
+    assert_eq!(keyed.generation, 2);
+    assert_eq!(keyed.renamed_from.as_deref(), Some("renamed"));
+}
+
+/// Generations live in the cell. A later residency continues from them, and
+/// a change made while nothing captured the cell is reported by its first
+/// pull, with a snapshot since no session saw the rows move.
+#[test]
+fn generations_survive_a_new_residency() {
+    let mut f = Fixture::new(SHAPES);
+    f.run("DROP TABLE plain;");
+    f.pull();
+    let mut f = f.reinstall();
+    // Nothing changed while it was away: no new generations.
+    assert_eq!(f.checkpoint(), Checkpoint::Clean);
+    f.run("CREATE TABLE plain (v INTEGER, w TEXT);");
+    assert_eq!(schema(&f.pull(), "plain").generation, 2);
+    // Unobserved: the capture is gone while the table changes.
+    drop(f.capture);
+    f.connection
+        .execute_batch(
+            "INSERT INTO keyed VALUES ('a', 1);
+             ALTER TABLE keyed ADD COLUMN extra TEXT;
+             CREATE TABLE later (id INTEGER PRIMARY KEY);
+             INSERT INTO later VALUES (1);",
+        )
+        .unwrap();
+    let mut f = Fixture::install(f.connection, settings());
+    assert!(f.capture.needs_visit());
+    let commit = f.pull();
+    assert_eq!(schema(&commit, "keyed").generation, 2);
+    assert_eq!(snapshotted(&commit, "keyed").rows.len(), 1);
+    assert_eq!(schema(&commit, "later").generation, 1);
+    assert_eq!(snapshotted(&commit, "later").rows.len(), 1);
+    assert!(commit.tables.is_empty());
+}
+
+/// A table dropped and recreated with the same definition while nothing
+/// captured the cell is a new generation when capture returns: the stored
+/// root page and schema cookie say so, and the old rows are closed.
+#[test]
+fn an_unobserved_recreate_is_a_new_generation() {
+    let mut f = Fixture::new(SHAPES);
+    let mut consumer = Consumer::new();
+    f.run("INSERT INTO keyed VALUES ('one', 1);");
+    ingest(&mut consumer, &f.pull());
+    drop(f.capture);
+    f.connection
+        .execute_batch(
+            "DROP TABLE keyed;
+             CREATE TABLE keyed (id TEXT PRIMARY KEY, v INTEGER);
+             INSERT INTO keyed VALUES ('two', 2);",
+        )
+        .unwrap();
+    let mut f = Fixture::install(f.connection, settings());
+    let commit = f.pull();
+    assert_eq!(schema(&commit, "keyed").generation, 2);
+    ingest(&mut consumer, &commit);
+    f.run("INSERT INTO keyed VALUES ('three', 3);");
+    ingest(&mut consumer, &f.pull());
+    let keys: Vec<_> = consumer
+        .stream(&stream())
+        .unwrap()
+        .table("keyed")
+        .unwrap()
+        .rows
+        .keys()
+        .cloned()
+        .collect();
+    assert_eq!(keys, [vec![text("three")], vec![text("two")]]);
+}
+
+/// A generation is released only once the cell stores it. While the store
+/// fails, a schema change exports the tables as `bulk` under the generations
+/// already stored, and a later residency never reuses a released number.
+#[test]
+fn generations_are_released_only_once_stored() {
+    let mut f = Fixture::new(SHAPES);
+    let mut consumer = Consumer::new();
+    f.run("INSERT INTO plain VALUES (1, 'before');");
+    ingest(&mut consumer, &f.pull());
+    f.run(
+        "CREATE TEMP TRIGGER no_insert BEFORE INSERT ON main._cf_EXPORT
+           BEGIN SELECT RAISE(ABORT, 'store fails'); END;
+         CREATE TEMP TRIGGER no_update BEFORE UPDATE ON main._cf_EXPORT
+           BEGIN SELECT RAISE(ABORT, 'store fails'); END;",
+    );
+    f.run("ALTER TABLE plain ADD COLUMN a INTEGER;");
+    let commit = f.pull();
+    assert!(
+        commit.schemas.iter().all(|s| s.generation == 1),
+        "{commit:?}"
+    );
+    assert!(commit
+        .bulk
+        .iter()
+        .any(|tg| tg.table == "plain" && tg.generation == 1));
+    assert_eq!(stored(&f)[2].1, 1);
+    // Once the store works, the next pull reports the change.
+    f.run("DROP TRIGGER temp.no_insert; DROP TRIGGER temp.no_update;");
+    f.run("INSERT INTO keyed VALUES ('k', 1);");
+    let commit = f.pull();
+    assert_eq!(schema(&commit, "plain").generation, 2);
+    assert_eq!(snapshotted(&commit, "plain").rows.len(), 1);
+    assert_eq!(stored(&f)[2].1, 2);
+    let mut f = f.reinstall();
+    f.run("ALTER TABLE plain ADD COLUMN b INTEGER;");
+    let commit = f.pull();
+    assert_eq!(schema(&commit, "plain").generation, 3);
+}
+
+/// A table too large for the transaction budget is `bulk` under its new
+/// generation instead of snapshotted.
+#[test]
+fn a_large_table_is_bulk_instead_of_snapshotted() {
+    let mut f = Fixture::with_settings(SHAPES, Settings { max_tx_bytes: 2048 });
+    for i in 0..100 {
+        f.run(&format!("INSERT INTO plain VALUES ({i}, '{i:0>20}');"));
+        f.pull();
+    }
+    f.run("ALTER TABLE plain ADD COLUMN extra INTEGER;");
+    let commit = f.pull();
+    assert_eq!(schema(&commit, "plain").generation, 2);
+    assert_eq!(
+        commit.bulk,
+        [TableGen {
+            table: "plain".into(),
+            generation: 2
+        }]
+    );
+    assert!(commit.snapshot.as_ref().is_none_or(|s| s.tables.is_empty()));
+}
+
+/// A table the operator denies is not described either.
+#[test]
+fn denied_tables_have_no_generations() {
+    let connection = Connection::open_in_memory().unwrap();
+    connection.execute_batch(SHAPES).unwrap();
+    let queue = DirtyList::default();
+    let mut capture = Capture::install(
+        &connection,
+        SCOPE,
+        settings(),
+        HashSet::from(["plain".to_string()]),
+        queue,
+    )
+    .unwrap();
+    connection
+        .execute_batch("DROP TABLE plain; CREATE TABLE plain2 (v INTEGER);")
+        .unwrap();
+    let Checkpoint::Pulled(commit) = capture.checkpoint(&connection, 0) else {
+        panic!("expected a commit");
+    };
+    let names: Vec<_> = commit.schemas.iter().map(|s| s.table.as_str()).collect();
+    assert_eq!(names, ["plain2"]);
 }
 
 /// Records built from captured commits, applied by the reference consumer,
@@ -829,24 +1353,56 @@ fn stream() -> StreamId {
     }
 }
 
+/// The records release builds from a commit, in its order, without
+/// fragmenting.
+fn records(commit: &CapturedCommit) -> Vec<Record> {
+    let envelope = Envelope {
+        stream: stream(),
+        cell_name: None,
+        position: Position::new(1, commit.seq, commit.seq),
+        committed_at: commit.committed_at,
+        node: "node-a".into(),
+        origin: Origin::Live,
+        fragment: 1,
+        fragments: 1,
+    };
+    let record = |body| Record {
+        envelope: envelope.clone(),
+        body,
+    };
+    let mut out: Vec<Record> = commit
+        .schemas
+        .iter()
+        .map(|s| record(Body::Schema(s.clone())))
+        .collect();
+    if let Some(snapshot) = &commit.snapshot {
+        for table in &snapshot.tables {
+            out.push(record(Body::Snapshot(SnapshotBody {
+                snapshot_id: snapshot.id.clone(),
+                data: table.clone(),
+            })));
+        }
+        out.push(record(Body::SnapshotEnd(SnapshotEndBody {
+            snapshot_id: snapshot.id.clone(),
+            scope: SnapshotScope::Tables,
+            tables: snapshot.tables.iter().map(TableRows::table_gen).collect(),
+            records: snapshot.tables.len() as u64,
+        })));
+    }
+    for rows in &commit.tables {
+        out.push(record(Body::Rows(RowsBody { data: rows.clone() })));
+    }
+    if !commit.bulk.is_empty() {
+        out.push(record(Body::Bulk(BulkBody {
+            tables: commit.bulk.clone(),
+        })));
+    }
+    out
+}
+
 fn ingest(consumer: &mut Consumer, commit: &CapturedCommit) {
     assert!(commit.bulk.is_empty(), "{commit:?}");
-    for rows in &commit.tables {
-        let record = Record {
-            envelope: Envelope {
-                stream: stream(),
-                cell_name: None,
-                position: Position::new(1, commit.seq, commit.seq),
-                committed_at: commit.committed_at,
-                node: "node-a".into(),
-                origin: Origin::Live,
-                fragment: 1,
-                fragments: 1,
-            },
-            body: Body::Rows(RowsBody { data: rows.clone() }),
-        };
-        consumer.ingest(record).unwrap();
-    }
+    consumer.ingest_all(records(commit)).unwrap();
 }
 
 #[derive(Clone, Debug)]
@@ -932,6 +1488,224 @@ proptest! {
     }
 }
 
+/// A table in the schema-change property test: how it is keyed, and the
+/// columns added since it was created.
+#[derive(Clone, Debug)]
+struct Model {
+    shape: u8,
+    added: Vec<u32>,
+}
+
+#[derive(Clone, Debug)]
+enum DdlStep {
+    Create { table: u8, shape: u8 },
+    Drop { table: u8 },
+    Recreate { table: u8 },
+    Rename { from: u8, to: u8 },
+    AddColumn { table: u8 },
+    DropColumn { table: u8 },
+    Upsert { table: u8, key: u8, value: u8 },
+    Delete { table: u8, key: u8 },
+}
+
+fn ddl_step() -> impl Strategy<Value = DdlStep> {
+    prop_oneof![
+        2 => (0..3u8, 0..3u8).prop_map(|(table, shape)| DdlStep::Create { table, shape }),
+        1 => (0..3u8).prop_map(|table| DdlStep::Drop { table }),
+        1 => (0..3u8).prop_map(|table| DdlStep::Recreate { table }),
+        1 => (0..3u8, 0..3u8).prop_map(|(from, to)| DdlStep::Rename { from, to }),
+        1 => (0..3u8).prop_map(|table| DdlStep::AddColumn { table }),
+        1 => (0..3u8).prop_map(|table| DdlStep::DropColumn { table }),
+        6 => (0..3u8, 0..5u8, any::<u8>()).prop_map(|(table, key, value)| DdlStep::Upsert { table, key, value }),
+        2 => (0..3u8, 0..5u8).prop_map(|(table, key)| DdlStep::Delete { table, key }),
+    ]
+}
+
+fn create_sql(name: &str, shape: u8) -> String {
+    match shape {
+        0 => format!("CREATE TABLE {name} (id INTEGER PRIMARY KEY, v TEXT)"),
+        1 => format!("CREATE TABLE {name} (id INTEGER, v TEXT)"),
+        _ => format!("CREATE TABLE {name} (id INTEGER PRIMARY KEY, v TEXT) WITHOUT ROWID"),
+    }
+}
+
+/// The SQL for `step` against the tables in `model`, applying it to the
+/// model; `None` when the step does not apply.
+fn ddl_sql(
+    step: &DdlStep,
+    model: &mut BTreeMap<String, Model>,
+    next_column: &mut u32,
+) -> Option<String> {
+    let name = |t: &u8| format!("t{t}");
+    match step {
+        DdlStep::Create { table, shape } => {
+            let n = name(table);
+            if model.contains_key(&n) {
+                return None;
+            }
+            model.insert(
+                n.clone(),
+                Model {
+                    shape: *shape,
+                    added: Vec::new(),
+                },
+            );
+            Some(create_sql(&n, *shape))
+        }
+        DdlStep::Drop { table } => {
+            let n = name(table);
+            model.remove(&n)?;
+            Some(format!("DROP TABLE {n}"))
+        }
+        DdlStep::Recreate { table } => {
+            let n = name(table);
+            let m = model.get_mut(&n)?;
+            m.added.clear();
+            Some(format!("DROP TABLE {n}; {}", create_sql(&n, m.shape)))
+        }
+        DdlStep::Rename { from, to } => {
+            let (f, t) = (name(from), name(to));
+            if model.contains_key(&t) {
+                return None;
+            }
+            let m = model.remove(&f)?;
+            model.insert(t.clone(), m);
+            Some(format!("ALTER TABLE {f} RENAME TO {t}"))
+        }
+        DdlStep::AddColumn { table } => {
+            let n = name(table);
+            let m = model.get_mut(&n)?;
+            *next_column += 1;
+            m.added.push(*next_column);
+            Some(format!(
+                "ALTER TABLE {n} ADD COLUMN c{next_column} INTEGER DEFAULT {next_column}"
+            ))
+        }
+        DdlStep::DropColumn { table } => {
+            let n = name(table);
+            let column = model.get_mut(&n)?.added.pop()?;
+            Some(format!("ALTER TABLE {n} DROP COLUMN c{column}"))
+        }
+        DdlStep::Upsert { table, key, value } => {
+            let n = name(table);
+            let m = model.get(&n)?;
+            Some(if m.shape == 1 {
+                format!(
+                    "INSERT INTO {n}(rowid, id, v) VALUES ({key}, {key}, 'v{value}') \
+                     ON CONFLICT(rowid) DO UPDATE SET v = excluded.v"
+                )
+            } else {
+                format!(
+                    "INSERT INTO {n}(id, v) VALUES ({key}, 'v{value}') \
+                     ON CONFLICT(id) DO UPDATE SET v = excluded.v"
+                )
+            })
+        }
+        DdlStep::Delete { table, key } => {
+            let n = name(table);
+            model.get(&n)?;
+            Some(format!("DELETE FROM {n} WHERE id = {key}"))
+        }
+    }
+}
+
+/// Every exported table's rows as the reference consumer should hold them,
+/// against what it holds.
+fn assert_consumer_matches_schema(f: &Fixture, consumer: &Consumer) {
+    let state = consumer.stream(&stream()).unwrap_or_default();
+    assert!(state.uncertain.is_empty(), "{:?}", state.uncertain);
+    let mut expected: BTreeMap<String, BTreeMap<Vec<Value>, Vec<Value>>> = BTreeMap::new();
+    let names: Vec<String> = f
+        .connection
+        .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name LIKE 't%'")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    for name in names {
+        let shape = read_shape(&f.connection, &name).unwrap();
+        let mut statement = f.connection.prepare(&scan_sql(&name, &shape)).unwrap();
+        let rows: BTreeMap<Vec<Value>, Vec<Value>> = statement
+            .query_map([], |row| {
+                let width = row.as_ref().column_count();
+                let values: Vec<Value> = (0..width)
+                    .map(|i| from_row(row.get_ref(i).unwrap()))
+                    .collect();
+                // Every table here is keyed by `id` or by the rowid, which
+                // leads the scan of a rowid-only table.
+                Ok(if shape.rowid_only() {
+                    (values[..1].to_vec(), values[1..].to_vec())
+                } else {
+                    (values[..1].to_vec(), values)
+                })
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        if !rows.is_empty() {
+            expected.insert(name, rows);
+        }
+    }
+    let actual: BTreeMap<String, BTreeMap<Vec<Value>, Vec<Value>>> = state
+        .tables
+        .iter()
+        .map(|(tg, t)| (tg.table.clone(), t.rows.clone()))
+        .collect();
+    // One open generation per name at most.
+    assert_eq!(
+        actual.len(),
+        state.tables.len(),
+        "{:?}",
+        state.tables.keys()
+    );
+    assert_eq!(actual, expected);
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(96))]
+
+    /// Random transactions mixing row changes with creates, drops, drop and
+    /// recreate under one name, renames and column changes, some rolled
+    /// back: after every commit, the reference consumer holds exactly the
+    /// rows of every table, under one open generation each, and rows of a
+    /// dropped or replaced generation never come back.
+    #[test]
+    fn the_reference_consumer_converges_across_schema_changes(
+        transactions in prop::collection::vec(
+            (prop::collection::vec(ddl_step(), 1..10), prop::bool::weighted(0.15)),
+            1..10,
+        )
+    ) {
+        let mut f = Fixture::new("CREATE TABLE t0 (id INTEGER PRIMARY KEY, v TEXT);");
+        let mut model = BTreeMap::from([(
+            "t0".to_string(),
+            Model { shape: 0, added: Vec::new() },
+        )]);
+        let mut next_column = 0;
+        let mut consumer = Consumer::new();
+        for (steps, rollback) in &transactions {
+            let before = model.clone();
+            f.run("BEGIN;");
+            for step in steps {
+                if let Some(sql) = ddl_sql(step, &mut model, &mut next_column) {
+                    f.run(&sql);
+                }
+            }
+            if *rollback {
+                f.run("ROLLBACK;");
+                model = before;
+            } else {
+                f.run("COMMIT;");
+            }
+            if let Checkpoint::Pulled(commit) = f.checkpoint() {
+                ingest(&mut consumer, &commit);
+            }
+            assert_consumer_matches_schema(&f, &consumer);
+        }
+    }
+}
+
 /// The capture as `storage` runs it: installed on open under the cell
 /// connection's authorizer and limits, pulled at check points, and dropped
 /// before the connection on close.
@@ -966,6 +1740,18 @@ mod on_the_cell_connection {
         storage::sql_exec(CELL, sql, &[]).unwrap();
     }
 
+    /// Run schema statements and pull the commit that creates the tables,
+    /// so later commits carry rows rather than the creating snapshot.
+    fn create(sql: &str) {
+        exec(sql);
+        storage::export_checkpoint();
+        let events = events();
+        assert!(
+            matches!(events.as_slice(), [CaptureEvent::Commit(c), CaptureEvent::CaughtUp] if c.snapshot.is_some()),
+            "{events:?}"
+        );
+    }
+
     fn events() -> Vec<CaptureEvent> {
         storage::take_capture_events(CELL)
     }
@@ -998,7 +1784,7 @@ mod on_the_cell_connection {
     fn user_sql_and_kv_writes_are_captured_at_check_points() {
         let _cell = open(Some(settings()));
         exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT, g INTEGER AS (id * 2))");
-        exec("CREATE TABLE u (id INTEGER PRIMARY KEY, v TEXT)");
+        create("CREATE TABLE u (id INTEGER PRIMARY KEY, v TEXT)");
         // Nothing is pulled until a check point.
         exec("INSERT INTO u VALUES (1, 'a')");
         assert!(take().is_empty());
@@ -1039,6 +1825,11 @@ mod on_the_cell_connection {
     fn caught_up_is_reported_only_with_nothing_unpulled() {
         let _cell = open(Some(settings()));
         exec("CREATE TABLE u (id INTEGER PRIMARY KEY, v TEXT)");
+        // The create is not pulled yet.
+        storage::export_report_caught_up(CELL);
+        assert!(events().is_empty());
+        storage::export_checkpoint();
+        assert_eq!(take().len(), 1);
         storage::export_report_caught_up(CELL);
         assert_eq!(events(), [CaptureEvent::CaughtUp]);
         exec("INSERT INTO u VALUES (1, 'a')");
@@ -1069,7 +1860,7 @@ mod on_the_cell_connection {
     #[test]
     fn an_open_transaction_is_pulled_after_it_commits() {
         let _cell = open(Some(settings()));
-        exec("CREATE TABLE u (id INTEGER PRIMARY KEY, v TEXT)");
+        create("CREATE TABLE u (id INTEGER PRIMARY KEY, v TEXT)");
         storage::transaction_control(CELL, "start", false, "cells_tx_1").unwrap();
         exec("INSERT INTO u VALUES (1, 'a')");
         storage::export_checkpoint();
@@ -1082,7 +1873,7 @@ mod on_the_cell_connection {
     #[test]
     fn an_open_returning_cursor_defers_the_pull() {
         let _cell = open(Some(settings()));
-        exec("CREATE TABLE u (id INTEGER PRIMARY KEY, v TEXT)");
+        create("CREATE TABLE u (id INTEGER PRIMARY KEY, v TEXT)");
         let (cursor, _, first, _, done) = storage::sql_cursor_start(
             CELL,
             "INSERT INTO u VALUES (1, 'a'), (2, 'b') RETURNING id",
@@ -1102,7 +1893,7 @@ mod on_the_cell_connection {
     #[test]
     fn close_pulls_the_last_writes() {
         let _cell = open(Some(settings()));
-        exec("CREATE TABLE u (id INTEGER PRIMARY KEY, v TEXT)");
+        create("CREATE TABLE u (id INTEGER PRIMARY KEY, v TEXT)");
         exec("INSERT INTO u VALUES (1, 'a')");
         storage::close(CELL);
         let commits = take();

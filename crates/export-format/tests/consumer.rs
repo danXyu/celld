@@ -326,6 +326,8 @@ fn links_and_recovered_heads_beyond_certification_are_gaps_until_repaired() {
             Body::Recovered(RecoveredBody {
                 session: "s".into(),
                 head: pos(3, 3),
+                loss: false,
+                cells: 1,
             }),
         ),
         live(
@@ -438,4 +440,254 @@ fn a_table_seen_only_in_a_bulk_marker_is_uncertain() {
         ),
     ]);
     assert!(dropped.uncertain.is_empty());
+}
+
+/// A `recovered` record as dead-node recovery emits it: no script and
+/// incarnation 0, since recovery knows neither.
+fn recovered(head: Position, loss: bool) -> Record {
+    let unscripted = StreamId {
+        script: String::new(),
+        incarnation: 0,
+        ..stream()
+    };
+    let mut r = record(
+        &unscripted,
+        head,
+        Origin::Live,
+        Body::Recovered(RecoveredBody {
+            session: "node-a/g1".into(),
+            head,
+            loss,
+            cells: 1,
+        }),
+    );
+    r.envelope.node = "node-b".into();
+    r
+}
+
+#[test]
+fn a_recovered_record_applies_to_its_cells_stream_without_breaking_certification() {
+    let head = pos(3, u64::MAX);
+    let mut c = Consumer::new();
+    c.ingest_all(vec![
+        rows(pos(1, 1), "t", 1, vec![put(1, "a")]),
+        rows(pos(3, 2), "t", 1, vec![put(2, "b")]),
+        watermark(None, pos(3, 2), 2, 2),
+        recovered(head, false),
+    ])
+    .unwrap();
+    let state = c.state();
+    assert_eq!(
+        state.len(),
+        1,
+        "the scriptless stream is adopted: {state:?}"
+    );
+    let s = &state[&stream()];
+    // Recovery reached txid 3 and so did certification: no gap, and the
+    // recovered record is not counted against the dead node's watermark.
+    assert_eq!(s.certified_head(), Some(pos(3, 2)));
+    assert!(s.gaps.is_empty(), "{:?}", s.gaps);
+
+    // Recovery past certification is a gap on the cell's own stream.
+    let mut c = Consumer::new();
+    c.ingest_all(vec![
+        rows(pos(1, 1), "t", 1, vec![put(1, "a")]),
+        watermark(None, pos(1, 1), 1, 1),
+        recovered(head, false),
+    ])
+    .unwrap();
+    let s = c.stream(&stream()).unwrap();
+    assert_eq!(
+        s.gaps,
+        vec![Gap::Recovered {
+            head,
+            certified: Some(pos(1, 1)),
+            loss: false,
+        }]
+    );
+}
+
+#[test]
+fn a_recovered_record_for_a_stream_never_seen_is_its_own_gap() {
+    let mut c = Consumer::new();
+    c.ingest(recovered(pos(3, u64::MAX), false)).unwrap();
+    let state = c.state();
+    assert_eq!(state.len(), 1);
+    let (id, s) = state.iter().next().unwrap();
+    assert!(id.script.is_empty());
+    assert!(matches!(
+        s.gaps[..],
+        [Gap::Recovered {
+            certified: None,
+            ..
+        }]
+    ));
+}
+
+#[test]
+fn a_recovered_record_picks_the_incarnation_its_epoch_belongs_to() {
+    let older = StreamId {
+        incarnation: 1,
+        ..stream()
+    };
+    let newer = StreamId {
+        incarnation: 5,
+        ..stream()
+    };
+    let head = Position::new(3, 9, u64::MAX);
+    let mut c = Consumer::new();
+    c.ingest_all(vec![
+        record(
+            &older,
+            Position::new(1, 1, 1),
+            Origin::Live,
+            Body::Rows(RowsBody {
+                data: table_rows("t", 1, vec![put(1, "a")]),
+            }),
+        ),
+        record(
+            &newer,
+            Position::new(5, 1, 1),
+            Origin::Live,
+            Body::Rows(RowsBody {
+                data: table_rows("t", 1, vec![put(1, "a")]),
+            }),
+        ),
+        recovered(head, false),
+    ])
+    .unwrap();
+    assert_eq!(c.stream(&older).unwrap().gaps.len(), 1);
+    assert!(c.stream(&newer).unwrap().gaps.is_empty());
+}
+
+#[test]
+fn a_loss_below_certification_is_a_gap_until_a_later_snapshot() {
+    // The dead node exported through txid 4; recovery could only reach 3.
+    let head = pos(3, u64::MAX);
+    let mut records = vec![
+        rows(pos(1, 1), "t", 1, vec![put(1, "a")]),
+        rows(pos(4, 2), "t", 1, vec![put(2, "lost")]),
+        watermark(None, pos(4, 2), 2, 2),
+        recovered(head, true),
+    ];
+    let s = apply(records.clone());
+    assert_eq!(
+        s.gaps,
+        vec![Gap::Recovered {
+            head,
+            certified: Some(pos(4, 2)),
+            loss: true,
+        }]
+    );
+    // Without the loss the same heads are no gap.
+    records[3] = recovered(head, false);
+    assert!(apply(records.clone()).gaps.is_empty());
+
+    // A repair at the recovered head does not supersede txid 4; one in the
+    // cell's next epoch does, and removes the lost row.
+    records[3] = recovered(head, true);
+    records.push(snapshot(head, "at-head", "t", 1, vec![put(1, "a")]));
+    records.push(snapshot_end(
+        head,
+        "at-head",
+        SnapshotScope::Stream,
+        &[("t", 1)],
+        1,
+    ));
+    assert_eq!(apply(records.clone()).gaps.len(), 1);
+    let next = Position::new(2, 1, 0);
+    records.push(snapshot(next, "next", "t", 1, vec![put(1, "a")]));
+    records.push(snapshot_end(
+        next,
+        "next",
+        SnapshotScope::Stream,
+        &[("t", 1)],
+        1,
+    ));
+    let s = apply(records);
+    assert!(s.gaps.is_empty(), "{:?}", s.gaps);
+    assert_eq!(rows_of(&s, "t"), vec![one(1, "a")]);
+}
+
+#[test]
+fn only_the_unadopted_recovered_records_stay_scriptless() {
+    // Recovery reported epochs 3 and 5; only incarnation 5 is known, and it
+    // is certified through its recovered head.
+    let known = StreamId {
+        incarnation: 5,
+        ..stream()
+    };
+    let at = |epoch: u64, txid: u64| Position::new(epoch, txid, u64::MAX);
+    let mut c = Consumer::new();
+    c.ingest_all(vec![
+        record(
+            &known,
+            Position::new(5, 2, 1),
+            Origin::Live,
+            Body::Rows(RowsBody {
+                data: table_rows("t", 1, vec![put(1, "a")]),
+            }),
+        ),
+        record(
+            &known,
+            Position::new(5, 2, 1),
+            Origin::Live,
+            Body::Watermark(WatermarkBody {
+                from: None,
+                through: Position::new(5, 2, 1),
+                commits: 1,
+                records: 1,
+            }),
+        ),
+        recovered(at(3, 7), false),
+        recovered(at(5, 2), false),
+    ])
+    .unwrap();
+    let state = c.state();
+    assert!(state[&known].gaps.is_empty(), "{:?}", state[&known].gaps);
+    let scriptless: Vec<&StreamState> = state
+        .iter()
+        .filter(|(s, _)| s.script.is_empty())
+        .map(|(_, st)| st)
+        .collect();
+    assert_eq!(scriptless.len(), 1);
+    assert!(
+        matches!(scriptless[0].gaps[..], [Gap::Recovered { head, .. }] if head == at(3, 7)),
+        "{:?}",
+        scriptless[0].gaps
+    );
+}
+
+#[test]
+fn a_recovered_facet_record_applies_to_every_incarnation_at_its_path() {
+    let path = "facets/aa";
+    let first = facet(path, 0x9e37);
+    let second = facet(path, 0x1234);
+    let other = facet("facets/bb", 0x9e37);
+    let head = Position::new(1, 5, u64::MAX);
+    let mut r = recovered(head, false);
+    r.envelope.stream.facet = Some(path.into());
+    let rows_on = |s: &StreamId| {
+        record(
+            s,
+            Position::new(1, 1, 1),
+            Origin::Live,
+            Body::Rows(RowsBody {
+                data: table_rows("t", 1, vec![put(1, "a")]),
+            }),
+        )
+    };
+    let mut c = Consumer::new();
+    c.ingest_all(vec![rows_on(&first), rows_on(&second), rows_on(&other), r])
+        .unwrap();
+    let state = c.state();
+    assert!(
+        state.keys().all(|s| !s.script.is_empty()),
+        "adopted: {state:?}"
+    );
+    assert_eq!(state[&first].gaps.len(), 1);
+    assert_eq!(state[&second].gaps.len(), 1);
+    assert!(state[&other].gaps.is_empty());
+    // The root stream, never seen, gets nothing.
+    assert!(!state.contains_key(&stream()));
 }

@@ -1,5 +1,10 @@
 # celld
 
+> This is the [ewhauser/celld fork](https://github.com/ewhauser/celld).
+> Read the [fork documentation](https://ewhauser.github.io/celld/) for its
+> fixes, features, installation, and release notes. For the standard runtime
+> and APIs, use the [upstream documentation](https://celld.dev/docs/).
+
 Self-hosted, distributed **Durable Objects**.
 
 celld is an open-source daemon that runs a Cloudflare Workers application

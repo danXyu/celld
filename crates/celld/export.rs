@@ -468,7 +468,7 @@ fn parse_brokers(value: &str) -> anyhow::Result<String> {
 }
 
 /// `<n>s`, `<n>m`, `<n>h` or `<n>d`, with `n > 0`.
-fn parse_interval(name: &str, value: &str) -> anyhow::Result<Duration> {
+pub(crate) fn parse_interval(name: &str, value: &str) -> anyhow::Result<Duration> {
     let unit = match value.chars().last() {
         Some('s') => 1,
         Some('m') => 60,
