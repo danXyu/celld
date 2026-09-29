@@ -341,6 +341,9 @@ pub mod engine_api;
 pub mod env_vars;
 pub mod export;
 pub mod export_audit;
+#[cfg(feature = "export-bench")]
+#[doc(hidden)]
+pub mod export_bench;
 pub mod export_blob_stream;
 pub mod export_cli;
 pub(crate) mod export_kv;

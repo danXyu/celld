@@ -93,3 +93,9 @@ jobs:
       # The blob-stream sink's own tests, with its client compiled in.
       - name: Test, blob-stream sink
         run: cargo test --locked -p celld --features export-blob-stream --lib export_blob_stream
+
+      # Check fixtures and benchmark paths without timing gates on shared runners.
+      - name: Smoke test export benchmarks
+        run: |
+          cargo test -p celld-export-format --bench export_format --locked -- --test
+          cargo test -p celld --features export-bench --bench export_pipeline --locked -- --test
