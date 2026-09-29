@@ -9,8 +9,7 @@ const out = path.join(site, 'src/content/docs/fork');
 const repo = 'https://github.com/ewhauser/celld';
 const pages = [
   { source: 'docs/fork-builds.md', slug: 'releases', title: 'Release notes', description: 'Fork build history, recovery changes, removed APIs, and rollout requirements.' },
-  { source: 'docs/previews.md', slug: 'previews', title: 'Application previews', description: 'Deploy isolated Kubernetes previews and clone approved persisted object state.' },
-  { source: 'docs/preview-runtime.md', slug: 'preview-runtime', title: 'Snapshot seeding', description: 'Snapshot consistency, initialization authority, and restore boundaries for seeded previews.' },
+  { source: 'docs/previews.md', slug: 'previews', title: 'Application previews', description: 'User guide: deploy isolated Kubernetes previews and seed them with objects copied from an approved fleet.' },
   { source: 'docs/telemetry.md', slug: 'metrics', title: 'OTLP metrics', description: 'Node gauges and cell CPU and heap distributions added by the fork.', section: 'Metrics' },
   { source: 'docs/export.md', slug: 'export', title: 'Change export', description: 'User guide: stream cell changes to a warehouse, load them into Snowflake, and keep the copy complete.' },
 ];

@@ -15,7 +15,7 @@ Use Node from `.node-version` and the pinned pnpm version in `package.json`.
 
 Author the overview, installation, and bug-fix guide in `src/content/docs/`.
 `scripts/sync-docs.mjs` explicitly allows only fork sources: `docs/fork-builds.md`,
-`docs/previews.md`, `docs/preview-runtime.md`, `docs/export.md`, and the Metrics
+`docs/previews.md`, `docs/export.md`, and the Metrics
 section of `docs/telemetry.md`. The generated `fork/` pages are ignored. Edit links
 lead to their canonical source, and repository links are rewritten for the site.
 Do not glob or mirror the upstream `docs/` tree. Add new fork sources explicitly.
