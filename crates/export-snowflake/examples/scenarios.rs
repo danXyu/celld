@@ -1,7 +1,7 @@
 //! Synthetic export records for the SQL tests in `sqltest/`.
 //!
-//! Prints one JSON document: for each scenario, the stage rows to load, the
-//! tombstones to write first, the rendered Dynamic Tables, and what the
+//! Prints one JSON document: for each scenario, its records, the same records
+//! as the rows the loader lands, the tombstones to write first, the rendered Dynamic Tables, and what the
 //! reference consumer derives from the same records, which the SQL must
 //! match. Hand-written scenarios cover each precedence rule; random ones,
 //! from a fixed seed, deliver realistic histories duplicated, fragmented,
@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 
 use celld_export_format::*;
-use celld_export_snowflake::{DynamicTable, StageRow};
+use celld_export_snowflake::{DynamicTable, LandingRow};
 use serde_json::{json, Value as Json};
 
 // ---------------------------------------------------------------- builder
@@ -1484,7 +1484,10 @@ fn main() {
         .map(|s| {
             json!({
                 "name": s.name,
-                "stage_rows": s.delivered.iter().map(StageRow::from_record).collect::<Vec<_>>(),
+                "records": &s.delivered,
+                "landing_rows": s.delivered.iter().enumerate().map(|(i, r)| {
+                    LandingRow::from_record(r, format!("scenario/{}/{i}", s.name))
+                }).collect::<Vec<_>>(),
                 "tombstones": s.tombstones.iter().map(|(id, inc)| {
                     let mut j = stream_json(id);
                     j["incarnation"] = json!(inc);

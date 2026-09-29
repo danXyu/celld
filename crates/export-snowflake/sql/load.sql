@@ -1,35 +1,27 @@
--- Change export: loading files the bucket sink writes into the tables.
+-- Change export: landing records the loader consumes into the tables.
 --
--- A stage file is Parquet with one column per envelope field, named as the
--- record's JSON fields are (`kind`, `script`, `class`, `cell`, `cell_name`,
--- `facet`, `incarnation`, `epoch`, `txid`, `commit`, `committed_at`, `node`,
--- `origin`, `fragment`, `fragments`), and `body`: the record's other fields
--- as a JSON object string. `StageRow` in this crate is that layout.
+-- The loader reads the blob-stream topic (consumer group `snowflake`) and
+-- appends each batch of records to EXPORT_LANDING_PIPE through Snowpipe
+-- Streaming's elastic channel: one NDJSON row per record, whose fields are
+-- the envelope's, named as the record's JSON fields are (`kind`, `script`,
+-- `class`, `cell`, `cell_name`, `facet`, `incarnation`, `epoch`, `txid`,
+-- `commit`, `committed_at`, `node`, `origin`, `fragment`, `fragments`),
+-- `body`: the record's other fields as a JSON object string, and `source`:
+-- where the record was read. `LandingRow` in this crate is that layout.
 --
--- `Deployment::statements` fills in {{STAGE_URL}}, {{STORAGE_INTEGRATION}}
--- and {{WAREHOUSE}}, and a {{NAME}} naming another statement in this file
--- with that statement's text, so the pipe and the tasks run exactly the
--- statements the tests run.
+-- `Deployment::statements` fills in {{WAREHOUSE}}, and a {{NAME}} naming
+-- another statement in this file with that statement's text, so the tasks
+-- run exactly the statements the tests run.
 
--- statement: export_file_format
--- Without logical types a Parquet TIMESTAMP(MILLIS) column reads as its
--- int64, which is what `committed_at` lands as.
-CREATE FILE FORMAT IF NOT EXISTS EXPORT_PARQUET TYPE = PARQUET USE_LOGICAL_TYPE = FALSE;
-
--- statement: export_stage
-CREATE STAGE IF NOT EXISTS EXPORT_STAGE
-    URL = '{{STAGE_URL}}'
-    STORAGE_INTEGRATION = {{STORAGE_INTEGRATION}}
-    FILE_FORMAT = EXPORT_PARQUET;
-
--- statement: copy_into_landing
--- Snapshot, repair and backfill files load this way too. COPY's load history
--- skips a file already loaded; a file loaded twice anyway is harmless, since
--- every reader dedups.
+-- statement: export_landing_pipe
+-- Snowpipe Streaming bills this per GB and runs no warehouse. Snapshot,
+-- repair and backfill records land this way too: they arrive on the same
+-- topic. A row appended twice is harmless, since every reader dedups.
+CREATE PIPE IF NOT EXISTS EXPORT_LANDING_PIPE AS
 COPY INTO EXPORT_LANDING (
     kind, script, class, cell, cell_name, facet, incarnation,
     epoch, txid, commit, committed_at, node, origin, fragment, fragments,
-    body, file_name
+    body, source
 )
 FROM (
     SELECT
@@ -49,15 +41,9 @@ FROM (
         $1:fragment::NUMBER(10, 0),
         $1:fragments::NUMBER(10, 0),
         $1:body::STRING,
-        METADATA$FILENAME
-    FROM @EXPORT_STAGE
-)
-PATTERN = '.*[.]parquet';
-
--- statement: export_pipe
--- Auto-ingest from the stage's bucket notifications.
-CREATE PIPE IF NOT EXISTS EXPORT_PIPE AUTO_INGEST = TRUE AS
-{{COPY_INTO_LANDING}};
+        $1:source::STRING
+    FROM TABLE(DATA_SOURCE(TYPE => 'STREAMING'))
+);
 
 -- statement: export_landing_new
 CREATE STREAM IF NOT EXISTS EXPORT_LANDING_NEW
@@ -70,7 +56,7 @@ INSERT INTO CELL_CHANGES (
     script, class, cell, facet, incarnation, cell_name,
     epoch, txid, commit, position_key, committed_at, node, origin,
     fragment, fragments, kind, snapshot_id, table_name, generation,
-    columns, key_columns, row_changes, file_name, loaded_at
+    columns, key_columns, row_changes, source, loaded_at
 )
 SELECT
     l.script, l.class, l.cell, COALESCE(l.facet, ''), l.incarnation, l.cell_name,
@@ -85,7 +71,7 @@ SELECT
     l.doc:columns::ARRAY,
     l.doc:key_columns::ARRAY,
     l.doc:rows::ARRAY,
-    l.file_name,
+    l.source,
     CURRENT_TIMESTAMP()
 FROM (SELECT n.*, PARSE_JSON(n.body) AS doc FROM EXPORT_LANDING_NEW n) l
 WHERE l.kind IN ('rows', 'snapshot')
@@ -101,7 +87,7 @@ WHERE l.kind IN ('rows', 'snapshot')
 INSERT INTO CELL_META (
     script, class, cell, facet, incarnation, cell_name,
     epoch, txid, commit, position_key, committed_at, node, origin,
-    fragment, fragments, kind, body, file_name, loaded_at
+    fragment, fragments, kind, body, source, loaded_at
 )
 SELECT
     l.script, l.class, l.cell, COALESCE(l.facet, ''), l.incarnation, l.cell_name,
@@ -111,7 +97,7 @@ SELECT
     TO_TIMESTAMP_NTZ(l.committed_at, 3), l.node, l.origin,
     l.fragment, l.fragments, l.kind,
     PARSE_JSON(l.body),
-    l.file_name,
+    l.source,
     CURRENT_TIMESTAMP()
 FROM EXPORT_LANDING_NEW l
 WHERE l.kind NOT IN ('rows', 'snapshot')

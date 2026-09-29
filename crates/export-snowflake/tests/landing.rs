@@ -1,5 +1,5 @@
 use celld_export_format::*;
-use celld_export_snowflake::{StageRow, STAGE_COLUMNS};
+use celld_export_snowflake::{LandingRow, LANDING_COLUMNS};
 
 fn record(facet: Option<&str>, body: Body) -> Record {
     Record {
@@ -24,7 +24,7 @@ fn record(facet: Option<&str>, body: Body) -> Record {
 }
 
 #[test]
-fn a_stage_row_holds_the_whole_record() {
+fn a_landing_row_holds_the_whole_record() {
     let bodies = [
         Body::Rows(RowsBody {
             data: TableRows {
@@ -55,18 +55,18 @@ fn a_stage_row_holds_the_whole_record() {
     for body in bodies {
         for facet in [None, Some("f/g")] {
             let r = record(facet, body.clone());
-            let row = StageRow::from_record(&r);
+            let row = LandingRow::from_record(&r, "blob-stream/3/17");
             assert_eq!(row.to_record().unwrap(), r);
             // The body carries only kind-specific fields.
             let body: serde_json::Map<String, serde_json::Value> =
                 serde_json::from_str(&row.body).unwrap();
-            for c in STAGE_COLUMNS.iter().filter(|c| **c != "body") {
+            for c in LANDING_COLUMNS.iter().filter(|c| **c != "body") {
                 assert!(!body.contains_key(*c), "{c} in body");
             }
-            // The stage row's JSON field names are the stage columns.
+            // The row's JSON field names are the landing columns.
             let j = serde_json::to_value(&row).unwrap();
             let names: Vec<&str> = j.as_object().unwrap().keys().map(|k| k.as_str()).collect();
-            let mut want = STAGE_COLUMNS.to_vec();
+            let mut want = LANDING_COLUMNS.to_vec();
             want.sort();
             let mut got = names.clone();
             got.sort();

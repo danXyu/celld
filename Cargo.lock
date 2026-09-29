@@ -287,6 +287,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-dynamodb"
+version = "1.128.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "875e1078bcdeab3da04c91bd4b6d169a2cd48ce1c7b027a747c0958c6aedab97"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 1.5.0",
+ "regex-lite",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "aws-sdk-s3"
 version = "1.150.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -843,7 +869,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 [[package]]
 name = "bd-backoff"
 version = "1.0.0"
-source = "git+https://github.com/bitdriftlabs/shared-core.git#6cdda8e571301af55b349f22a17307d776f1e0d0"
+source = "git+https://github.com/bitdriftlabs/shared-core.git#45596af62bd19f36deb5ca4b79167b0a8e107d34"
 dependencies = [
  "bd-workspace-hack",
  "rand 0.10.3",
@@ -853,7 +879,7 @@ dependencies = [
 [[package]]
 name = "bd-grpc"
 version = "1.0.0"
-source = "git+https://github.com/bitdriftlabs/shared-core.git#6cdda8e571301af55b349f22a17307d776f1e0d0"
+source = "git+https://github.com/bitdriftlabs/shared-core.git#45596af62bd19f36deb5ca4b79167b0a8e107d34"
 dependencies = [
  "anyhow",
  "assert_matches",
@@ -896,7 +922,7 @@ dependencies = [
 [[package]]
 name = "bd-grpc-codec"
 version = "1.0.0"
-source = "git+https://github.com/bitdriftlabs/shared-core.git#6cdda8e571301af55b349f22a17307d776f1e0d0"
+source = "git+https://github.com/bitdriftlabs/shared-core.git#45596af62bd19f36deb5ca4b79167b0a8e107d34"
 dependencies = [
  "bd-stats-common",
  "bd-workspace-hack",
@@ -910,7 +936,7 @@ dependencies = [
 [[package]]
 name = "bd-log"
 version = "1.0.0"
-source = "git+https://github.com/bitdriftlabs/shared-core.git#6cdda8e571301af55b349f22a17307d776f1e0d0"
+source = "git+https://github.com/bitdriftlabs/shared-core.git#45596af62bd19f36deb5ca4b79167b0a8e107d34"
 dependencies = [
  "anyhow",
  "bd-workspace-hack",
@@ -931,7 +957,7 @@ dependencies = [
 [[package]]
 name = "bd-log-util"
 version = "1.0.0"
-source = "git+https://github.com/bitdriftlabs/shared-core.git#6cdda8e571301af55b349f22a17307d776f1e0d0"
+source = "git+https://github.com/bitdriftlabs/shared-core.git#45596af62bd19f36deb5ca4b79167b0a8e107d34"
 dependencies = [
  "bd-workspace-hack",
  "log",
@@ -943,7 +969,7 @@ dependencies = [
 [[package]]
 name = "bd-pgv"
 version = "1.0.0"
-source = "git+https://github.com/bitdriftlabs/shared-core.git#6cdda8e571301af55b349f22a17307d776f1e0d0"
+source = "git+https://github.com/bitdriftlabs/shared-core.git#45596af62bd19f36deb5ca4b79167b0a8e107d34"
 dependencies = [
  "bd-workspace-hack",
  "log",
@@ -956,7 +982,7 @@ dependencies = [
 [[package]]
 name = "bd-runtime-config"
 version = "1.0.0"
-source = "git+https://github.com/bitdriftlabs/shared-core.git#6cdda8e571301af55b349f22a17307d776f1e0d0"
+source = "git+https://github.com/bitdriftlabs/shared-core.git#45596af62bd19f36deb5ca4b79167b0a8e107d34"
 dependencies = [
  "async-trait",
  "bd-server-stats",
@@ -977,7 +1003,7 @@ dependencies = [
 [[package]]
 name = "bd-server-stats"
 version = "1.0.0"
-source = "git+https://github.com/bitdriftlabs/shared-core.git#6cdda8e571301af55b349f22a17307d776f1e0d0"
+source = "git+https://github.com/bitdriftlabs/shared-core.git#45596af62bd19f36deb5ca4b79167b0a8e107d34"
 dependencies = [
  "anyhow",
  "bd-stats-common",
@@ -997,7 +1023,7 @@ dependencies = [
 [[package]]
 name = "bd-shutdown"
 version = "1.0.0"
-source = "git+https://github.com/bitdriftlabs/shared-core.git#6cdda8e571301af55b349f22a17307d776f1e0d0"
+source = "git+https://github.com/bitdriftlabs/shared-core.git#45596af62bd19f36deb5ca4b79167b0a8e107d34"
 dependencies = [
  "bd-workspace-hack",
  "log",
@@ -1007,7 +1033,7 @@ dependencies = [
 [[package]]
 name = "bd-stats-common"
 version = "1.0.0"
-source = "git+https://github.com/bitdriftlabs/shared-core.git#6cdda8e571301af55b349f22a17307d776f1e0d0"
+source = "git+https://github.com/bitdriftlabs/shared-core.git#45596af62bd19f36deb5ca4b79167b0a8e107d34"
 dependencies = [
  "anyhow",
  "bd-workspace-hack",
@@ -1017,7 +1043,7 @@ dependencies = [
 [[package]]
 name = "bd-time"
 version = "1.0.0"
-source = "git+https://github.com/bitdriftlabs/shared-core.git#6cdda8e571301af55b349f22a17307d776f1e0d0"
+source = "git+https://github.com/bitdriftlabs/shared-core.git#45596af62bd19f36deb5ca4b79167b0a8e107d34"
 dependencies = [
  "async-trait",
  "bd-workspace-hack",
@@ -1063,7 +1089,7 @@ dependencies = [
  "bitflags 2.13.1",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.12.1",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -1136,6 +1162,77 @@ dependencies = [
  "time",
  "tokio",
  "tokio-stream",
+]
+
+[[package]]
+name = "blob-stream-consumer"
+version = "0.1.0"
+source = "git+https://github.com/bitdriftlabs/blob-stream?rev=5c7bec508978f62bc3efdde884293f0a42b0dae9#5c7bec508978f62bc3efdde884293f0a42b0dae9"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aws-config",
+ "aws-sdk-dynamodb",
+ "aws-sdk-s3",
+ "aws-types",
+ "axum 0.8.9",
+ "bd-backoff",
+ "bd-grpc",
+ "bd-log",
+ "bd-log-util",
+ "bd-pgv",
+ "bd-runtime-config",
+ "bd-server-stats",
+ "bd-time",
+ "blob-stream-blob-store",
+ "blob-stream-broker-discovery",
+ "blob-stream-metadata-store",
+ "blob-stream-proto",
+ "blob-stream-runtime-config",
+ "blob-stream-types",
+ "bytes",
+ "futures",
+ "hyper-util",
+ "log",
+ "parking_lot",
+ "prometheus",
+ "protobuf 4.0.0-alpha.0",
+ "serde",
+ "serde_json",
+ "time",
+ "tokio",
+ "tracing",
+ "uuid",
+ "zstd",
+]
+
+[[package]]
+name = "blob-stream-metadata-store"
+version = "0.1.0"
+source = "git+https://github.com/bitdriftlabs/blob-stream?rev=5c7bec508978f62bc3efdde884293f0a42b0dae9#5c7bec508978f62bc3efdde884293f0a42b0dae9"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aws-config",
+ "aws-sdk-dynamodb",
+ "bd-backoff",
+ "bd-log",
+ "bd-log-util",
+ "bd-server-stats",
+ "blob-stream-blob-store",
+ "blob-stream-proto",
+ "blob-stream-types",
+ "bytes",
+ "log",
+ "parking_lot",
+ "prometheus",
+ "protobuf 4.0.0-alpha.0",
+ "serde",
+ "serde_dynamo",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -1386,16 +1483,26 @@ dependencies = [
 name = "celld-export-snowflake"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
+ "async-trait",
  "base64 0.22.1",
+ "bd-server-stats",
+ "blob-stream-consumer",
+ "blob-stream-proto",
+ "blob-stream-types",
  "celld-export-format",
  "getrandom 0.3.4",
  "pkcs8",
+ "protobuf-json-mapping",
  "rand_chacha 0.3.1",
  "rsa",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2 0.10.9",
  "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
  "ureq",
 ]
 
@@ -2084,7 +2191,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2769,7 +2876,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "tokio",
  "tower-service",
  "tracing",
@@ -3008,15 +3115,6 @@ name = "itertools"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba291022dbbd398a455acf126c1e341954079855bc60dfdda641363bd6922569"
-dependencies = [
- "either",
-]
-
-[[package]]
-name = "itertools"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
 dependencies = [
  "either",
 ]
@@ -3634,7 +3732,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4372,7 +4470,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.12.1",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -4401,7 +4499,7 @@ dependencies = [
 [[package]]
 name = "protobuf"
 version = "4.0.0-alpha.0"
-source = "git+https://github.com/bitdriftlabs/rust-protobuf.git?branch=patch-stack#4fb2f9ae20d27e1e5caf7c5f19d7b4c854ccaa7a"
+source = "git+https://github.com/bitdriftlabs/rust-protobuf.git?branch=patch-stack#4ea4e3845e1c743630c72b081763a2ccfeeace44"
 dependencies = [
  "bytes",
  "once_cell",
@@ -4412,7 +4510,7 @@ dependencies = [
 [[package]]
 name = "protobuf-codegen"
 version = "4.0.0-alpha.0"
-source = "git+https://github.com/bitdriftlabs/rust-protobuf.git?branch=patch-stack#4fb2f9ae20d27e1e5caf7c5f19d7b4c854ccaa7a"
+source = "git+https://github.com/bitdriftlabs/rust-protobuf.git?branch=patch-stack#4ea4e3845e1c743630c72b081763a2ccfeeace44"
 dependencies = [
  "anyhow",
  "once_cell",
@@ -4426,7 +4524,7 @@ dependencies = [
 [[package]]
 name = "protobuf-json-mapping"
 version = "4.0.0-alpha.0"
-source = "git+https://github.com/bitdriftlabs/rust-protobuf.git?branch=patch-stack#4fb2f9ae20d27e1e5caf7c5f19d7b4c854ccaa7a"
+source = "git+https://github.com/bitdriftlabs/rust-protobuf.git?branch=patch-stack#4ea4e3845e1c743630c72b081763a2ccfeeace44"
 dependencies = [
  "protobuf 4.0.0-alpha.0",
  "protobuf-support 4.0.0-alpha.0",
@@ -4436,7 +4534,7 @@ dependencies = [
 [[package]]
 name = "protobuf-parse"
 version = "4.0.0-alpha.0"
-source = "git+https://github.com/bitdriftlabs/rust-protobuf.git?branch=patch-stack#4fb2f9ae20d27e1e5caf7c5f19d7b4c854ccaa7a"
+source = "git+https://github.com/bitdriftlabs/rust-protobuf.git?branch=patch-stack#4ea4e3845e1c743630c72b081763a2ccfeeace44"
 dependencies = [
  "anyhow",
  "indexmap",
@@ -4460,7 +4558,7 @@ dependencies = [
 [[package]]
 name = "protobuf-support"
 version = "4.0.0-alpha.0"
-source = "git+https://github.com/bitdriftlabs/rust-protobuf.git?branch=patch-stack#4fb2f9ae20d27e1e5caf7c5f19d7b4c854ccaa7a"
+source = "git+https://github.com/bitdriftlabs/rust-protobuf.git?branch=patch-stack#4ea4e3845e1c743630c72b081763a2ccfeeace44"
 dependencies = [
  "thiserror 1.0.69",
 ]
@@ -4494,7 +4592,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.3",
  "rustls 0.23.43",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -4532,9 +4630,9 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4881,7 +4979,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4961,7 +5059,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5165,7 +5263,7 @@ checksum = "7bd22781911de0ca6debda95f073c8f18bec65d1a94f1fa9573f3102e514cea4"
 dependencies = [
  "ahash",
  "annotate-snippets",
- "base64 0.21.7",
+ "base64 0.22.1",
  "encoding_rs_io",
  "getrandom 0.3.4",
  "granit-parser",
@@ -5204,6 +5302,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.3",
+]
+
+[[package]]
+name = "serde_dynamo"
+version = "4.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "873a97c3f7a67dd042bceb47d056d288424b82d4c66b0a25e1a3b34675620951"
+dependencies = [
+ "aws-sdk-dynamodb",
+ "base64 0.21.7",
+ "serde",
+ "serde_core",
 ]
 
 [[package]]
@@ -5426,7 +5536,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5546,10 +5656,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6422,7 +6532,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

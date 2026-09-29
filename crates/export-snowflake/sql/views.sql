@@ -111,7 +111,7 @@ WITH fragments AS (
         PARTITION BY c.script, c.class, c.cell, c.facet, c.incarnation,
             c.position_key, c.kind, c.origin, c.table_name, c.generation,
             c.snapshot_id, c.fragment
-        ORDER BY c.loaded_at, c.file_name
+        ORDER BY c.loaded_at, c.source
     ) = 1
 ),
 whole AS (
@@ -146,7 +146,7 @@ WITH records AS (
             m.body:target_facet::STRING,
             COALESCE(m.body:target_incarnation::STRING, m.body:through_incarnation::STRING),
             TO_JSON(m.body:tables)
-        ORDER BY m.loaded_at, m.file_name
+        ORDER BY m.loaded_at, m.source
     ) = 1
 ),
 adoptions AS (

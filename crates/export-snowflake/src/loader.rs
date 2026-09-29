@@ -1,22 +1,20 @@
-//! The loader's Snowflake side: deploy the export's objects, keep one Dynamic
-//! Table per `(script, class, table)` in step with the schema union, load
-//! repair and backfill files, erase streams, and read what verify and the
-//! reconciler need.
+//! The loader's Snowflake side: deploy the export's objects, route landed
+//! records, keep one Dynamic Table per `(script, class, table)` in step with
+//! the schema union, erase streams, and read what verify and the reconciler
+//! need.
 //!
 //! Everything here goes through [`Warehouse`], one statement at a time, so
 //! the same code runs against Snowflake (the `sql-api` feature's client) and
 //! against the emulator in `sqltest/`.
 //!
-//! Records reach `EXPORT_LANDING` by the pipe, from the files the bucket sink
-//! writes. Consuming blob-stream (group `snowflake`) and writing batches to
-//! the stage waits on the blob-stream sink; when it lands, it hands the
-//! batch's files to [`Loader::load_prefix`] or leaves them to the pipe.
+//! Records reach `EXPORT_LANDING` through Snowpipe Streaming, not through
+//! here: see [`crate::consume`].
 
 use std::collections::BTreeMap;
 
 use celld_export_format::SchemaBody;
 
-use crate::{literal, statement, task_body, Deployment, DynamicTable, RenderError, LOAD_SQL};
+use crate::{literal, task_body, Deployment, DynamicTable, RenderError};
 
 /// A statement's result as the SQL API returns it: every value as text,
 /// NULL as `None`.
@@ -91,8 +89,6 @@ pub enum LoadError {
     },
     #[error(transparent)]
     Render(#[from] RenderError),
-    #[error("{0:?} is not a stage path of letters, digits and _ - . = /")]
-    StagePath(String),
     #[error("a schema record in CELL_META does not decode: {0}")]
     Schema(serde_json::Error),
 }
@@ -114,9 +110,6 @@ pub struct LoaderConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeployReport {
     pub statements: usize,
-    /// The queue the bucket's event notifications must go to for the pipe to
-    /// auto-ingest (`SHOW PIPES`'s `notification_channel`).
-    pub notification_channel: Option<String>,
     pub dynamic_tables: SyncReport,
 }
 
@@ -173,14 +166,20 @@ impl<W: Warehouse> Loader<W> {
         for s in &statements {
             self.run(&s.name, &s.sql)?;
         }
-        let pipes = self.run("show pipes", "SHOW PIPES LIKE 'EXPORT_PIPE'")?;
-        let notification_channel = pipes.get(0, "notification_channel").map(str::to_string);
         let dynamic_tables = self.sync_dynamic_tables()?;
         Ok(DeployReport {
             statements: statements.len(),
-            notification_channel,
             dynamic_tables,
         })
+    }
+
+    /// Route every landed record now, by running the route task's body,
+    /// which returns once they are routed (`EXECUTE TASK` only schedules a
+    /// run). The task does the same on its schedule; routing twice is
+    /// harmless.
+    pub fn route(&mut self) -> Result<(), LoadError> {
+        self.run("route", &task_body("export_route_task")?)?;
+        Ok(())
     }
 
     /// Every `(script, class, table)` with its `schema` records, from all
@@ -298,18 +297,6 @@ impl<W: Warehouse> Loader<W> {
         Ok(report)
     }
 
-    /// Copy the stage files under `prefix` (relative to the stage URL) into
-    /// `EXPORT_LANDING`, then route them into the tables by running the
-    /// route task's body, which returns once they are routed. This is how snapshot, repair and
-    /// backfill files load when the pipe does not see them. Files COPY has
-    /// already loaded are skipped. Returns COPY's per-file result.
-    pub fn load_prefix(&mut self, prefix: &str) -> Result<Rows, LoadError> {
-        let copy = copy_from_prefix(prefix)?;
-        let loaded = self.run("copy_into_landing", &copy)?;
-        self.run("route", &task_body("export_route_task")?)?;
-        Ok(loaded)
-    }
-
     /// Tombstone a stream, unless it already has an open tombstone for the
     /// same incarnations, and delete its rows by running the erase task's
     /// body, which returns once they are deleted. Routing stops taking its
@@ -361,24 +348,6 @@ impl<W: Warehouse> Loader<W> {
     pub fn certified(&mut self) -> Result<Rows, LoadError> {
         self.run("certified", "SELECT * FROM CELL_CERTIFIED")
     }
-}
-
-/// `copy_into_landing` reading only the stage files under `prefix`.
-pub fn copy_from_prefix(prefix: &str) -> Result<String, LoadError> {
-    let ok = !prefix.is_empty()
-        && !prefix.starts_with('/')
-        && !prefix.split('/').any(|p| p == "..")
-        && prefix
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "_-.=/".contains(c));
-    if !ok {
-        return Err(LoadError::StagePath(prefix.to_string()));
-    }
-    let copy = statement(LOAD_SQL, "copy_into_landing")?;
-    Ok(copy.sql.replace(
-        "FROM @EXPORT_STAGE",
-        &format!("FROM @EXPORT_STAGE/{prefix}"),
-    ))
 }
 
 /// The Dynamic Table for `(script, class, table)`: `PREFIX_SCRIPT_CLASS_TABLE`
@@ -446,15 +415,7 @@ mod tests {
                 columns: columns.iter().map(|c| c.to_string()).collect(),
                 data,
             };
-            Ok(if sql.starts_with("SHOW PIPES") {
-                rows(
-                    &["name", "notification_channel"],
-                    vec![vec![
-                        Some("EXPORT_PIPE".into()),
-                        Some("arn:aws:sqs:q".into()),
-                    ]],
-                )
-            } else if sql.contains("FROM CELL_META WHERE kind = 'schema'") {
+            Ok(if sql.contains("FROM CELL_META WHERE kind = 'schema'") {
                 rows(
                     &["SCRIPT", "CLASS", "BODY"],
                     self.schemas
@@ -501,8 +462,6 @@ mod tests {
     fn config() -> LoaderConfig {
         LoaderConfig {
             deployment: Deployment {
-                stage_url: "s3://b/export/changes/".into(),
-                storage_integration: "S3_INT".into(),
                 warehouse: "WH".into(),
             },
             target_lag: "1 minute".into(),
@@ -511,7 +470,7 @@ mod tests {
     }
 
     #[test]
-    fn deploy_creates_everything_resumes_the_tasks_and_reports_the_queue() {
+    fn deploy_creates_everything_and_resumes_the_tasks() {
         let mut l = Loader::new(Fake::default(), config());
         let report = l.deploy().unwrap();
         let log = &l.warehouse.log;
@@ -519,11 +478,6 @@ mod tests {
         assert_eq!(report.statements, n);
         assert!(log[..n].contains(&"ALTER TASK EXPORT_ROUTE RESUME".to_string()));
         assert!(log[..n].contains(&"ALTER TASK EXPORT_ERASE RESUME".to_string()));
-        assert!(log[n].starts_with("SHOW PIPES"));
-        assert_eq!(
-            report.notification_channel.as_deref(),
-            Some("arn:aws:sqs:q")
-        );
         assert!(log
             .iter()
             .any(|s| s.contains("CREATE TABLE IF NOT EXISTS EXPORT_DYNAMIC_TABLES")));
@@ -639,17 +593,10 @@ mod tests {
     }
 
     #[test]
-    fn load_prefix_reads_only_the_prefix_and_routes() {
+    fn route_runs_the_route_tasks_body() {
         let mut l = Loader::new(Fake::default(), config());
-        l.load_prefix("repair/2026/09/29").unwrap();
-        assert!(l.warehouse.log[0].contains("FROM @EXPORT_STAGE/repair/2026/09/29\n"));
-        assert_eq!(l.warehouse.log[1], task_body("export_route_task").unwrap());
-        for bad in ["", "/abs", "a/../b", "a b", "x'; DROP", "a\\b"] {
-            assert!(
-                matches!(copy_from_prefix(bad), Err(LoadError::StagePath(_))),
-                "{bad}"
-            );
-        }
+        l.route().unwrap();
+        assert_eq!(l.warehouse.log, [task_body("export_route_task").unwrap()]);
     }
 
     #[test]

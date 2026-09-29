@@ -1,9 +1,10 @@
 # The change export's Snowflake side (docs/design/change-export.md#the-snowflake-loader):
-# the tables, the SQL that lands bucket-sink files into them, the views that
+# the tables, the SQL that lands batches of records into them, the views that
 # derive current state, and the Dynamic Table template. Pure: it renders SQL
 # and runs nothing, except through the loader module's `Warehouse` trait. The
 # `sql-api` feature adds a Warehouse on Snowflake's SQL API and the
-# celld-export-loader binary that deploys and drives it. The tests in
+# celld-export-loader binary that deploys and drives it; the `blob-stream`
+# feature adds the consumer that feeds it from the export topic. The tests in
 # sqltest/ run the SQL and the binary against a Snowflake emulator.
 [package]
 name = "celld-export-snowflake"
@@ -25,11 +26,36 @@ pkcs8 = { workspace = true, optional = true }
 rsa = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 ureq = { version = "3.4.0", optional = true }
+anyhow = { workspace = true, optional = true }
+bd-server-stats = { workspace = true, optional = true }
+blob-stream-consumer = { workspace = true, optional = true }
+blob-stream-proto = { workspace = true, optional = true }
+blob-stream-types = { workspace = true, optional = true }
+protobuf-json-mapping = { workspace = true, optional = true }
+serde_yaml = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["macros", "rt-multi-thread", "signal", "time"] }
+tokio-util = { workspace = true, optional = true }
 
 [features]
 sql-api = ["dep:base64", "dep:getrandom", "dep:pkcs8", "dep:rsa", "dep:sha2", "dep:ureq"]
+# The consumer that feeds the loader from the blob-stream topic. Off by
+# default for the same reason as celld's `export-blob-stream`: the bitdrift
+# crates, a patched protobuf, and protoc to build them. Without it,
+# `celld-export-loader run` refuses and `ingest` still lands record files.
+blob-stream = [
+    "dep:anyhow",
+    "dep:bd-server-stats",
+    "dep:blob-stream-consumer",
+    "dep:blob-stream-proto",
+    "dep:blob-stream-types",
+    "dep:protobuf-json-mapping",
+    "dep:serde_yaml",
+    "dep:tokio",
+    "dep:tokio-util",
+]
 
 [dev-dependencies]
+async-trait.workspace = true
 rand_chacha = "0.3"
 
 [[bin]]

@@ -1,17 +1,18 @@
 """Check the export on a real Snowflake account, where the emulator cannot:
-the stage, the pipe's auto-ingest, the stream, the tasks, and the Dynamic
-Tables' refresh. The README's "Verifying on a real account" says when to
-run each command.
+the landing insert's JSON casts, the stream, the tasks, and the Dynamic
+Tables' refresh. The README's "Verifying on a real account" says when to run
+each command.
 
     python real_account.py files OUTDIR
-        Write each scenario's records as a Parquet file in the bucket sink's
-        layout (OUTDIR/<scenario>.parquet), and OUTDIR/edge.parquet, one row
-        whose unsigned columns hold 2^64-1.
+        Write each scenario's records as JSON lines, as `celld export
+        inspect` prints them and `celld-export-loader ingest` reads them
+        (OUTDIR/<scenario>.jsonl), and OUTDIR/edge.jsonl, one record whose
+        unsigned fields hold their largest values.
 
     python real_account.py check SCENARIO
-        Compare what the account derived from SCENARIO's file with what the
-        reference consumer derives, as the emulator tests do, and print each
-        Dynamic Table's refresh mode. Connects with SNOWFLAKE_ACCOUNT,
+        Compare what the account derived from SCENARIO's records with what
+        the reference consumer derives, as the emulator tests do, and print
+        each Dynamic Table's refresh mode. Connects with SNOWFLAKE_ACCOUNT,
         SNOWFLAKE_USER, SNOWFLAKE_PRIVATE_KEY_FILE, SNOWFLAKE_ROLE (optional),
         SNOWFLAKE_DATABASE, SNOWFLAKE_SCHEMA and SNOWFLAKE_WAREHOUSE.
 """
@@ -23,43 +24,25 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pyarrow as pa
-import pyarrow.parquet as pq
-
 from conftest import CRATE, RANDOM_COUNT
 from test_sql import Warehouse, check
 
-# crates/celld/export_sink.rs, MESSAGE_TYPE.
-SINK_SCHEMA = pa.schema([
-    pa.field("kind", pa.string(), nullable=False),
-    pa.field("script", pa.string(), nullable=False),
-    pa.field("class", pa.string(), nullable=False),
-    pa.field("cell", pa.string(), nullable=False),
-    pa.field("cell_name", pa.string()),
-    pa.field("facet", pa.string()),
-    pa.field("incarnation", pa.uint64(), nullable=False),
-    pa.field("epoch", pa.uint64(), nullable=False),
-    pa.field("txid", pa.uint64(), nullable=False),
-    pa.field("commit", pa.uint64(), nullable=False),
-    pa.field("committed_at", pa.timestamp("ms", tz="UTC"), nullable=False),
-    pa.field("node", pa.string(), nullable=False),
-    pa.field("origin", pa.string(), nullable=False),
-    pa.field("fragment", pa.uint32(), nullable=False),
-    pa.field("fragments", pa.uint32(), nullable=False),
-    pa.field("body", pa.string(), nullable=False),
-])
+TOP64, TOP32 = 2**64 - 1, 2**32 - 1
+
+# A record at the edge of every unsigned field: a watermark, since it has
+# no rows to project.
+EDGE = {
+    "kind": "watermark", "script": "edge", "class": "Edge", "cell": "e1",
+    "cell_name": None, "facet": None, "incarnation": TOP64, "epoch": TOP64, "txid": TOP64,
+    "commit": TOP64, "committed_at": 1_790_000_000_123, "node": "n", "origin": "live",
+    "fragment": TOP32, "fragments": TOP32,
+    "from": None, "through": {"epoch": TOP64, "txid": TOP64, "commit": TOP64},
+    "commits": TOP64, "records": TOP64,
+}
 
 
-def sink_row(stage_row):
-    """A stage row as the bucket sink writes it: its body also carries `kind`."""
-    row = dict(stage_row)
-    row["body"] = json.dumps({"kind": row["kind"], **json.loads(row["body"])})
-    return row
-
-
-def write_parquet(rows, path):
-    columns = {f.name: [r[f.name] for r in rows] for f in SINK_SCHEMA}
-    pq.write_table(pa.Table.from_pydict(columns, schema=SINK_SCHEMA), path, compression="zstd")
+def write_jsonl(records, path):
+    Path(path).write_text("".join(json.dumps(r) + "\n" for r in records))
 
 
 def scenarios():
@@ -76,18 +59,9 @@ def files(outdir):
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     for name, s in scenarios().items():
-        write_parquet([sink_row(r) for r in s["stage_rows"]], outdir / f"{name}.parquet")
+        write_jsonl(s["records"], outdir / f"{name}.jsonl")
         (outdir / f"{name}.tombstones.json").write_text(json.dumps(s["tombstones"]))
-    top = 2**64 - 1
-    write_parquet(
-        [{
-            "kind": "heartbeat", "script": "edge", "class": "Edge", "cell": "e1",
-            "cell_name": None, "facet": None, "incarnation": top, "epoch": top, "txid": top,
-            "commit": top, "committed_at": 1_790_000_000_123, "node": "n", "origin": "live",
-            "fragment": 2**32 - 1, "fragments": 2**32 - 1, "body": '{"kind":"heartbeat"}',
-        }],
-        outdir / "edge.parquet",
-    )
+    write_jsonl([EDGE], outdir / "edge.jsonl")
 
 
 def with_loader_names(w, scenario):

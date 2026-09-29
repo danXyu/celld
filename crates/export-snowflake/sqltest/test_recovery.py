@@ -5,7 +5,7 @@ import json
 from test_sql import load, warehouse
 
 
-def stage(kind, txid, body, script="app", incarnation=1):
+def landing(kind, txid, body, script="app", incarnation=1):
     return dict(
         kind=kind,
         script=script,
@@ -22,17 +22,18 @@ def stage(kind, txid, body, script="app", incarnation=1):
         fragment=1,
         fragments=1,
         body=json.dumps(body),
+        source="test",
     )
 
 
 def setup(w, records):
-    load(w, dict(tombstones=[], stage_rows=records, dynamic_tables=[]))
+    load(w, dict(tombstones=[], landing_rows=records, dynamic_tables=[]))
 
 
 def test_scriptless_recovery_targets_existing_stream(warehouse):
     setup(warehouse, [
-        stage("link", 0, dict(start_txid=0, prev_epoch=None, prev_txid=None, mode="fresh")),
-        stage("recovered", 5, dict(
+        landing("link", 0, dict(start_txid=0, prev_epoch=None, prev_txid=None, mode="fresh")),
+        landing("recovered", 5, dict(
             session="dead/1", head=dict(epoch=1, txid=5, commit=0), loss=False, cells=1,
         ), script="", incarnation=0),
     ])
@@ -43,10 +44,10 @@ def test_scriptless_recovery_targets_existing_stream(warehouse):
 
 def test_recovered_loss_below_certification_is_detected(warehouse):
     setup(warehouse, [
-        stage("watermark", 10, dict(
+        landing("watermark", 10, dict(
             through=dict(epoch=1, txid=10, commit=1), commits=0, records=0,
         )),
-        stage("recovered", 5, dict(
+        landing("recovered", 5, dict(
             session="dead/1", head=dict(epoch=1, txid=5, commit=0), loss=True, cells=1,
         )),
     ])
