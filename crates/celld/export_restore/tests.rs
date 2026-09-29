@@ -173,13 +173,16 @@ async fn nothing_is_written_to_the_bucket_or_the_image() {
     };
     assert_eq!(keys(&before), keys(&after));
 
-    let client = ReadOnly(ObjectStoreClient::with_store(
-        ObjectStoreConfig {
-            path: format!("{}cells/{SCOPE}/ltx/e3", bucket.prefix),
-            ..Default::default()
-        },
-        bucket.store.clone(),
-    ));
+    let client = ReadOnly(
+        ObjectStoreClient::with_store(
+            ObjectStoreConfig {
+                path: format!("{}cells/{SCOPE}/ltx/e3", bucket.prefix),
+                ..Default::default()
+            },
+            bucket.store.clone(),
+        ),
+        None,
+    );
     assert!(client
         .write_ltx_file(0, TXID(7), TXID(7), &image(7, 7, 7))
         .await

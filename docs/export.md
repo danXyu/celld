@@ -13,10 +13,23 @@ watermarks that certify what the bucket holds. Every activation of a cell
 starts its stream with a `link` record naming the state it restored, so a
 consumer sees a gap across a restart or a move between nodes. Each facet
 exports on a stream of its own, and deleting a facet puts a `deleted`
-record for it and every facet below it on its root's stream. Repair
-and the blob-stream sink are not built yet. A node with
-`CELLD_EXPORT_SINK=blob-stream` refuses
-to start.
+record for it and every facet below it on its root's stream. Repair is not
+built yet.
+
+The blob-stream sink sends each record to a
+[blob-stream](https://github.com/bitdriftlabs/blob-stream) topic instead. Its
+client is behind the `export-blob-stream` Cargo feature, which a default
+build leaves out; a node without it refuses to start with
+`CELLD_EXPORT_SINK=blob-stream`. Build with
+`cargo build --features export-blob-stream` (the client's protobuf code
+generation needs `protoc` on the build machine). A node exports through one
+sink at a time: `bucket,blob-stream` refuses to start.
+
+blob-stream partitions a topic by writer, one writer per zone of the broker
+deployment. For a topic with several writers, list its zones in writer order
+in `CELLD_EXPORT_ZONES` and give each node its zone in `CELLD_ZONE`; the
+node produces as the writer at its zone's position. A single-writer topic
+needs neither.
 
 Export is off by default, and the off state costs nothing: with
 `CELLD_EXPORT` unset or `0`, celld opens no capture session, holds no
@@ -41,8 +54,10 @@ relate one variable to another apply only with `CELLD_EXPORT=1`.
 | `CELLD_EXPORT_FLUSH_BYTES` | `8388608` | The buffered bytes that trigger an early bucket sink flush. |
 | `CELLD_EXPORT_RETENTION` | `none` | `<n>d` makes the bucket sink delete its files after `n` days. `none` leaves the lifecycle to the consumer. |
 | `CELLD_EXPORT_TOPIC` | `celld-changes` | The blob-stream topic. |
-| `CELLD_EXPORT_BROKERS` | unset | Comma-separated `host:port` brokers, or `k8s://NAMESPACE/SERVICE`. Required when the blob-stream sink is on. |
-| `CELLD_EXPORT_WRITER_ID` | the node's zone | The blob-stream writer id. |
+| `CELLD_EXPORT_BROKERS` | unset | Comma-separated `NODE_ID=host:port` brokers, or `k8s://NAMESPACE/SERVICE`. A static broker's `NODE_ID` must be the node ID the broker itself is configured with (its `node_identity`), because the producer assigns partitions by node ID. Required when the blob-stream sink is on. |
+| `CELLD_EXPORT_PARTITIONS` | unset | The topic's partition count, which every producer and consumer of the topic must agree on. Required when the blob-stream sink is on. |
+| `CELLD_EXPORT_ZONES` | unset | The topic's writer zones, comma-separated in the broker deployment's writer order: a zone's writer number is its position, from 0. Every node must list them alike. Unset means a single-writer topic. |
+| `CELLD_EXPORT_WRITER_ID` | the node's zone (`CELLD_ZONE`) | The zone whose writer this node produces as. It must be one of `CELLD_EXPORT_ZONES`. |
 | `CELLD_EXPORT_RETRY_MS` | `30000` | The blob-stream retry deadline before a record counts as dropped. |
 | `CELLD_EXPORT_RECONCILE` | `24h` | The reconciler interval, as `<n>s`, `<n>m`, `<n>h`, or `<n>d`. The loader deployment runs the reconciler, not the node. |
 

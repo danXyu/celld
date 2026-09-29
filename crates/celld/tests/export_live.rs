@@ -235,19 +235,24 @@ impl Dev {
 
 /// Every export record the bucket sink has written to the dev store.
 fn exported(project: &Path) -> Vec<celld_export_format::Record> {
+    exported_under(project, "export/changes/")
+}
+
+/// The export records under one key prefix of the dev store.
+fn exported_under(project: &Path, prefix: &str) -> Vec<celld_export_format::Record> {
     let store = project.join(".celld/dev/objects.sqlite3");
     let Ok(connection) =
         rusqlite::Connection::open_with_flags(&store, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
     else {
         return Vec::new();
     };
-    let Ok(mut statement) = connection
-        .prepare("SELECT body FROM objects WHERE key LIKE 'export/changes/%' ORDER BY key")
+    let Ok(mut statement) =
+        connection.prepare("SELECT body FROM objects WHERE key LIKE ?1 || '%' ORDER BY key")
     else {
         return Vec::new();
     };
     let bodies: Vec<Vec<u8>> = statement
-        .query_map([], |row| row.get(0))
+        .query_map([prefix], |row| row.get(0))
         .unwrap()
         .map(Result::unwrap)
         .collect();
@@ -664,6 +669,57 @@ async fn exported_rows_match_the_restored_cell() {
         })
         .collect();
 
+    // Repair both streams from the same bucket at its head. The snapshot on
+    // its own holds each cell's rows, and applied over the live records it
+    // changes nothing and closes no gap that was not there.
+    // Cells a and b, told from the other cells by the rows they hold.
+    let streams: Vec<celld_export_format::StreamId> = [&live_a, &live_b]
+        .iter()
+        .filter_map(|live| {
+            let cell = cells.iter().find(|cell| {
+                stream_state(&records, cell).is_some_and(|(state, _)| {
+                    exported_rows(&state, "items")
+                        == cell_rows(live, "items", &["id", "name", "qty"])
+                        && exported_rows(&state, "notes") == cell_rows(live, "notes", &["body"])
+                })
+            })?;
+            records
+                .iter()
+                .find(|r| &r.envelope.stream.cell == cell)
+                .map(|r| r.envelope.stream.clone())
+        })
+        .collect();
+    assert_eq!(streams.len(), 2, "both cells have an exported stream");
+    let reports = repair(project.path(), &streams).await;
+    let repaired = exported_under(project.path(), "export/changes/repair-test/");
+    for (stream, report) in streams.iter().zip(&reports) {
+        assert_eq!(
+            report.status,
+            celld::export_repair::Status::Written,
+            "{report:?}"
+        );
+        let (_, newest) = stream_state(&records, &stream.cell).unwrap();
+        let reached = report.reached.unwrap();
+        assert!(
+            (reached.epoch, reached.txid) >= (newest.epoch, newest.txid),
+            "repair reached {reached:?}, short of the newest live commit {newest:?}"
+        );
+        let (alone, _) = stream_state(&repaired, &stream.cell).unwrap();
+        let mut both = records.clone();
+        both.extend(repaired.iter().cloned());
+        let (over_live, _) = stream_state(&both, &stream.cell).unwrap();
+        let (live, _) = stream_state(&records, &stream.cell).unwrap();
+        for table in ["items", "notes"] {
+            assert_eq!(exported_rows(&alone, table), exported_rows(&live, table));
+            assert_eq!(
+                exported_rows(&over_live, table),
+                exported_rows(&live, table)
+            );
+        }
+        assert!(over_live.gaps.is_empty() && over_live.uncertain.is_empty());
+        assert_eq!(over_live.certified_head(), live.certified_head());
+    }
+
     // Restore both cells from the bucket and compare what they hold now
     // with what the export says they hold.
     let dev = Dev::start(&client, project.path(), 2).await;
@@ -788,4 +844,51 @@ async fn exported_rows_match_the_restored_cell() {
         assert_eq!(body.prev_epoch, Some(*first), "{link:#?}");
         assert!(body.prev_txid.is_some(), "{link:#?}");
     }
+}
+
+/// Snapshot `streams` at the bucket head of the dev store through the bucket
+/// sink, as `celld export repair` does, under the node `repair-test`.
+async fn repair(
+    project: &Path,
+    streams: &[celld_export_format::StreamId],
+) -> Vec<celld::export_repair::Report> {
+    use celld::export_repair::{run, Job, Settings};
+    let bucket =
+        celld::dev::open_local_bucket(&project.join(".celld/dev/objects.sqlite3")).unwrap();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let sink = celld::export_sink::BucketSink::start(
+        bucket.clone(),
+        "repair-test".to_string(),
+        celld::export_sink::BucketSinkConfig {
+            flush: Duration::from_millis(50),
+            ..Default::default()
+        },
+        tx,
+    );
+    let jobs = streams
+        .iter()
+        .map(|stream| Job {
+            stream: stream.clone(),
+            target: celld::export_restore::Target::Head,
+            reasons: ["test".to_string()].into(),
+            pin_incarnation: true,
+        })
+        .collect();
+    let settings = Settings {
+        node: "repair-test".to_string(),
+        max_record_bytes: 16 << 10,
+        denied_tables: Default::default(),
+        concurrency: 2,
+        buffer_bytes: 1 << 20,
+    };
+    run(
+        &bucket,
+        std::sync::Arc::new(sink),
+        rx,
+        jobs,
+        &settings,
+        None,
+        |_| {},
+    )
+    .await
 }

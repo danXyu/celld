@@ -230,6 +230,7 @@ pub fn validate() -> anyhow::Result<()> {
         "CELLD_EXPORT_FLUSH_MS",
         "CELLD_EXPORT_MAX_RECORD_BYTES",
         "CELLD_EXPORT_MAX_TX_BYTES",
+        "CELLD_EXPORT_PARTITIONS",
         "CELLD_EXPORT_QUEUE_BYTES",
         "CELLD_EXPORT_RETRY_MS",
         "CELLD_FETCH_TIMEOUT_S",
@@ -298,6 +299,9 @@ pub fn validate() -> anyhow::Result<()> {
         if !matches!(value.as_str(), "release" | "sticky") {
             bail!("CELLD_PRESSURE_OWNERSHIP must be release or sticky, not {value:?}");
         }
+    }
+    if let Some(zone) = value("CELLD_ZONE")? {
+        crate::export::parse_zone("CELLD_ZONE", &zone)?;
     }
     if let Some(node) = value("CELLD_NODE")? {
         crate::machine::validate_node_name(&node).map_err(|error| anyhow!("CELLD_NODE {error}"))?;

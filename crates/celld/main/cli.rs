@@ -278,6 +278,7 @@ USAGE:
   celld d1 migrations apply DATABASE [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX]
   celld d1 execute DATABASE --command SQL [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX]
   celld export reconcile|verify|erase --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
+  celld export repair|backfill|inspect --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
   celld kv get|put|delete|list|info NAMESPACE --bucket [s3://|gs://|az://]NAME[/PREFIX]
   celld queue info|peek|purge|pause|resume|redrive QUEUE --bucket [s3://|gs://|az://]NAME[/PREFIX]
   celld r2 get|head|put|delete|list BUCKET [KEY] --bucket [s3://|gs://|az://]NAME[/PREFIX]
@@ -339,6 +340,7 @@ ENVIRONMENT:
   CELLD_TRUST_FORWARDED_HEADERS   `1` trusts X-Forwarded-Host and
                                   X-Forwarded-Proto
   CELLD_NODE                      Node-session ID (default: generated)
+  CELLD_ZONE                      The node's availability zone
   CELLD_WATCH                     Local SQLite/replication working directory
   CELLD_ESBUILD                   Override esbuild executable path
   CELLD_ACTIVATIONS               Concurrent cold activations

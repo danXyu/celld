@@ -61,6 +61,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends sqlite3
 
+      # The export-blob-stream feature's client generates its protobuf code at
+      # build time. The runner's apt protoc is too old for proto3 optional
+      # fields and lacks the well-known types, so use a pinned release.
+      - name: Install protoc
+        run: |
+          set -euo pipefail
+          curl -sSfL -o "$RUNNER_TEMP/protoc.zip" \
+            https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-linux-x86_64.zip
+          sudo unzip -q -o "$RUNNER_TEMP/protoc.zip" -d /usr/local bin/protoc 'include/*'
+          protoc --version
+
       - uses: Swatinem/rust-cache@v2
         with:
           # Saving from pull requests would only fill the repository's cache
@@ -78,3 +89,7 @@ jobs:
 
       - name: Test
         run: cargo test --locked
+
+      # The blob-stream sink's own tests, with its client compiled in.
+      - name: Test, blob-stream sink
+        run: cargo test --locked -p celld --features export-blob-stream --lib export_blob_stream
