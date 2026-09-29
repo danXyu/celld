@@ -4122,6 +4122,9 @@ impl Actor {
                     }
                 }
             }
+            // Nothing sends `Event::ExportTicket` until the change exporter is
+            // wired in, so no verdict has an exporter to reach yet.
+            Effect::ExportProven { .. } => {}
             Effect::CloseWebSocket { cell, websocket } => {
                 // The core declined to hold this transport. Drop it and tell
                 // the core it is gone, so the cell is not left believing it

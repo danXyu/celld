@@ -155,6 +155,63 @@ impl State {
         }
     }
 
+    /// Open a barrier for the change exporter: prove the cell's committed
+    /// `position` durable before the exporter releases what it captured.
+    ///
+    /// The exporter gets what an output gets and nothing else: the node's
+    /// authority is checked now, a fence drains the barrier, and a bucket
+    /// proof waits for the ownership read. It is not a request, so it pins
+    /// nothing, and a read-only output never trails it: it reveals nothing
+    /// to a client, and the writes a reader could see have barriers or
+    /// observed positions of their own.
+    pub(crate) fn export_ticket(
+        &mut self,
+        cell: CellId,
+        epoch: Epoch,
+        position: u64,
+        ticket: u64,
+        effects: &mut Vec<Effect>,
+    ) {
+        let refused = if !self.node_authoritative() {
+            Some(RequestError::NodeFenced)
+        } else if !matches!(
+            self.cells.get(&cell).map(|record| &record.phase),
+            Some(Phase::Resident { epoch: current }) if *current == epoch
+        ) {
+            // A proof of a residency this node no longer holds proves nothing
+            // the exporter of that residency may release.
+            Some(RequestError::DurabilityUnproven)
+        } else {
+            None
+        };
+        if let Some(error) = refused {
+            effects.push(Effect::ExportProven {
+                cell,
+                epoch,
+                ticket,
+                result: Err(error),
+            });
+            return;
+        }
+        let op = self.op();
+        self.barriers.insert(
+            op,
+            Barrier {
+                owner: GateOwner::Export { ticket },
+                cell: cell.clone(),
+                epoch,
+                position,
+                followers: Vec::new(),
+            },
+        );
+        effects.push(Effect::AwaitDurable {
+            op,
+            cell,
+            epoch,
+            position,
+        });
+    }
+
     /// Whether a verified proof of this residency, at `epoch`, already covers
     /// `observed`.
     fn proven_covers(&self, cell: &CellId, epoch: Epoch, observed: u64) -> bool {
@@ -178,7 +235,10 @@ impl State {
         effects: &mut Vec<Effect>,
     ) {
         if let Some((_, barrier)) = self.barriers.iter_mut().rev().find(|(_, barrier)| {
-            barrier.cell == cell && barrier.epoch == epoch && barrier.position >= observed
+            barrier.cell == cell
+                && barrier.epoch == epoch
+                && barrier.position >= observed
+                && barrier.trailable()
         }) {
             barrier.followers.push(held);
             return;
@@ -262,7 +322,7 @@ impl State {
             .barriers
             .iter_mut()
             .rev()
-            .find(|(_, barrier)| barrier.cell == cell)
+            .find(|(_, barrier)| barrier.cell == cell && barrier.trailable())
         {
             barrier.followers.push(held);
         } else {
@@ -382,6 +442,19 @@ impl State {
                     outcome,
                     effects,
                 );
+            }
+            // The exporter learns the verdict and reads the proven txid
+            // itself. A failure leaves the cell alone: the exporter retries,
+            // and a write this proof could not cover fails through its own
+            // barrier.
+            GateOwner::Export { ticket } => {
+                effects.push(Effect::ExportProven {
+                    cell: gate.cell.clone(),
+                    epoch: gate.epoch,
+                    ticket,
+                    result,
+                });
+                return;
             }
         }
         // A follower is always an output: an alarm opens a barrier, it never
