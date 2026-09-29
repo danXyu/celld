@@ -319,3 +319,56 @@ fn fragments_apply_only_once_complete() {
     assert_eq!(c.incomplete(), 0);
     assert_eq!(rows_of(&c.stream(&stream()).unwrap(), "t").len(), 100);
 }
+
+#[test]
+fn bulk_markers_for_two_tables_of_one_commit_both_count() {
+    let big = |t: &str| rows(pos(2, 2), t, 1, vec![put(1, &"q".repeat(2000))]);
+    let mut records = vec![
+        live(pos(1, 1), Body::Schema(schema("a", 1))),
+        live(pos(1, 1), Body::Schema(schema("b", 1))),
+    ];
+    for t in ["a", "b"] {
+        let Split::Bulk(b) = split(big(t), 1000) else {
+            panic!("expected bulk")
+        };
+        records.push(*b);
+    }
+    assert_ne!(DedupKey::of(&records[2]), DedupKey::of(&records[3]));
+    for order in [records.clone(), records.into_iter().rev().collect()] {
+        assert_eq!(apply(order).uncertain.len(), 2);
+    }
+}
+
+#[test]
+fn a_table_seen_only_in_a_bulk_marker_is_uncertain() {
+    let tg = TableGen {
+        table: "t".into(),
+        generation: 1,
+    };
+    let bulk = live(
+        pos(2, 2),
+        Body::Bulk(BulkBody {
+            tables: vec![tg.clone()],
+        }),
+    );
+    assert!(apply(vec![bulk.clone()]).uncertain.contains(&tg));
+
+    // A later snapshot still clears it, and a closed generation is not
+    // uncertain.
+    let repaired = apply(vec![
+        bulk.clone(),
+        snapshot_end(pos(3, 3), "s", SnapshotScope::Stream, &[("t", 1)], 0),
+    ]);
+    assert!(repaired.uncertain.is_empty());
+    let dropped = apply(vec![
+        bulk,
+        live(
+            pos(4, 4),
+            Body::Schema(SchemaBody {
+                dropped: true,
+                ..schema("t", 1)
+            }),
+        ),
+    ]);
+    assert!(dropped.uncertain.is_empty());
+}

@@ -264,7 +264,9 @@ fn derive(all: &[Record]) -> StreamState {
     let mut closed: BTreeSet<TableGen> = BTreeSet::new();
     let mut renames: Vec<(&str, Position)> = Vec::new();
     for r in &records {
-        let tg = match &r.body {
+        // A `bulk` marker names generations too: a table seen only through
+        // one is still uncertain.
+        let tgs = match &r.body {
             Body::Schema(s) => {
                 let tg = TableGen {
                     table: s.table.clone(),
@@ -276,15 +278,18 @@ fn derive(all: &[Record]) -> StreamState {
                 if let Some(from) = &s.renamed_from {
                     renames.push((from.as_str(), r.position()));
                 }
-                tg
+                vec![tg]
             }
+            Body::Bulk(b) => b.tables.clone(),
             _ => match r.body.table_rows() {
-                Some(d) => d.table_gen(),
+                Some(d) => vec![d.table_gen()],
                 None => continue,
             },
         };
-        let at = opened.entry(tg).or_insert(r.position());
-        *at = (*at).min(r.position());
+        for tg in tgs {
+            let at = opened.entry(tg).or_insert(r.position());
+            *at = (*at).min(r.position());
+        }
     }
     let newest: BTreeMap<&str, u64> = opened.keys().fold(BTreeMap::new(), |mut m, tg| {
         let g = m.entry(tg.table.as_str()).or_insert(0);

@@ -7,7 +7,7 @@
 //! which adds what tells two non-row records at one position apart: the
 //! kind, the origin, and the snapshot id.
 
-use crate::record::{Body, Kind, Origin, Position, Record, StreamId};
+use crate::record::{Body, Kind, Origin, Position, Record, StreamId, TableGen};
 use crate::value::Value;
 
 /// Identifies a whole record, all fragments together.
@@ -24,6 +24,9 @@ pub struct RecordKey {
     pub snapshot_id: Option<String>,
     /// For `deleted`: the stream it names, when not its own.
     pub target: Option<(String, u64)>,
+    /// For `bulk`: the generations it marks, so markers for two tables of
+    /// one commit stay distinct.
+    pub bulk_tables: Vec<TableGen>,
 }
 
 impl RecordKey {
@@ -40,6 +43,14 @@ impl RecordKey {
             Body::Deleted(b) => (None, None, b.facet.clone().zip(b.incarnation)),
             _ => (None, None, None),
         };
+        let bulk_tables = match &r.body {
+            Body::Bulk(b) => {
+                let mut t = b.tables.clone();
+                t.sort();
+                t
+            }
+            _ => Vec::new(),
+        };
         Self {
             stream: r.envelope.stream.clone(),
             position: r.envelope.position,
@@ -48,6 +59,7 @@ impl RecordKey {
             table,
             snapshot_id,
             target,
+            bulk_tables,
         }
     }
 }
