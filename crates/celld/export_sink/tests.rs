@@ -157,6 +157,7 @@ fn every_kind() -> Vec<Record> {
             facet: Some("child".into()),
             incarnation: Some(u64::MAX),
             subtree: true,
+            through_incarnation: None,
         }),
         Body::Watermark(WatermarkBody {
             from: None,
