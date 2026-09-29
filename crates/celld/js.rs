@@ -6152,7 +6152,7 @@ impl Worker {
         name: &str,
         id: &str,
         props_sc: Vec<u8>,
-        file: (std::path::PathBuf, bool),
+        file: crate::host_channels::FacetFile,
     ) -> Result<Option<i64>> {
         let compat = self.inner.as_ref().expect("live worker isolate").compat;
         let (mut locker, _cells) = self.lock();
@@ -6169,7 +6169,6 @@ impl Worker {
         let cs = &mut v8::ContextScope::new(hs, context);
         let tc = std::pin::pin!(v8::TryCatch::new(cs));
         let tc = &mut tc.init();
-        let (path, restored) = file;
         adopt_embedded_cell(
             tc,
             cell,
@@ -6178,8 +6177,9 @@ impl Worker {
             EmbeddedStartup {
                 id,
                 props_sc,
-                path,
-                restored,
+                path: file.path,
+                restored: file.restored,
+                incarnation: file.incarnation,
             },
             compat,
         )
@@ -7852,7 +7852,7 @@ fn facet_scope(class_name: &str, parent_scope: &str, owner: &str, name: &str) ->
 async fn open_facet_file(
     parent: &storage::StorageIdentity,
     name: &str,
-) -> Result<(std::path::PathBuf, bool), String> {
+) -> Result<crate::host_channels::FacetFile, String> {
     let mut names = parent.facet_path.clone();
     names.push(name.to_string());
     let Some(sender) = FACET_TX.get() else {
@@ -7865,7 +7865,11 @@ async fn open_facet_file(
             .replace('/', "-");
         let root = std::path::Path::new(&parent.root_path);
         let file = root.file_name().unwrap().to_string_lossy();
-        return Ok((root.with_file_name(format!("{file}.{facet}.sqlite")), false));
+        return Ok(crate::host_channels::FacetFile {
+            path: root.with_file_name(format!("{file}.{facet}.sqlite")),
+            restored: false,
+            incarnation: None,
+        });
     };
     let (reply, receive) = tokio::sync::oneshot::channel();
     let request = FacetReq::Open {
@@ -8210,7 +8214,7 @@ fn op_facet_delete(
     names.push(name);
     let async_id = asyncrt::enqueue(async move {
         let Some(sender) = FACET_TX.get() else {
-            let (path, _) = open_facet_file(&parent, names.last().unwrap()).await?;
+            let path = open_facet_file(&parent, names.last().unwrap()).await?.path;
             for suffix in ["", "-wal", "-shm"] {
                 let mut file = path.clone().into_os_string();
                 file.push(suffix);
