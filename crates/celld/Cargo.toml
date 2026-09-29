@@ -7,6 +7,8 @@ license = "Apache-2.0"
 
 
 [features]
+# Internal fixtures for the export Criterion target; absent from ordinary builds.
+export-bench = []
 # The blob-stream sink for change export. Off by default: it pulls in the
 # bitdrift client crates and a patched protobuf that a default build does not
 # carry. Without it, `CELLD_EXPORT_SINK=blob-stream` refuses to start.
@@ -109,5 +111,11 @@ libc.workspace = true
 nix.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 lz4_flex.workspace = true
 proptest.workspace = true
+
+[[bench]]
+name = "export_pipeline"
+harness = false
+required-features = ["export-bench"]

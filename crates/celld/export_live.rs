@@ -2676,3 +2676,8 @@ mod tests {
         assert!(states.get(("Items:a".into(), 1, 1)).unwrap().frozen);
     }
 }
+
+#[cfg(feature = "export-bench")]
+#[doc(hidden)]
+#[path = "export_live/bench.rs"]
+pub mod bench;
