@@ -385,6 +385,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "celld-export-snowflake"
+version = "0.0.0"
+dependencies = [
+ "celld-export-format",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "celld-logic"
 version = "0.1.0"
 
