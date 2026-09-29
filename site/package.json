@@ -1,0 +1,29 @@
+{
+  "name": "celld-fork-site",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "version": "0.0.0",
+  "packageManager": "pnpm@11.15.0",
+  "engines": {
+    "node": ">=24 <27"
+  },
+  "scripts": {
+    "sync": "node scripts/sync-docs.mjs",
+    "predev": "pnpm sync",
+    "dev": "astro dev",
+    "prebuild": "pnpm sync",
+    "build": "astro build && node scripts/check-links.mjs",
+    "preview": "astro preview",
+    "check": "pnpm build"
+  },
+  "dependencies": {
+    "@astrojs/starlight": "^0.42.2",
+    "astro": "^7.2.10",
+    "sharp": "^0.35.3",
+    "starlight-links-validator": "^0.26.0"
+  },
+  "devDependencies": {
+    "parse5": "8.0.0"
+  }
+}

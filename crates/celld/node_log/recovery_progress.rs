@@ -110,6 +110,13 @@ impl Progress {
         Ok(progress)
     }
 
+    /// Every cell epoch covered so far, with the TXID it is covered through.
+    pub fn covered(&self) -> impl Iterator<Item = (&str, u64, u64)> + '_ {
+        self.covered
+            .iter()
+            .map(|((cell, epoch), through)| (cell.as_str(), *epoch, *through))
+    }
+
     pub fn through(&self, cell: &str, epoch: u64) -> Option<u64> {
         self.covered.get(&(cell.to_string(), epoch)).copied()
     }

@@ -252,6 +252,9 @@ impl Cells {
     /// Capture row changes on every cell opened from now on, for change
     /// export. Off by default.
     pub(crate) fn set_export_capture(&self, settings: Option<export_capture::Settings>) {
+        if settings.is_some() {
+            DROP_HINTS_WANTED.with(|wanted| wanted.set(true));
+        }
         self.export_capture.set(settings);
     }
 
@@ -520,6 +523,24 @@ thread_local! {
     /// authorizer otherwise denies; toggling the authorizer off instead would
     /// expire every cached statement on each pull.
     static CAPTURE_PULL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set on a thread whose cells change export captures. Only then is
+    /// `DROP_HINTS` collected.
+    static DROP_HINTS_WANTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Exported tables a `DROP TABLE` or `ALTER TABLE` was prepared or run
+    /// for since the last check point. A table dropped, or renamed away, and
+    /// another created under its name with the same definition between two
+    /// safe points leaves `sqlite_schema` looking unchanged. Capture compares
+    /// the schema for what changed and takes these only as a hint that a
+    /// table which looks unchanged is new. The authorizer has no cell scope,
+    /// so each check point hands them to every capture on the thread.
+    static DROP_HINTS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Note that `table` may be dropped; see `DROP_HINTS`.
+fn hint_dropped(table: &str) {
+    if DROP_HINTS_WANTED.with(std::cell::Cell::get) && export_capture::exported_table(table) {
+        DROP_HINTS.with(|hints| hints.borrow_mut().push(table.to_string()));
+    }
 }
 
 /// Run `callback` with application-SQL restrictions in force.
@@ -609,6 +630,11 @@ fn authorize_sql(context: rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::
     // `SchemaCookie`.
     SQL_PREPARES.fetch_add(1, Ordering::Relaxed);
 
+    if let AuthAction::DropTable { table_name } | AuthAction::AlterTable { table_name, .. } =
+        context.action
+    {
+        hint_dropped(table_name);
+    }
     let prohibited = match context.action {
         AuthAction::Savepoint { savepoint_name, .. }
             if savepoint_name == "changeset" && CAPTURE_PULL.with(std::cell::Cell::get) =>
@@ -1037,6 +1063,7 @@ pub(crate) fn export_checkpoint() {
     if CURRENT_CELLS.get().is_null() {
         return;
     }
+    hand_out_drop_hints();
     let dirty = cells(|c| {
         let mut dirty = c.export_dirty.borrow_mut();
         (!dirty.is_empty()).then(|| std::mem::take(&mut *dirty))
@@ -1046,7 +1073,33 @@ pub(crate) fn export_checkpoint() {
     }
 }
 
+/// Give every capture on the thread the tables dropped since the last check
+/// point. A capture keeps them until its next pull; one whose schema did not
+/// change there discards them.
+fn hand_out_drop_hints() {
+    let hints = DROP_HINTS.with(|hints| std::mem::take(&mut *hints.borrow_mut()));
+    if hints.is_empty() {
+        return;
+    }
+    let handed = dbs(|d| {
+        let Ok(mut d) = d.try_borrow_mut() else {
+            return false;
+        };
+        for cell in d.values_mut() {
+            if let Some(capture) = cell.capture.as_mut() {
+                capture.hint_dropped(&hints);
+            }
+        }
+        true
+    });
+    if !handed {
+        // Reached inside a storage call; the next check point hands them out.
+        DROP_HINTS.with(|pending| pending.borrow_mut().extend(hints));
+    }
+}
+
 fn export_checkpoint_scope(scope: &str) {
+    hand_out_drop_hints();
     let now_ms = crate::asyncrt::wall_ms();
     let visited = dbs(|d| {
         let Ok(mut d) = d.try_borrow_mut() else {
@@ -4436,7 +4489,15 @@ pub fn delete_all_with_alarm(scope: &str, delete_alarm: bool) -> anyhow::Result<
             c.execute_batch("PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE;")?;
             let result = (|| -> anyhow::Result<()> {
                 for table in tables {
-                    if matches!(table.as_str(), "_cf_METADATA" | "_cf_WAKE" | "_cf_ALARM") {
+                    // Change export's table generations outlive the tables,
+                    // so a table recreated after this starts a new one.
+                    if matches!(
+                        table.as_str(),
+                        "_cf_METADATA"
+                            | "_cf_WAKE"
+                            | "_cf_ALARM"
+                            | export_capture::GENERATIONS_TABLE
+                    ) {
                         continue;
                     }
                     // The ltx replicator owns its control tables. Dropping
@@ -4447,6 +4508,8 @@ pub fn delete_all_with_alarm(scope: &str, delete_alarm: bool) -> anyhow::Result<
                     if celld_ltx::db::is_control_table(&table) {
                         continue;
                     }
+                    // Run without the authorizer, which would note this.
+                    hint_dropped(&table);
                     let quoted = table.replace('"', "\"\"");
                     c.execute_batch(&format!("DROP TABLE IF EXISTS \"{quoted}\";"))?;
                 }

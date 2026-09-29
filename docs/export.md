@@ -9,8 +9,9 @@ The feature is under construction. A node with `CELLD_EXPORT=1` exports
 the row changes of its root cells through the bucket sink: Parquet objects
 under `export/changes/<node>/` in the bucket, released only after the
 change is durable and the node still owns the cell, and followed by
-watermarks that certify what the bucket holds. Facets, schema records,
-activation links, repair and the blob-stream sink are not built yet. A node with `CELLD_EXPORT_SINK=blob-stream` refuses
+watermarks that certify what the bucket holds. Facets, activation links,
+repair and the blob-stream sink are not built yet. A node with
+`CELLD_EXPORT_SINK=blob-stream` refuses
 to start.
 
 Export is off by default, and the off state costs nothing: with
@@ -49,6 +50,25 @@ Queue brokers (`__Queue`), Workflow instances (`__Workflow` and every
 `__Workflow.<script>` class), and cron cells (`.cron`) are never exported.
 celld refuses to start when `CELLD_EXPORT_CLASSES` names one of them.
 
+## Schema changes
+
+Every exported table has a generation, and rows of different generations
+never merge. celld compares each cell's schema with what it last exported
+at the same safe point it pulls row changes. A create opens generation
+one. A drop closes the generation. An alteration, a rename, or a drop and
+recreate under the same name opens the next generation, and so does a
+table that changed while export was off for its cell. Each change is a
+`schema` record at the commit that made it, and every generation that
+opens is snapshotted inline at that commit, or exported as `bulk` when it
+is larger than `CELLD_EXPORT_MAX_TX_BYTES`.
+
+Generations are stored in the cell itself, in the `_cf_EXPORT` table, so
+they survive restarts, moves and restores, and `deleteAll()` keeps them: a
+table created after it continues from its old generation, so old rows
+cannot come back. A cell's first export starts every table it already has
+at generation one with no snapshot, like any change that happened before
+export was on; the planned `celld export backfill` covers those.
+
 ## Key-value tables
 
 The Durable Object key-value API (`ctx.storage.get`, `put`, `kv`) keeps its
@@ -84,3 +104,58 @@ A node with export off reports none of them.
 | `celld.export.gaps` | Gap notes emitted since the process started. |
 | `celld.export.bulk_commits` | Commits exported as `bulk` since the process started. |
 | `celld.export.attribution_mismatches` | Commits the capture could not attribute since the process started. |
+
+## Dead-node recovery
+
+When a node dies, the node that recovers its log emits a `recovered` record
+for each cell epoch it folds into the bucket, once the fold is uploaded and
+before it seals the log. The record's head is what the bucket holds for that
+epoch, and `loss` marks a recovery that declared a bounded loss. Recovery
+only visits cells with rows left in the dead node's log, so a cell whose
+writes were already in the bucket gets no record, and the reconciler covers
+it. The record names the cell's class and cell, and a facet's path, but not
+its script or incarnation, which recovery does not know; a consumer matches
+it to the cell's stream by class, cell and facet path. Facets are reported
+once their streams export.
+
+## Reconcile, verify and erase
+
+`celld export reconcile | verify | erase` take the fleet flags
+(`--bucket`, `--endpoint`, `--region`) and `--export-bucket` when the export
+writes somewhere else (`CELLD_EXPORT_BUCKET`). The consumer they compare
+against today is the reference consumer over every record the bucket sink
+wrote under `export/changes/`; the Snowflake loader plugs its own tables in
+through the same interface (`export_audit::ConsumerView`).
+
+- **`reconcile`** lists `cells/` and `log/`, derives each cell's head the way
+  a restore does (following paged epochs and skipping epochs the chain does
+  not link), and compares it with what the consumer certified. It reports a
+  `gap` when the bucket holds changes the consumer has not certified, `lost`
+  when the consumer certified changes the cell no longer has (past the end
+  of a closed epoch, in a skipped epoch, or past the head after the
+  producing node declared a loss), `missing_deleted` for a facet that has
+  no objects at all while its root does, `unknown_stream` for an exported
+  cell the consumer has never seen, and `unrestorable` for a cell whose
+  objects form no restorable chain. A difference counts only once the
+  evidence it rests on is older than `--settle` (default `1h`): for a gap,
+  when the first change the consumer lacks reached the bucket, not the
+  cell's latest write, so a busy cell cannot defer an old gap. It writes the findings to
+  `export/reconcile/` and `gap` and `deleted` records, with
+  `origin: repair` and `node: reconciler`, to `export/changes/reconciler/`.
+  `--dry-run` writes nothing; `--schedule` repeats every
+  `CELLD_EXPORT_RECONCILE`.
+- **`verify`** restores a sample of streams (`--sample N`, or `--cell` and
+  `--facet`) read-only at their bucket head and compares every exported
+  table, row by row, with the consumer's state at that position. A stream
+  the consumer has not certified that far is reported as behind. It exits
+  non-zero on drift. `_cf_KV` and tables a `bulk` record left uncertain are
+  skipped.
+- **`erase --cell SCOPE`** writes a tombstone under
+  `export/tombstones/<cell>/<script>/<root | f.facet>/<all | incarnation>.json`
+  for the root and every facet the consumer holds, or for `--script`,
+  `--facet` and `--incarnation` when given. With no incarnation it erases
+  every incarnation of the scope, as `EXPORT_TOMBSTONES` does. The
+  reconciler, the reference consumer, repair and backfill skip tombstoned
+  streams. `--clear` clears matching tombstones so a stream recreated under
+  the same scope exports again. Records already in `export/changes/` stay
+  until the bucket's lifecycle rules remove them.
