@@ -124,6 +124,7 @@ A cell fits a workload that divides into named, stateful units:
 - [List Durable Objects](#list-durable-objects)
 - [Environment variables](#environment-variables)
 - [Services](#services)
+- [Change export](export.md)
 - [Cloudflare compatibility](cloudflare-compat.md)
 - [What celld guarantees](guarantees.md)
 - [Limitations](limitations.md)

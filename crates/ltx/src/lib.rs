@@ -63,6 +63,10 @@ pub use db::Db;
 /// Re-exported from [`crate::db::CheckpointMode`].
 pub use db::CheckpointMode;
 
+/// The capture observer surface: what each written L0 file covers.
+/// Re-exported from [`crate::db`].
+pub use db::{CaptureKind, CaptureObserver, CapturedFile, WalRange};
+
 /// Connects a managed [`Db`] to a replication destination and drives the
 /// single-replica sync loop. Re-exported from [`crate::replica::Replica`].
 pub use replica::Replica;

@@ -1,0 +1,80 @@
+name: CI
+
+# Every pull request must format, lint, build and test cleanly before it
+# merges. These are the checks the Dockerfile test stage runs, run natively
+# on the dev profile with a dependency cache so a PR gets an answer without
+# the release profile's fat-LTO relink. Pushes to main keep the cache warm:
+# a pull request can restore caches saved on its base branch but not on
+# another pull request's branch.
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_VERSION: 1.97.1
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt
+          rustup default "$RUST_VERSION"
+
+      - run: cargo fmt --all --check
+
+  check:
+    name: Lint and test
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy
+          rustup default "$RUST_VERSION"
+
+      # The ltx fault-injection oracle diffs databases with the sqlite3 CLI.
+      - name: Install sqlite3
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends sqlite3
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Saving from pull requests would only fill the repository's cache
+          # quota with entries no other pull request can restore.
+          save-if: ${{ github.event_name != 'pull_request' }}
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      # Optional features (the ltx object-store backends, and later the
+      # export transports) must keep compiling even though the default
+      # build leaves them off.
+      - name: Clippy, all features
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked

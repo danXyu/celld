@@ -1,0 +1,22 @@
+# The change-export record format (docs/design/change-export.md#records) and a
+# reference consumer. Pure: no I/O, clocks, or randomness. The node's exporter,
+# the bucket sink, the loader, and the tests of each use these types, and the
+# reference consumer is their oracle for what a consumer must converge to.
+[package]
+name = "celld-export-format"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.94.1"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+base64.workspace = true
+serde.workspace = true
+# Reals must survive a round trip exactly: the reference consumer compares
+# decoded rows with the cell's values bit for bit.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

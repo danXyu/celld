@@ -339,6 +339,7 @@ pub mod docker;
 pub mod drain_token;
 pub mod engine_api;
 pub mod env_vars;
+pub mod export;
 pub mod export_restore;
 #[cfg(celld_internal_tests)]
 #[allow(clippy::disallowed_methods)]
@@ -366,6 +367,7 @@ pub(crate) mod operator_cell;
 #[doc(hidden)]
 pub mod otlp;
 pub mod ownership_store;
+pub mod parquet_batch;
 pub mod peer_auth;
 pub mod peer_probe;
 pub mod pool;
