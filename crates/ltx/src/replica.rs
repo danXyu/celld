@@ -48,7 +48,7 @@ use crate::{Pos, TXID};
 use futures_util::stream;
 use futures_util::StreamExt;
 use futures_util::TryStreamExt;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -753,6 +753,62 @@ pub async fn calc_restore_plan_with_slots<C: ReplicaClient>(
     }
 
     Ok(infos)
+}
+
+/// Every txid a restore can end at exactly, ascending.
+///
+/// A cut is the end of a contiguous run of files from txid 1: the whole
+/// database as of that txid. Compaction and merged recovery tails cover
+/// ranges, so a txid inside a range is not a cut. A file extends any cut
+/// `r` with `min_txid <= r + 1 < max_txid + 1`: its pages are the state at
+/// its `max_txid` of every page changed in its range, so an overlap with
+/// what came before is superseded, not lost. That is the same rule
+/// [`calc_restore_plan`] follows, so [`calc_restore_plan`] with any of these
+/// txids ends there exactly, and the last one is the plan at `TXID(0)`.
+pub async fn restorable_cuts<C: ReplicaClient>(client: &C) -> Result<Vec<TXID>> {
+    let mut files = Vec::new();
+    for level in 0..=SNAPSHOT_LEVEL {
+        files.extend(client.ltx_files(level, TXID(0)).await?);
+    }
+    Ok(cuts_of(&files))
+}
+
+/// [`restorable_cuts`] over files already listed, from every level.
+pub fn cuts_of(files: &[FileInfo]) -> Vec<TXID> {
+    let mut files: Vec<&FileInfo> = files.iter().collect();
+    // A file reaches only past the cuts below its end, so taking files in
+    // end order settles every cut a file could extend before the file.
+    files.sort_by_key(|f| (f.max_txid, f.min_txid));
+    let mut reached: BTreeSet<u64> = BTreeSet::from([0]);
+    for f in files {
+        if f.min_txid.0 == 0 || f.max_txid < f.min_txid {
+            continue;
+        }
+        if reached
+            .range(f.min_txid.0 - 1..f.max_txid.0)
+            .next()
+            .is_some()
+        {
+            reached.insert(f.max_txid.0);
+        }
+    }
+    reached.remove(&0);
+    reached.into_iter().map(TXID).collect()
+}
+
+/// The first cut at or after `txid`, and the plan that ends there. The
+/// planner above ends exactly at its target or fails, so a target inside a
+/// merged range has no plan at all; this answers "the nearest state no
+/// older than `txid`" instead. `TxNotAvailable` when every cut is below it.
+pub async fn calc_restore_plan_at_or_after<C: ReplicaClient>(
+    client: &C,
+    txid: TXID,
+) -> Result<(TXID, Vec<FileInfo>)> {
+    let cuts = restorable_cuts(client).await?;
+    let Some(&cut) = cuts.iter().find(|cut| **cut >= txid) else {
+        return Err(Error::TxNotAvailable);
+    };
+    Ok((cut, calc_restore_plan(client, cut).await?))
 }
 
 /// A single level's streaming view during restore planning.
