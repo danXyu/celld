@@ -5,6 +5,10 @@ use object_store::memory::InMemory;
 
 const SCOPE: &str = "Cart:one";
 
+fn stream() -> Stream {
+    Stream::cell(SCOPE).unwrap()
+}
+
 fn bucket() -> Bucket {
     let store = Arc::new(InMemory::new());
     Bucket::with_stores(
@@ -54,8 +58,12 @@ fn image(min: u64, max: u64, marker: i64) -> Vec<u8> {
 }
 
 async fn put(bucket: &Bucket, epoch: u64, level: i32, min: u64, max: u64) {
+    put_to(bucket, SCOPE, epoch, level, min, max).await;
+}
+
+async fn put_to(bucket: &Bucket, stream: &str, epoch: u64, level: i32, min: u64, max: u64) {
     let config = ObjectStoreConfig {
-        path: format!("{}cells/{SCOPE}/ltx/e{epoch}", bucket.prefix),
+        path: format!("{}cells/{stream}/ltx/e{epoch}", bucket.prefix),
         ..Default::default()
     };
     ObjectStoreClient::with_store(config, bucket.store.clone())
@@ -82,7 +90,7 @@ fn at(epoch: u64, txid: u64) -> Position {
 }
 
 async fn marker(bucket: &Bucket, target: Target) -> (Position, Position, i64) {
-    let restored = restore(bucket, SCOPE, target).await.unwrap();
+    let restored = restore(bucket, &stream(), target).await.unwrap();
     let v = restored
         .open()
         .unwrap()
@@ -125,7 +133,7 @@ async fn at_or_after_lands_on_the_first_cut_not_below() {
 async fn past_the_bucket_head_fails_and_names_it() {
     let bucket = paged_chain().await;
     for target in [at(4, 10), at(5, 1)] {
-        let error = restore(&bucket, SCOPE, Target::AtOrAfter(target))
+        let error = restore(&bucket, &stream(), Target::AtOrAfter(target))
             .await
             .err()
             .unwrap()
@@ -150,7 +158,7 @@ async fn a_clone_epoch_restarts_txids_and_is_after_everything_before_it() {
 async fn nothing_is_written_to_the_bucket_or_the_image() {
     let bucket = paged_chain().await;
     let before = bucket.list("").await.unwrap();
-    let restored = restore(&bucket, SCOPE, Target::AtOrAfter(at(3, 4)))
+    let restored = restore(&bucket, &stream(), Target::AtOrAfter(at(3, 4)))
         .await
         .unwrap();
     let db = restored.open().unwrap();
@@ -184,10 +192,58 @@ async fn nothing_is_written_to_the_bucket_or_the_image() {
 
 #[tokio::test]
 async fn a_cell_with_nothing_in_the_bucket_is_an_error() {
-    assert!(restore(&bucket(), SCOPE, Target::Head).await.is_err());
-    assert!(restore(&bucket(), "not a scope", Target::Head)
+    assert!(restore(&bucket(), &stream(), Target::Head).await.is_err());
+}
+
+#[tokio::test]
+async fn a_nested_facet_restores_from_its_own_stream() {
+    let bucket = paged_chain().await;
+    let names = ["cart".to_string(), "lines".to_string()];
+    let facet = Stream::facet(SCOPE, &names).unwrap();
+    assert_eq!(facet.as_str(), crate::engine_api::facet_cell(SCOPE, &names));
+    assert_eq!(Stream::parse(facet.as_str()).unwrap(), facet);
+    put_to(&bucket, facet.as_str(), 2, 0, 1, 40).await;
+    put_to(&bucket, facet.as_str(), 2, 0, 41, 42).await;
+    let restored = restore(&bucket, &facet, Target::AtOrAfter(at(2, 2)))
         .await
-        .is_err());
+        .unwrap();
+    let v: i64 = restored
+        .open()
+        .unwrap()
+        .query_row("SELECT v FROM t", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        (restored.position, restored.bucket_head, v),
+        (at(2, 40), at(2, 42), 40)
+    );
+    // The root's own stream is untouched by its facet's objects.
+    assert_eq!(marker(&bucket, Target::Head).await.0, at(4, 9));
+}
+
+#[test]
+fn a_stream_is_a_valid_root_and_facet_hashes_only() {
+    let hash = "0123456789abcdef0123456789abcdef";
+    for ok in [
+        SCOPE.to_string(),
+        format!("{SCOPE}/facets/{hash}"),
+        format!("{SCOPE}/facets/{hash}/facets/{hash}"),
+    ] {
+        assert!(Stream::parse(&ok).is_ok(), "{ok}");
+    }
+    for bad in [
+        String::new(),
+        "not a scope".to_string(),
+        format!("../{SCOPE}"),
+        format!("{SCOPE}/facets/"),
+        format!("{SCOPE}/facets/{}", &hash[1..]),
+        format!("{SCOPE}/facets/{}", hash.to_uppercase()),
+        format!("{SCOPE}/facets/{hash}/"),
+        format!("{SCOPE}/facets/{hash}/facets/../{hash}"),
+        format!("{SCOPE}/ltx/e1"),
+    ] {
+        assert!(Stream::parse(&bad).is_err(), "{bad}");
+    }
+    assert!(Stream::facet("../x", &["a".into()]).is_err());
 }
 
 #[test]

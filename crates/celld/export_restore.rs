@@ -92,12 +92,61 @@ impl Restored {
     }
 }
 
-/// Restore `scope` from `bucket` without writing to it.
-pub async fn restore(bucket: &Bucket, scope: &str, target: Target) -> anyhow::Result<Restored> {
-    ensure!(
-        celld_logic::cell::valid_cell_scope(scope),
-        "invalid cell scope {scope:?}"
-    );
+/// A replication stream an export restore can name: a root cell scope, or
+/// a facet of one at any depth, `<root>/facets/<32 hex>` repeated, the
+/// coordinates [`crate::engine_api::facet_cell`] gives a facet's own LTX.
+/// The root passes the cell scope gate and every facet segment is exactly
+/// one lowercase hash, so no stream can reach outside `cells/<root>/`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Stream(String);
+
+impl Stream {
+    /// A root cell.
+    pub fn cell(scope: &str) -> anyhow::Result<Self> {
+        ensure!(
+            celld_logic::cell::valid_cell_scope(scope),
+            "invalid cell scope {scope:?}"
+        );
+        Ok(Self(scope.to_string()))
+    }
+
+    /// The facet of `root` at the path `names`, outermost first.
+    pub fn facet(root: &str, names: &[String]) -> anyhow::Result<Self> {
+        Self::cell(root)?;
+        Self::parse(&crate::engine_api::facet_cell(root, names))
+    }
+
+    /// A stream as it appears in the bucket or in an export record.
+    pub fn parse(stream: &str) -> anyhow::Result<Self> {
+        let mut parts = stream.split("/facets/");
+        let root = parts.next().unwrap_or_default();
+        Self::cell(root)?;
+        for hash in parts {
+            ensure!(
+                hash.len() == 32
+                    && hash
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                "invalid facet segment {hash:?} in stream {stream:?}"
+            );
+        }
+        Ok(Self(stream.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for Stream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Restore `stream` from `bucket` without writing to it.
+pub async fn restore(bucket: &Bucket, stream: &Stream, target: Target) -> anyhow::Result<Restored> {
+    let scope = stream.as_str();
     let chain = chain(bucket, scope).await?;
     let spans = chain.spans();
     let cuts = replica::restorable_cuts(&chain)
