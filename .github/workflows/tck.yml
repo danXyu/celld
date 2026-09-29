@@ -1,0 +1,134 @@
+name: TCK
+
+# Gates pull requests on the celld-tck compatibility and recovery suites,
+# run against this change's own image instead of the upstream release the
+# TCK pins. The image is built once (its test stage runs the workspace
+# tests and clippy) and handed to one job per suite. `TCK passed` is the
+# single check to require in branch protection.
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tck-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # A celld-tck commit, not a branch, so a TCK change cannot turn this gate
+  # red on its own. Bump it deliberately.
+  TCK_REPOSITORY: ewhauser/celld-tck
+  TCK_REF: f6f0b0e7ea48a06306444517c9161740939dd820
+  TCK_CELLD_IMAGE: celld:tck
+
+jobs:
+  image:
+    name: Build candidate image
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-buildx-action@v3
+
+      # `lab` is `release` without the fat-LTO relink: the same code at a
+      # fraction of the build time.
+      - name: Build
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/celld/Cargo.toml | head -1)
+          docker buildx build \
+            --platform linux/amd64 \
+            --build-arg CELLD_PROFILE=lab \
+            --build-arg "CELLD_COMMIT=$GITHUB_SHA" \
+            --build-arg "CELLD_VERSION=$version" \
+            --cache-from type=gha,scope=tck-image \
+            --cache-to type=gha,scope=tck-image,mode=max \
+            --load \
+            --tag "$TCK_CELLD_IMAGE" \
+            .
+          docker run --rm "$TCK_CELLD_IMAGE" --version | grep -F "$version"
+          mkdir -p out
+          docker save "$TCK_CELLD_IMAGE" | gzip -1 > out/celld-tck-image.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: celld-tck-image
+          path: out/celld-tck-image.tar.gz
+          if-no-files-found: error
+          retention-days: 3
+
+  suite:
+    name: TCK ${{ matrix.suite }}
+    needs: image
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - local
+          - recovery
+          - multinode
+          - fleet
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ env.TCK_REPOSITORY }}
+          ref: ${{ env.TCK_REF }}
+          path: tck
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: celld-tck-image
+
+      - name: Load candidate image
+        run: gunzip -c celld-tck-image.tar.gz | docker load
+
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: tck/package.json
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: tck/.node-version
+          cache: pnpm
+          cache-dependency-path: tck/pnpm-lock.yaml
+
+      - name: Install
+        working-directory: tck
+        run: pnpm install --frozen-lockfile
+
+      - name: Run
+        working-directory: tck
+        env:
+          SUITE: ${{ matrix.suite }}
+        run: pnpm "test:$SUITE"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tck-evidence-${{ matrix.suite }}
+          path: tck/artifacts/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # One stable check name for branch protection, whatever the matrix holds.
+  gate:
+    name: TCK passed
+    needs: suite
+    if: always()
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every suite
+        env:
+          RESULT: ${{ needs.suite.result }}
+        run: |
+          echo "suites: $RESULT"
+          test "$RESULT" = success

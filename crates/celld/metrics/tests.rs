@@ -326,6 +326,39 @@ fn a_node_without_load_or_deployment_reports_only_what_it_has() {
     assert_eq!(names, vec!["celld.node.owned_cells", "celld.node.occupied"]);
 }
 
+#[test]
+fn export_gauges_appear_only_with_an_export_object() {
+    let state = state_with(&NodeLoadWire::default());
+    let gauges = node_gauges(&state);
+    assert!(
+        gauges
+            .iter()
+            .all(|gauge| !gauge.name.starts_with("celld.export.")),
+        "export off must add no gauge"
+    );
+
+    let mut state = state;
+    state["export"] = serde_json::json!({
+        "queue_bytes": 4096,
+        "pending_commits": 3,
+        "dropped_records": 2,
+        "gaps": 1,
+        "bulk_commits": 5,
+        "attribution_mismatches": 0,
+    });
+    let gauges = node_gauges(&state);
+    use GaugeValue::Int;
+    assert_eq!(gauge(&gauges, "celld.export.queue_bytes"), Some(Int(4096)));
+    assert_eq!(gauge(&gauges, "celld.export.pending_commits"), Some(Int(3)));
+    assert_eq!(gauge(&gauges, "celld.export.dropped_records"), Some(Int(2)));
+    assert_eq!(gauge(&gauges, "celld.export.gaps"), Some(Int(1)));
+    assert_eq!(gauge(&gauges, "celld.export.bulk_commits"), Some(Int(5)));
+    assert_eq!(
+        gauge(&gauges, "celld.export.attribution_mismatches"),
+        Some(Int(0))
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Exponential histogram
 

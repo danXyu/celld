@@ -375,6 +375,51 @@ pub fn node_gauges(state: &serde_json::Value) -> Vec<Gauge> {
         "{cell}",
         (deployment.is_some() || any).then_some(Int(isolate_cells)),
     );
+
+    // Change export. `/state` carries an `export` object only on a node with
+    // CELLD_EXPORT=1, so a node with export off reports none of these.
+    let export = |key: &str| {
+        state
+            .get("export")
+            .and_then(|export| export.get(key))
+            .and_then(serde_json::Value::as_i64)
+    };
+    push(
+        "celld.export.queue_bytes",
+        "Encoded bytes held against CELLD_EXPORT_QUEUE_BYTES.",
+        "By",
+        export("queue_bytes").map(Int),
+    );
+    push(
+        "celld.export.pending_commits",
+        "Captured commits waiting for a durability proof.",
+        "{commit}",
+        export("pending_commits").map(Int),
+    );
+    push(
+        "celld.export.dropped_records",
+        "Records dropped over budget or past the retry deadline since the process started.",
+        "{record}",
+        export("dropped_records").map(Int),
+    );
+    push(
+        "celld.export.gaps",
+        "Gap notes emitted since the process started.",
+        "{gap}",
+        export("gaps").map(Int),
+    );
+    push(
+        "celld.export.bulk_commits",
+        "Commits exported as bulk since the process started.",
+        "{commit}",
+        export("bulk_commits").map(Int),
+    );
+    push(
+        "celld.export.attribution_mismatches",
+        "Commits capture could not attribute since the process started.",
+        "{commit}",
+        export("attribution_mismatches").map(Int),
+    );
     gauges
 }
 
