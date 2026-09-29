@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 51d38a11e28df79b73e684ca02aec381373fabf3898dcaf3984a24b4cc4ed1d1 # shrinks to v = [Real(-5.8854773326531485e165)]
+cc 3014e170ca61398650bcfc942100e00ae116e36517b3dbca894cf71af7722db9 # shrinks to history = [(false, [Put { table: 0, key: Integer(0), body: Real(1.3402857640784745e271) }])], every = 1
