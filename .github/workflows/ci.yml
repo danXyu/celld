@@ -78,6 +78,17 @@ jobs:
           # quota with entries no other pull request can restore.
           save-if: ${{ github.event_name != 'pull_request' }}
 
+      # rust-cache removes gn_out but keeps V8's build-script fingerprints.
+      # Without the native archive, a later v8 recompile skips its download
+      # and fails to link. Invalidate only V8 when those cached outputs are missing.
+      - name: Repair incomplete V8 build cache
+        run: |
+          set -euo pipefail
+          if [[ ! -s target/debug/gn_out/obj/librusty_v8.a ]]; then
+            rm -f target/debug/gn_out/obj/librusty_v8.sum
+            cargo clean --locked -p v8
+          fi
+
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 
