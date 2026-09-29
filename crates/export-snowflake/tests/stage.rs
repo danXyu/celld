@@ -49,6 +49,7 @@ fn a_stage_row_holds_the_whole_record() {
             facet: Some("f".into()),
             incarnation: Some(9),
             subtree: true,
+            through_incarnation: Some(12),
         }),
     ];
     for body in bodies {
