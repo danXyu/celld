@@ -29,7 +29,6 @@ export default defineConfig({
       ] },
       { label: 'Features', items: [
         { label: 'Application previews', slug: 'fork/previews' },
-        { label: 'Snapshot seeding', slug: 'fork/preview-runtime' },
         { label: 'OTLP metrics', slug: 'fork/metrics' },
         { label: 'Change export', slug: 'fork/export', badge: { text: 'In progress', variant: 'caution' } },
       ] },
