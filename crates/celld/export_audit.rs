@@ -32,6 +32,7 @@ use serde::Serialize;
 use crate::bucket::Bucket;
 use crate::export_sink::CHANGES_PREFIX;
 
+mod cache;
 pub mod cli;
 pub mod inventory;
 pub mod reconcile;
@@ -184,31 +185,36 @@ pub trait ConsumerView: Send + Sync {
 /// The reference consumer over the bucket sink's records.
 pub struct BucketConsumer {
     bucket: Bucket,
-    consumer: Consumer,
-    records: Vec<Record>,
+    cache: cache::Cache,
+    tombstones: Vec<Tombstone>,
+    only_cell: Option<String>,
+    max_cell_history: usize,
 }
 
 impl BucketConsumer {
-    /// Read every record under `export/changes/`, dropping tombstoned
-    /// streams as the loader does.
+    /// Index bucket history on disk and evaluate cells on demand.
     pub async fn load(bucket: Bucket) -> anyhow::Result<Self> {
+        Self::load_cached(bucket, None, "temporary", None).await
+    }
+
+    /// Reuse unchanged objects from an operator cache. `identity` must include
+    /// the endpoint, bucket and prefix; a cache cannot be reused across scopes.
+    pub async fn load_cached(
+        bucket: Bucket,
+        path: Option<&std::path::Path>,
+        identity: &str,
+        only_cell: Option<String>,
+    ) -> anyhow::Result<Self> {
+        let cache = cache::Cache::open(path, identity)?;
         let tombstones = tombstone::load(&bucket).await?;
-        let mut objects = bucket.list(CHANGES_PREFIX).await?;
-        objects.sort_by(|a, b| a.location.as_ref().cmp(b.location.as_ref()));
-        let mut records = Vec::new();
-        for object in objects {
-            let key = object.location.as_ref();
-            if !key.ends_with(".parquet") {
-                continue;
-            }
-            let Some((bytes, _)) = bucket.get(key).await? else {
-                continue;
-            };
-            let decoded = crate::export_sink::decode_records(bytes.to_vec())
-                .with_context(|| format!("decode export object {key}"))?;
-            records.extend(decoded);
-        }
-        Self::from_records(bucket, records, &tombstones)
+        cache.refresh(&bucket, &tombstones).await?;
+        Ok(Self {
+            bucket,
+            cache,
+            tombstones,
+            only_cell,
+            max_cell_history: cache::MAX_CELL_HISTORY,
+        })
     }
 
     pub fn from_records(
@@ -216,19 +222,22 @@ impl BucketConsumer {
         records: Vec<Record>,
         tombstones: &[Tombstone],
     ) -> anyhow::Result<Self> {
-        let records: Vec<Record> = records
-            .into_iter()
-            .filter(|r| !tombstones.iter().any(|t| t.matches(r.stream())))
-            .collect();
-        let mut consumer = Consumer::new();
-        consumer
-            .ingest_all(records.iter().cloned())
-            .map_err(|error| anyhow::anyhow!("reassemble export records: {error}"))?;
+        let cache = cache::Cache::open(None, "test")?;
+        cache.insert_records(records)?;
         Ok(Self {
             bucket,
-            consumer,
-            records,
+            cache,
+            tombstones: tombstones.to_vec(),
+            only_cell: None,
+            max_cell_history: cache::MAX_CELL_HISTORY,
         })
+    }
+
+    /// Maximum encoded history loaded for any one cell (default 64 MiB).
+    pub fn with_history_limit(mut self, bytes: usize) -> anyhow::Result<Self> {
+        anyhow::ensure!(bytes > 0, "--max-cell-history must be positive");
+        self.max_cell_history = bytes;
+        Ok(self)
     }
 
     pub fn bucket(&self) -> &Bucket {
@@ -239,42 +248,52 @@ impl BucketConsumer {
 #[async_trait]
 impl ConsumerView for BucketConsumer {
     async fn streams(&self) -> anyhow::Result<Vec<StreamSummary>> {
-        let mut extra: BTreeMap<&StreamId, (BTreeMap<u64, BTreeSet<String>>, i64)> =
-            BTreeMap::new();
-        for r in &self.records {
-            let entry = extra.entry(r.stream()).or_default();
-            entry.1 = entry.1.max(r.envelope.committed_at);
-            if r.envelope.origin == Origin::Live && !matches!(r.body, Body::Recovered(_)) {
-                entry
-                    .0
-                    .entry(r.position().epoch)
-                    .or_default()
-                    .insert(r.envelope.node.clone());
+        let mut summaries = Vec::new();
+        for cell in self.cache.cells(self.only_cell.as_deref())? {
+            let records = self
+                .cache
+                .records(&cell, &self.tombstones, self.max_cell_history)?;
+            let mut extra: BTreeMap<StreamId, (BTreeMap<u64, BTreeSet<String>>, i64, bool)> =
+                BTreeMap::new();
+            for r in &records {
+                let entry = extra
+                    .entry(r.stream().clone())
+                    .or_insert_with(|| (BTreeMap::new(), 0, true));
+                entry.2 &= matches!(r.body, Body::Recovered(_));
+                entry.1 = entry.1.max(r.envelope.committed_at);
+                if r.envelope.origin == Origin::Live && !matches!(r.body, Body::Recovered(_)) {
+                    entry
+                        .0
+                        .entry(r.position().epoch)
+                        .or_default()
+                        .insert(r.envelope.node.clone());
+                }
             }
-        }
-        Ok(self
-            .consumer
-            .state()
-            .into_iter()
-            // A scriptless stream the consumer could not adopt holds only
-            // `recovered` records for a cell it has never seen.
-            .filter(|(id, _)| {
-                !(id.script.is_empty()
-                    && id.incarnation == 0
-                    && is_recovery_only(&self.records, id))
-            })
-            .map(|(id, state)| {
-                let (nodes, last) = extra.remove(&id).unwrap_or_default();
-                StreamSummary {
+            let recovery_only: BTreeSet<_> = extra
+                .iter()
+                .filter(|(id, (_, _, only))| id.script.is_empty() && id.incarnation == 0 && *only)
+                .map(|(id, _)| id.clone())
+                .collect();
+            let mut consumer = Consumer::new();
+            consumer
+                .ingest_all(records)
+                .map_err(|e| anyhow::anyhow!("reassemble export records: {e}"))?;
+            for (id, state) in consumer.state() {
+                if recovery_only.contains(&id) {
+                    continue;
+                }
+                let (nodes, last, _) = extra.remove(&id).unwrap_or_default();
+                summaries.push(StreamSummary {
+                    id,
                     certified: state.certified,
                     snapshot_at: state.snapshot_at,
                     deleted_at: state.deleted_at,
                     nodes,
                     last_committed_ms: last,
-                    id,
-                }
-            })
-            .collect())
+                });
+            }
+        }
+        Ok(summaries)
     }
 
     async fn state_at(
@@ -282,29 +301,36 @@ impl ConsumerView for BucketConsumer {
         stream: &StreamId,
         at: Position,
     ) -> anyhow::Result<Option<StreamState>> {
+        let records = self
+            .cache
+            .records(&stream.cell, &self.tombstones, self.max_cell_history)?;
         let mut consumer = Consumer::new();
+        // Keep recovery placeholders and root deletion records so adoption and
+        // facet deletion have the same semantics as the full consumer.
         consumer
-            .ingest_all(
-                self.records
-                    .iter()
-                    .filter(|r| r.stream() == stream && r.position() <= at)
-                    .cloned(),
-            )
-            .map_err(|error| anyhow::anyhow!("reassemble export records: {error}"))?;
+            .ingest_all(records.into_iter().filter(|r| r.position() <= at))
+            .map_err(|e| anyhow::anyhow!("reassemble export records: {e}"))?;
         Ok(consumer.stream(stream))
     }
 
     async fn recovered(&self) -> anyhow::Result<Vec<RecoveredSession>> {
-        // A recovered cell epoch is its cell, facet path and epoch.
-        type Held<'a> = BTreeSet<(&'a str, Option<&'a str>, u64)>;
-        let mut sessions: BTreeMap<&str, (u64, Held<'_>, bool)> = BTreeMap::new();
-        for r in &self.records {
+        type Held = BTreeSet<(String, Option<String>, u64)>;
+        let mut sessions: BTreeMap<String, (u64, Held, bool)> = BTreeMap::new();
+        let db = self.cache.db.lock().unwrap();
+        let mut stmt =
+            db.prepare("SELECT data FROM records WHERE recovered=1 AND (?1 IS NULL OR cell=?1)")?;
+        let mut rows = stmt.query([self.only_cell.as_deref()])?;
+        while let Some(row) = rows.next()? {
+            let r: Record = serde_json::from_slice(row.get_ref(0)?.as_blob()?)?;
+            if self.tombstones.iter().any(|t| t.matches(r.stream())) {
+                continue;
+            }
             if let Body::Recovered(b) = &r.body {
-                let s = sessions.entry(b.session.as_str()).or_default();
+                let s = sessions.entry(b.session.clone()).or_default();
                 s.0 = s.0.max(b.cells);
                 s.1.insert((
-                    r.stream().cell.as_str(),
-                    r.stream().facet.as_deref(),
+                    r.stream().cell.clone(),
+                    r.stream().facet.clone(),
                     b.head.epoch,
                 ));
                 s.2 |= b.loss;
@@ -313,7 +339,7 @@ impl ConsumerView for BucketConsumer {
         Ok(sessions
             .into_iter()
             .map(|(session, (expected, held, loss))| RecoveredSession {
-                session: session.to_string(),
+                session,
                 expected,
                 held: held.len() as u64,
                 loss,
@@ -336,13 +362,6 @@ impl ConsumerView for BucketConsumer {
         // The bucket object is this consumer's tombstone table.
         Ok(())
     }
-}
-
-fn is_recovery_only(records: &[Record], id: &StreamId) -> bool {
-    records
-        .iter()
-        .filter(|r| r.stream() == id)
-        .all(|r| matches!(r.body, Body::Recovered(_)))
 }
 
 /// Write the audit's own records (`gap`, `deleted`) as one bucket-sink

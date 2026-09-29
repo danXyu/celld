@@ -1036,3 +1036,177 @@ fn the_snowflake_binds_follow_the_statements() {
         "00000000000000000001.00000000000000000002.00000000000000000003"
     );
 }
+
+#[test]
+fn bucket_cache_reuses_objects_replaces_changes_and_expires_deleted_history() {
+    block_on(async {
+        let bucket = bucket();
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let key = emit(
+            &bucket,
+            snapshot(&root(), at(1, 1, 1), "items", &[(1, "old")]),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let first = BucketConsumer::load_cached(bucket.clone(), Some(path.path()), "fleet-a", None)
+            .await
+            .unwrap();
+        first.cache.db.lock().unwrap().execute_batch("CREATE TABLE imports (n INTEGER); INSERT INTO imports VALUES (0);
+            CREATE TRIGGER count_import AFTER INSERT ON objects BEGIN UPDATE imports SET n=n+1; END;").unwrap();
+        drop(first);
+        let same = BucketConsumer::load_cached(bucket.clone(), Some(path.path()), "fleet-a", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            same.cache
+                .db
+                .lock()
+                .unwrap()
+                .query_row("SELECT n FROM imports", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(same.streams().await.unwrap().len(), 1);
+        drop(same);
+        bucket
+            .put(
+                &key,
+                crate::export_sink::encode_records(snapshot(
+                    &root(),
+                    at(1, 2, 1),
+                    "items",
+                    &[(1, "new")],
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let changed =
+            BucketConsumer::load_cached(bucket.clone(), Some(path.path()), "fleet-a", None)
+                .await
+                .unwrap();
+        assert_eq!(
+            changed
+                .cache
+                .db
+                .lock()
+                .unwrap()
+                .query_row("SELECT n FROM imports", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        let state = changed
+            .state_at(&root(), at(1, 2, 1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state.table("items").unwrap().rows[&vec![Value::Integer(1)]][1],
+            Value::Text("new".into())
+        );
+        drop(changed);
+        assert!(
+            BucketConsumer::load_cached(bucket.clone(), Some(path.path()), "fleet-b", None)
+                .await
+                .is_err()
+        );
+        bucket.delete(&key).await.unwrap();
+        let deleted = BucketConsumer::load_cached(bucket, Some(path.path()), "fleet-a", None)
+            .await
+            .unwrap();
+        assert!(deleted.streams().await.unwrap().is_empty());
+    });
+}
+
+#[test]
+fn scoped_bucket_audit_evaluates_only_the_selected_cell() {
+    block_on(async {
+        let bucket = bucket();
+        let other = stream("Cart:other", None);
+        let records = [
+            snapshot(&root(), at(1, 1, 1), "items", &[(1, "one")]),
+            snapshot(&other, at(1, 1, 1), "items", &[(2, "two")]),
+        ]
+        .concat();
+        emit(&bucket, records).await.unwrap();
+        let consumer = BucketConsumer::load_cached(bucket, None, "test", Some(CELL.into()))
+            .await
+            .unwrap();
+        // Poison the other cell's cached payload. A scoped audit must never decode it.
+        consumer
+            .cache
+            .db
+            .lock()
+            .unwrap()
+            .execute("UPDATE records SET data=x'00' WHERE cell=?1", [&other.cell])
+            .unwrap();
+        let summaries = consumer.streams().await.unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, root());
+        assert!(consumer
+            .state_at(&root(), at(1, 1, 1))
+            .await
+            .unwrap()
+            .is_some());
+    });
+}
+
+#[test]
+fn persistent_audit_cache_applies_and_clears_tombstones() {
+    block_on(async {
+        let bucket = bucket();
+        let path = tempfile::NamedTempFile::new().unwrap();
+        emit(
+            &bucket,
+            snapshot(&root(), at(1, 1, 1), "items", &[(1, "secret")]),
+        )
+        .await
+        .unwrap();
+        let consumer =
+            BucketConsumer::load_cached(bucket.clone(), Some(path.path()), "fleet", None)
+                .await
+                .unwrap();
+        assert_eq!(consumer.streams().await.unwrap().len(), 1);
+        drop(consumer);
+        let mut erased = tombstone_for(&root(), None);
+        tombstone::put(&bucket, &erased).await.unwrap();
+        let consumer =
+            BucketConsumer::load_cached(bucket.clone(), Some(path.path()), "fleet", None)
+                .await
+                .unwrap();
+        assert!(consumer.streams().await.unwrap().is_empty());
+        assert_eq!(
+            consumer
+                .cache
+                .db
+                .lock()
+                .unwrap()
+                .query_row("SELECT count(*) FROM records", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        drop(consumer);
+        erased.cleared_at_ms = Some(erased.erased_at_ms + 1);
+        tombstone::put(&bucket, &erased).await.unwrap();
+        let consumer = BucketConsumer::load_cached(bucket, Some(path.path()), "fleet", None)
+            .await
+            .unwrap();
+        assert_eq!(consumer.streams().await.unwrap().len(), 1);
+    });
+}
+
+#[test]
+fn bucket_audit_enforces_an_operator_history_budget() {
+    block_on(async {
+        let records = snapshot(&root(), at(1, 1, 1), "items", &[(1, "data")]);
+        let consumer = BucketConsumer::from_records(bucket(), records, &[])
+            .unwrap()
+            .with_history_limit(1)
+            .unwrap();
+        let error = consumer.streams().await.unwrap_err().to_string();
+        assert!(error.contains("exceeds the 1-byte audit limit"), "{error}");
+        let consumer = consumer.with_history_limit(65536).unwrap();
+        assert_eq!(consumer.streams().await.unwrap().len(), 1);
+    });
+}
