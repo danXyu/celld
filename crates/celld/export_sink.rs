@@ -43,11 +43,12 @@ use futures_util::FutureExt as _;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 use tokio::sync::mpsc;
-use tokio::sync::oneshot;
+use tokio::sync::watch;
 
 /// Where the bucket sink writes, under `<node>/<yyyy>/<mm>/<dd>/<hh>/`.
 pub const CHANGES_PREFIX: &str = "export/changes";
@@ -125,7 +126,9 @@ pub trait ExportSink: Send + Sync {
     fn buffered_bytes(&self) -> u64;
 
     /// Write what is buffered, report its results, and stop. Records
-    /// submitted after this is called are refused.
+    /// submitted after this is called are refused. Every returned future,
+    /// from this call or a later one, resolves only after the results of
+    /// every accepted record have been sent.
     fn close(&self) -> BoxFuture<'static, ()>;
 }
 
@@ -183,7 +186,7 @@ impl Default for BucketSinkConfig {
 enum Command {
     Records(Vec<Pending>),
     Flush,
-    Close(oneshot::Sender<()>),
+    Close,
 }
 
 /// A submitted record, encoded at submit so its size is known when it is
@@ -205,8 +208,12 @@ struct Pending {
 /// records are dropped. Records submitted while a put is retrying wait
 /// behind it and count toward [`ExportSink::buffered_bytes`].
 pub struct BucketSink {
-    tx: mpsc::UnboundedSender<Command>,
+    /// The sender, until [`ExportSink::close`] takes it. Submitting holds
+    /// the lock across the send, so no record can queue behind the close.
+    tx: Mutex<Option<mpsc::UnboundedSender<Command>>>,
     buffered: Arc<AtomicU64>,
+    /// Set by the task once the last batch is written and its outcome sent.
+    stopped: watch::Receiver<bool>,
 }
 
 impl BucketSink {
@@ -232,8 +239,21 @@ impl BucketSink {
         }
         let (tx, rx) = mpsc::unbounded_channel();
         let buffered = Arc::new(AtomicU64::new(0));
-        tokio::spawn(run(rx, bucket, node, config, outcomes, buffered.clone()));
-        BucketSink { tx, buffered }
+        let (stop, stopped) = watch::channel(false);
+        tokio::spawn(run(
+            rx,
+            bucket,
+            node,
+            config,
+            outcomes,
+            buffered.clone(),
+            stop,
+        ));
+        BucketSink {
+            tx: Mutex::new(Some(tx)),
+            buffered,
+            stopped,
+        }
     }
 }
 
@@ -255,8 +275,12 @@ impl ExportSink for BucketSink {
             })
             .collect();
         let bytes: u64 = pending.iter().map(|p| p.bytes).sum();
+        let tx = self.tx.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(tx) = tx.as_ref() else {
+            return Err(Closed);
+        };
         self.buffered.fetch_add(bytes, Ordering::Relaxed);
-        if self.tx.send(Command::Records(pending)).is_err() {
+        if tx.send(Command::Records(pending)).is_err() {
             self.buffered.fetch_sub(bytes, Ordering::Relaxed);
             return Err(Closed);
         }
@@ -264,7 +288,10 @@ impl ExportSink for BucketSink {
     }
 
     fn flush(&self) {
-        let _ = self.tx.send(Command::Flush);
+        let tx = self.tx.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(tx) = tx.as_ref() {
+            let _ = tx.send(Command::Flush);
+        }
     }
 
     fn buffered_bytes(&self) -> u64 {
@@ -272,12 +299,16 @@ impl ExportSink for BucketSink {
     }
 
     fn close(&self) -> BoxFuture<'static, ()> {
-        let (done, wait) = oneshot::channel();
-        let sent = self.tx.send(Command::Close(done)).is_ok();
+        // Refuse submits from here on. The first close queues the command
+        // behind every accepted record; later ones only wait.
+        if let Some(tx) = self.tx.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = tx.send(Command::Close);
+        }
+        let mut stopped = self.stopped.clone();
         async move {
-            if sent {
-                let _ = wait.await;
-            }
+            // An error means the task is gone, which it only is once
+            // stopped or when the runtime is shutting down.
+            let _ = stopped.wait_for(|stopped| *stopped).await;
         }
         .boxed()
     }
@@ -292,6 +323,7 @@ async fn run(
     config: BucketSinkConfig,
     outcomes: mpsc::UnboundedSender<Outcome>,
     buffered: Arc<AtomicU64>,
+    stopped: watch::Sender<bool>,
 ) {
     let writer = Writer {
         bucket,
@@ -301,7 +333,6 @@ async fn run(
         retry_backoff: config.retry_backoff,
     };
     let mut batch: Vec<Pending> = Vec::new();
-    let mut closing = None;
     loop {
         let deadline = tokio::time::Instant::now() + config.flush;
         let mut bytes = 0u64;
@@ -316,27 +347,13 @@ async fn run(
                     }
                 }
                 Ok(Some(Command::Flush)) => break,
-                Ok(Some(Command::Close(done))) => {
-                    closing = Some(done);
-                    stop = true;
-                    break;
-                }
-                // Every handle is gone: write what is left and stop.
-                Ok(None) => {
+                // Close is queued behind every accepted record, and nothing
+                // is accepted after it; so is the end of every handle.
+                Ok(Some(Command::Close)) | Ok(None) => {
                     stop = true;
                     break;
                 }
                 Err(_) => break,
-            }
-        }
-        if stop {
-            // Refuse later submits, but write what they queued before
-            // the close so none of them is left without a result.
-            rx.close();
-            while let Ok(command) = rx.try_recv() {
-                if let Command::Records(records) = command {
-                    batch.extend(records);
-                }
             }
         }
         if !batch.is_empty() {
@@ -350,9 +367,7 @@ async fn run(
             });
         }
         if stop {
-            if let Some(done) = closing {
-                let _ = done.send(());
-            }
+            let _ = stopped.send(true);
             return;
         }
     }

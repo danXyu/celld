@@ -416,6 +416,50 @@ async fn close_writes_what_is_buffered_then_refuses_records() {
 }
 
 #[tokio::test]
+async fn records_submitted_after_close_is_called_are_refused() {
+    let bucket = memory_bucket();
+    let (tx, mut outcomes) = mpsc::unbounded_channel();
+    let sink = BucketSink::start(bucket, "node-1".into(), manual(), tx);
+    sink.submit(submitted(0..1)).unwrap();
+    let closing = sink.close();
+    assert_eq!(sink.submit(submitted(1..2)), Err(Closed));
+    closing.await;
+    let outcome = outcomes
+        .try_recv()
+        .expect("outcome sent before close resolved");
+    assert_eq!(
+        outcome
+            .results
+            .iter()
+            .map(|(seq, _)| *seq)
+            .collect::<Vec<_>>(),
+        [0]
+    );
+    assert!(outcomes.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn every_close_waits_for_the_final_write() {
+    let (_store, bucket) = FlakyStore::bucket(1);
+    let (tx, mut outcomes) = mpsc::unbounded_channel();
+    let config = BucketSinkConfig {
+        retry_backoff: Duration::from_millis(50),
+        ..manual()
+    };
+    let sink = BucketSink::start(bucket, "node-1".into(), config, tx);
+    sink.submit(submitted(0..1)).unwrap();
+    let first = sink.close();
+    sink.close().await;
+    let outcome = outcomes
+        .try_recv()
+        .expect("the second close resolved after the outcome");
+    assert!(outcome.results[0].1.is_acknowledged());
+    first.await;
+    // A close after the sink has stopped resolves at once.
+    sink.close().await;
+}
+
+#[tokio::test]
 async fn one_sink_is_usable_as_a_trait_object() {
     let bucket = memory_bucket();
     let (tx, mut outcomes) = mpsc::unbounded_channel();
