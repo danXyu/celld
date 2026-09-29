@@ -258,8 +258,7 @@ fn decode_rejects_a_body_whose_kind_disagrees_with_the_column() {
     assert!(error.to_string().contains("disagrees"), "{error:#}");
 }
 
-/// An in-memory bucket. Not the development store: that runs its I/O on
-/// the process's first runtime, which a `#[tokio::test]` does not outlive.
+/// An in-memory bucket, so the tests control failures and need no files.
 fn memory_bucket() -> Bucket {
     FlakyStore::bucket(0).1
 }
@@ -302,178 +301,194 @@ fn object_of(outcome: &Outcome) -> Arc<str> {
     }
 }
 
-#[tokio::test]
-async fn flush_writes_one_object_and_acknowledges_every_record_in_order() {
-    let bucket = memory_bucket();
-    let (tx, mut outcomes) = mpsc::unbounded_channel();
-    let sink = BucketSink::start(bucket.clone(), "node-1".into(), manual(), tx);
-    let records = submitted(0..3);
-    sink.submit(records.clone()).unwrap();
-    sink.submit(submitted(3..5)).unwrap();
-    assert!(sink.buffered_bytes() > 0);
-    sink.flush();
-
-    let outcome = next(&mut outcomes).await;
-    assert_eq!(outcome.sink, "bucket");
-    let object = object_of(&outcome);
-    assert!(
-        object.starts_with("export/changes/node-1/"),
-        "unexpected key {object}"
-    );
-    assert!(object.ends_with(".parquet"));
-    let expected: Vec<(u64, Delivery)> = (0..5)
-        .map(|seq| {
-            (
-                seq,
-                Delivery::Acknowledged {
-                    object: object.clone(),
-                },
-            )
-        })
-        .collect();
-    assert_eq!(outcome.results, expected);
-    assert_eq!(sink.buffered_bytes(), 0);
-
-    let written = read_object(&bucket, &object).await;
-    let all: Vec<Record> = submitted(0..5).into_iter().map(|r| r.record).collect();
-    assert_eq!(written, all);
-    let (_, schema) = bucket
-        .head_with_meta(&object, "celld-schema")
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(schema.as_deref(), Some(SCHEMA_VERSION));
-    let (_, retention) = bucket
-        .head_with_meta(&object, "celld-retention")
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(retention.as_deref(), Some("none"));
-    assert_eq!(bucket.list(CHANGES_PREFIX).await.unwrap().len(), 1);
-}
-
-#[tokio::test]
-async fn a_flush_with_nothing_buffered_writes_nothing() {
-    let bucket = memory_bucket();
-    let (tx, mut outcomes) = mpsc::unbounded_channel();
-    let sink = BucketSink::start(bucket.clone(), "node-1".into(), manual(), tx);
-    sink.flush();
-    sink.submit(Vec::new()).unwrap();
-    sink.close().await;
-    assert!(outcomes.recv().await.is_none());
-    assert!(bucket.list(CHANGES_PREFIX).await.unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn the_byte_threshold_flushes_early() {
-    let bucket = memory_bucket();
-    let (tx, mut outcomes) = mpsc::unbounded_channel();
-    let config = BucketSinkConfig {
-        flush_bytes: 1,
-        ..manual()
-    };
-    let sink = BucketSink::start(bucket.clone(), "node-1".into(), config, tx);
-    sink.submit(submitted(0..1)).unwrap();
-    sink.submit(submitted(1..2)).unwrap();
-    let first = next(&mut outcomes).await;
-    let second = next(&mut outcomes).await;
-    assert_eq!(first.results.len(), 1);
-    assert_eq!(first.results[0].0, 0);
-    assert_eq!(second.results[0].0, 1);
-    assert_ne!(object_of(&first), object_of(&second));
-    assert_eq!(bucket.list(CHANGES_PREFIX).await.unwrap().len(), 2);
-}
-
-#[tokio::test]
-async fn the_interval_flushes_without_being_asked() {
-    let bucket = memory_bucket();
-    let (tx, mut outcomes) = mpsc::unbounded_channel();
-    let config = BucketSinkConfig {
-        flush: Duration::from_millis(20),
-        ..manual()
-    };
-    let sink = BucketSink::start(bucket.clone(), "node-1".into(), config, tx);
-    sink.submit(submitted(0..2)).unwrap();
-    let outcome = next(&mut outcomes).await;
-    assert_eq!(outcome.results.len(), 2);
-    assert!(outcome.results.iter().all(|(_, d)| d.is_acknowledged()));
-}
-
-#[tokio::test]
-async fn close_writes_what_is_buffered_then_refuses_records() {
-    let bucket = memory_bucket();
-    let (tx, mut outcomes) = mpsc::unbounded_channel();
-    let sink = BucketSink::start(bucket.clone(), "node-1".into(), manual(), tx);
-    sink.submit(submitted(0..2)).unwrap();
-    sink.close().await;
-    let outcome = next(&mut outcomes).await;
-    assert_eq!(outcome.results.len(), 2);
-    assert!(outcome.results.iter().all(|(_, d)| d.is_acknowledged()));
-    assert_eq!(sink.submit(submitted(2..3)), Err(Closed));
-    assert_eq!(sink.buffered_bytes(), 0);
-    // A second close finds the sink already stopped.
-    sink.close().await;
-}
-
-#[tokio::test]
-async fn records_submitted_after_close_is_called_are_refused() {
-    let bucket = memory_bucket();
-    let (tx, mut outcomes) = mpsc::unbounded_channel();
-    let sink = BucketSink::start(bucket, "node-1".into(), manual(), tx);
-    sink.submit(submitted(0..1)).unwrap();
-    let closing = sink.close();
-    assert_eq!(sink.submit(submitted(1..2)), Err(Closed));
-    closing.await;
-    let outcome = outcomes
-        .try_recv()
-        .expect("outcome sent before close resolved");
-    assert_eq!(
-        outcome
-            .results
-            .iter()
-            .map(|(seq, _)| *seq)
-            .collect::<Vec<_>>(),
-        [0]
-    );
-    assert!(outcomes.try_recv().is_err());
-}
-
-#[tokio::test]
-async fn every_close_waits_for_the_final_write() {
-    let (_store, bucket) = FlakyStore::bucket(1);
-    let (tx, mut outcomes) = mpsc::unbounded_channel();
-    let config = BucketSinkConfig {
-        retry_backoff: Duration::from_millis(50),
-        ..manual()
-    };
-    let sink = BucketSink::start(bucket, "node-1".into(), config, tx);
-    sink.submit(submitted(0..1)).unwrap();
-    let first = sink.close();
-    sink.close().await;
-    let outcome = outcomes
-        .try_recv()
-        .expect("the second close resolved after the outcome");
-    assert!(outcome.results[0].1.is_acknowledged());
-    first.await;
-    // A close after the sink has stopped resolves at once.
-    sink.close().await;
-}
-
-#[tokio::test]
-async fn one_sink_is_usable_as_a_trait_object() {
-    let bucket = memory_bucket();
-    let (tx, mut outcomes) = mpsc::unbounded_channel();
-    let sinks: Vec<Box<dyn ExportSink>> = vec![Box::new(BucketSink::start(
-        bucket,
-        "node-1".into(),
-        manual(),
-        tx,
-    ))];
-    for sink in &sinks {
-        sink.submit(submitted(0..1)).unwrap();
+#[test]
+fn flush_writes_one_object_and_acknowledges_every_record_in_order() {
+    crate::asyncrt::test_block_on(async {
+        let bucket = memory_bucket();
+        let (tx, mut outcomes) = mpsc::unbounded_channel();
+        let sink = BucketSink::start(bucket.clone(), "node-1".into(), manual(), tx);
+        let records = submitted(0..3);
+        sink.submit(records.clone()).unwrap();
+        sink.submit(submitted(3..5)).unwrap();
+        assert!(sink.buffered_bytes() > 0);
         sink.flush();
-    }
-    assert_eq!(next(&mut outcomes).await.sink, sinks[0].name());
+
+        let outcome = next(&mut outcomes).await;
+        assert_eq!(outcome.sink, "bucket");
+        let object = object_of(&outcome);
+        assert!(
+            object.starts_with("export/changes/node-1/"),
+            "unexpected key {object}"
+        );
+        assert!(object.ends_with(".parquet"));
+        let expected: Vec<(u64, Delivery)> = (0..5)
+            .map(|seq| {
+                (
+                    seq,
+                    Delivery::Acknowledged {
+                        object: object.clone(),
+                    },
+                )
+            })
+            .collect();
+        assert_eq!(outcome.results, expected);
+        assert_eq!(sink.buffered_bytes(), 0);
+
+        let written = read_object(&bucket, &object).await;
+        let all: Vec<Record> = submitted(0..5).into_iter().map(|r| r.record).collect();
+        assert_eq!(written, all);
+        let (_, schema) = bucket
+            .head_with_meta(&object, "celld-schema")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(schema.as_deref(), Some(SCHEMA_VERSION));
+        let (_, retention) = bucket
+            .head_with_meta(&object, "celld-retention")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retention.as_deref(), Some("none"));
+        assert_eq!(bucket.list(CHANGES_PREFIX).await.unwrap().len(), 1);
+    });
+}
+
+#[test]
+fn a_flush_with_nothing_buffered_writes_nothing() {
+    crate::asyncrt::test_block_on(async {
+        let bucket = memory_bucket();
+        let (tx, mut outcomes) = mpsc::unbounded_channel();
+        let sink = BucketSink::start(bucket.clone(), "node-1".into(), manual(), tx);
+        sink.flush();
+        sink.submit(Vec::new()).unwrap();
+        sink.close().await;
+        assert!(outcomes.recv().await.is_none());
+        assert!(bucket.list(CHANGES_PREFIX).await.unwrap().is_empty());
+    });
+}
+
+#[test]
+fn the_byte_threshold_flushes_early() {
+    crate::asyncrt::test_block_on(async {
+        let bucket = memory_bucket();
+        let (tx, mut outcomes) = mpsc::unbounded_channel();
+        let config = BucketSinkConfig {
+            flush_bytes: 1,
+            ..manual()
+        };
+        let sink = BucketSink::start(bucket.clone(), "node-1".into(), config, tx);
+        sink.submit(submitted(0..1)).unwrap();
+        sink.submit(submitted(1..2)).unwrap();
+        let first = next(&mut outcomes).await;
+        let second = next(&mut outcomes).await;
+        assert_eq!(first.results.len(), 1);
+        assert_eq!(first.results[0].0, 0);
+        assert_eq!(second.results[0].0, 1);
+        assert_ne!(object_of(&first), object_of(&second));
+        assert_eq!(bucket.list(CHANGES_PREFIX).await.unwrap().len(), 2);
+    });
+}
+
+#[test]
+fn the_interval_flushes_without_being_asked() {
+    crate::asyncrt::test_block_on(async {
+        let bucket = memory_bucket();
+        let (tx, mut outcomes) = mpsc::unbounded_channel();
+        let config = BucketSinkConfig {
+            flush: Duration::from_millis(20),
+            ..manual()
+        };
+        let sink = BucketSink::start(bucket.clone(), "node-1".into(), config, tx);
+        sink.submit(submitted(0..2)).unwrap();
+        let outcome = next(&mut outcomes).await;
+        assert_eq!(outcome.results.len(), 2);
+        assert!(outcome.results.iter().all(|(_, d)| d.is_acknowledged()));
+    });
+}
+
+#[test]
+fn close_writes_what_is_buffered_then_refuses_records() {
+    crate::asyncrt::test_block_on(async {
+        let bucket = memory_bucket();
+        let (tx, mut outcomes) = mpsc::unbounded_channel();
+        let sink = BucketSink::start(bucket.clone(), "node-1".into(), manual(), tx);
+        sink.submit(submitted(0..2)).unwrap();
+        sink.close().await;
+        let outcome = next(&mut outcomes).await;
+        assert_eq!(outcome.results.len(), 2);
+        assert!(outcome.results.iter().all(|(_, d)| d.is_acknowledged()));
+        assert_eq!(sink.submit(submitted(2..3)), Err(Closed));
+        assert_eq!(sink.buffered_bytes(), 0);
+        // A second close finds the sink already stopped.
+        sink.close().await;
+    });
+}
+
+#[test]
+fn records_submitted_after_close_is_called_are_refused() {
+    crate::asyncrt::test_block_on(async {
+        let bucket = memory_bucket();
+        let (tx, mut outcomes) = mpsc::unbounded_channel();
+        let sink = BucketSink::start(bucket, "node-1".into(), manual(), tx);
+        sink.submit(submitted(0..1)).unwrap();
+        let closing = sink.close();
+        assert_eq!(sink.submit(submitted(1..2)), Err(Closed));
+        closing.await;
+        let outcome = outcomes
+            .try_recv()
+            .expect("outcome sent before close resolved");
+        assert_eq!(
+            outcome
+                .results
+                .iter()
+                .map(|(seq, _)| *seq)
+                .collect::<Vec<_>>(),
+            [0]
+        );
+        assert!(outcomes.try_recv().is_err());
+    });
+}
+
+#[test]
+fn every_close_waits_for_the_final_write() {
+    crate::asyncrt::test_block_on(async {
+        let (_store, bucket) = FlakyStore::bucket(1);
+        let (tx, mut outcomes) = mpsc::unbounded_channel();
+        let config = BucketSinkConfig {
+            retry_backoff: Duration::from_millis(50),
+            ..manual()
+        };
+        let sink = BucketSink::start(bucket, "node-1".into(), config, tx);
+        sink.submit(submitted(0..1)).unwrap();
+        let first = sink.close();
+        sink.close().await;
+        let outcome = outcomes
+            .try_recv()
+            .expect("the second close resolved after the outcome");
+        assert!(outcome.results[0].1.is_acknowledged());
+        first.await;
+        // A close after the sink has stopped resolves at once.
+        sink.close().await;
+    });
+}
+
+#[test]
+fn one_sink_is_usable_as_a_trait_object() {
+    crate::asyncrt::test_block_on(async {
+        let bucket = memory_bucket();
+        let (tx, mut outcomes) = mpsc::unbounded_channel();
+        let sinks: Vec<Box<dyn ExportSink>> = vec![Box::new(BucketSink::start(
+            bucket,
+            "node-1".into(),
+            manual(),
+            tx,
+        ))];
+        for sink in &sinks {
+            sink.submit(submitted(0..1)).unwrap();
+            sink.flush();
+        }
+        assert_eq!(next(&mut outcomes).await.sink, sinks[0].name());
+    });
 }
 
 /// An in-memory store whose next `fail_puts` puts fail.
@@ -567,76 +582,82 @@ impl ObjectStore for FlakyStore {
     }
 }
 
-#[tokio::test]
-async fn a_failed_put_is_retried_before_acknowledging() {
-    let (store, bucket) = FlakyStore::bucket(2);
-    let (tx, mut outcomes) = mpsc::unbounded_channel();
-    let sink = BucketSink::start(bucket.clone(), "node-1".into(), manual(), tx);
-    sink.submit(submitted(0..2)).unwrap();
-    sink.flush();
-    let outcome = next(&mut outcomes).await;
-    assert!(outcome.results.iter().all(|(_, d)| d.is_acknowledged()));
-    assert_eq!(store.puts.load(Ordering::SeqCst), 3);
-    let written = read_object(&bucket, &object_of(&outcome)).await;
-    assert_eq!(written.len(), 2);
+#[test]
+fn a_failed_put_is_retried_before_acknowledging() {
+    crate::asyncrt::test_block_on(async {
+        let (store, bucket) = FlakyStore::bucket(2);
+        let (tx, mut outcomes) = mpsc::unbounded_channel();
+        let sink = BucketSink::start(bucket.clone(), "node-1".into(), manual(), tx);
+        sink.submit(submitted(0..2)).unwrap();
+        sink.flush();
+        let outcome = next(&mut outcomes).await;
+        assert!(outcome.results.iter().all(|(_, d)| d.is_acknowledged()));
+        assert_eq!(store.puts.load(Ordering::SeqCst), 3);
+        let written = read_object(&bucket, &object_of(&outcome)).await;
+        assert_eq!(written.len(), 2);
+    });
 }
 
-#[tokio::test]
-async fn records_are_dropped_after_the_last_attempt_and_the_sink_carries_on() {
-    let (store, bucket) = FlakyStore::bucket(3);
-    let (tx, mut outcomes) = mpsc::unbounded_channel();
-    let sink = BucketSink::start(bucket.clone(), "node-1".into(), manual(), tx);
-    sink.submit(submitted(0..2)).unwrap();
-    sink.flush();
-    let outcome = next(&mut outcomes).await;
-    assert_eq!(
-        outcome
+#[test]
+fn records_are_dropped_after_the_last_attempt_and_the_sink_carries_on() {
+    crate::asyncrt::test_block_on(async {
+        let (store, bucket) = FlakyStore::bucket(3);
+        let (tx, mut outcomes) = mpsc::unbounded_channel();
+        let sink = BucketSink::start(bucket.clone(), "node-1".into(), manual(), tx);
+        sink.submit(submitted(0..2)).unwrap();
+        sink.flush();
+        let outcome = next(&mut outcomes).await;
+        assert_eq!(
+            outcome
+                .results
+                .iter()
+                .map(|(seq, _)| *seq)
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+        for (_, delivery) in &outcome.results {
+            let Delivery::Dropped { reason } = delivery else {
+                panic!("expected a drop, got {delivery:?}");
+            };
+            assert!(reason.contains("after 3 attempts"), "{reason}");
+        }
+        assert_eq!(store.puts.load(Ordering::SeqCst), 3);
+        assert_eq!(sink.buffered_bytes(), 0);
+        assert!(bucket.list(CHANGES_PREFIX).await.unwrap().is_empty());
+
+        // The next batch is independent of the dropped one.
+        sink.submit(submitted(2..3)).unwrap();
+        sink.flush();
+        let outcome = next(&mut outcomes).await;
+        assert_eq!(outcome.results[0].0, 2);
+        assert!(outcome.results[0].1.is_acknowledged());
+    });
+}
+
+#[test]
+fn records_submitted_during_a_retry_wait_keep_their_order() {
+    crate::asyncrt::test_block_on(async {
+        let (_store, bucket) = FlakyStore::bucket(1);
+        let (tx, mut outcomes) = mpsc::unbounded_channel();
+        let config = BucketSinkConfig {
+            retry_backoff: Duration::from_millis(100),
+            ..manual()
+        };
+        let sink = BucketSink::start(bucket, "node-1".into(), config, tx);
+        sink.submit(submitted(0..1)).unwrap();
+        sink.flush();
+        sink.submit(submitted(1..2)).unwrap();
+        sink.flush();
+        let first = next(&mut outcomes).await;
+        let second = next(&mut outcomes).await;
+        let seqs: Vec<u64> = first
             .results
             .iter()
+            .chain(&second.results)
             .map(|(seq, _)| *seq)
-            .collect::<Vec<_>>(),
-        [0, 1]
-    );
-    for (_, delivery) in &outcome.results {
-        let Delivery::Dropped { reason } = delivery else {
-            panic!("expected a drop, got {delivery:?}");
-        };
-        assert!(reason.contains("after 3 attempts"), "{reason}");
-    }
-    assert_eq!(store.puts.load(Ordering::SeqCst), 3);
-    assert_eq!(sink.buffered_bytes(), 0);
-    assert!(bucket.list(CHANGES_PREFIX).await.unwrap().is_empty());
-
-    // The next batch is independent of the dropped one.
-    sink.submit(submitted(2..3)).unwrap();
-    sink.flush();
-    let outcome = next(&mut outcomes).await;
-    assert_eq!(outcome.results[0].0, 2);
-    assert!(outcome.results[0].1.is_acknowledged());
-}
-
-#[tokio::test]
-async fn records_submitted_during_a_retry_wait_keep_their_order() {
-    let (_store, bucket) = FlakyStore::bucket(1);
-    let (tx, mut outcomes) = mpsc::unbounded_channel();
-    let config = BucketSinkConfig {
-        retry_backoff: Duration::from_millis(100),
-        ..manual()
-    };
-    let sink = BucketSink::start(bucket, "node-1".into(), config, tx);
-    sink.submit(submitted(0..1)).unwrap();
-    sink.flush();
-    sink.submit(submitted(1..2)).unwrap();
-    sink.flush();
-    let first = next(&mut outcomes).await;
-    let second = next(&mut outcomes).await;
-    let seqs: Vec<u64> = first
-        .results
-        .iter()
-        .chain(&second.results)
-        .map(|(seq, _)| *seq)
-        .collect();
-    assert_eq!(seqs, [0, 1]);
+            .collect();
+        assert_eq!(seqs, [0, 1]);
+    });
 }
 
 #[test]
@@ -659,51 +680,53 @@ fn retention_defaults_to_none() {
     assert_eq!(Retention::Days(30).label(), "30d");
 }
 
-#[tokio::test]
-async fn the_reference_consumer_applies_what_the_sink_wrote() {
-    let bucket = memory_bucket();
-    let (tx, mut outcomes) = mpsc::unbounded_channel();
-    let sink = BucketSink::start(bucket.clone(), "node-1".into(), manual(), tx);
-    let schema = Record {
-        envelope: envelope("cell-a", 1),
-        body: schema_body(),
-    };
-    let records = [
-        schema,
-        rows_record("cell-a", 1, vec![insert(1, "one"), insert(2, "two")]),
-        rows_record(
-            "cell-a",
-            2,
-            vec![RowChange(
-                Op::Delete,
-                vec![Value::Integer(1)],
-                insert(1, "one").2,
-            )],
-        ),
-    ];
-    sink.submit(
-        records
-            .iter()
-            .cloned()
-            .enumerate()
-            .map(|(seq, record)| SinkRecord {
-                seq: seq as u64,
-                record,
-            })
-            .collect(),
-    )
-    .unwrap();
-    sink.flush();
-    let object = object_of(&next(&mut outcomes).await);
-
-    let mut consumer = Consumer::new();
-    consumer
-        .ingest_all(read_object(&bucket, &object).await)
+#[test]
+fn the_reference_consumer_applies_what_the_sink_wrote() {
+    crate::asyncrt::test_block_on(async {
+        let bucket = memory_bucket();
+        let (tx, mut outcomes) = mpsc::unbounded_channel();
+        let sink = BucketSink::start(bucket.clone(), "node-1".into(), manual(), tx);
+        let schema = Record {
+            envelope: envelope("cell-a", 1),
+            body: schema_body(),
+        };
+        let records = [
+            schema,
+            rows_record("cell-a", 1, vec![insert(1, "one"), insert(2, "two")]),
+            rows_record(
+                "cell-a",
+                2,
+                vec![RowChange(
+                    Op::Delete,
+                    vec![Value::Integer(1)],
+                    insert(1, "one").2,
+                )],
+            ),
+        ];
+        sink.submit(
+            records
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(seq, record)| SinkRecord {
+                    seq: seq as u64,
+                    record,
+                })
+                .collect(),
+        )
         .unwrap();
-    let state = consumer.stream(&stream("cell-a")).expect("stream applied");
-    let items = state.table("items").expect("table applied");
-    assert_eq!(
-        items.rows.keys().cloned().collect::<Vec<_>>(),
-        [vec![Value::Integer(2)]]
-    );
+        sink.flush();
+        let object = object_of(&next(&mut outcomes).await);
+
+        let mut consumer = Consumer::new();
+        consumer
+            .ingest_all(read_object(&bucket, &object).await)
+            .unwrap();
+        let state = consumer.stream(&stream("cell-a")).expect("stream applied");
+        let items = state.table("items").expect("table applied");
+        assert_eq!(
+            items.rows.keys().cloned().collect::<Vec<_>>(),
+            [vec![Value::Integer(2)]]
+        );
+    });
 }
