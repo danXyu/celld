@@ -352,22 +352,23 @@ fn image_identity(db: &Connection, scope: &str) -> anyhow::Result<ImageIdentity>
 /// The stream a job's snapshot is written to, or why it is skipped.
 fn resolve_identity(job: &Job, image: &ImageIdentity) -> Result<StreamId, String> {
     let mut stream = job.stream.clone();
-    match image.incarnation {
-        None => {}
-        Some(None) => {
+    // An image from before stream incarnations belongs to the stream the
+    // live path stamped then.
+    match image.incarnation.unwrap_or(Some(ROOT_INCARNATION)) {
+        None => {
             return Err(
                 "the cell has not opened with export on, so it has no stream yet; \
-                        backfill it once it has"
+                 backfill it once it has"
                     .to_string(),
             )
         }
-        Some(Some(held)) if job.pin_incarnation && held != stream.incarnation => {
+        Some(held) if job.pin_incarnation && held != stream.incarnation => {
             return Err(format!(
                 "the bucket holds incarnation {held} of this cell, not {}",
                 stream.incarnation
             ))
         }
-        Some(Some(held)) => stream.incarnation = held,
+        Some(held) => stream.incarnation = held,
     }
     Ok(stream)
 }
@@ -730,6 +731,11 @@ async fn run_job(
     pace: Option<Arc<Pace>>,
 ) -> Report {
     let mut report = Report::new(job);
+    if crate::export::is_never_exported(&job.stream.class) {
+        report.status = Status::Skipped;
+        report.error = Some(format!("class {} is never exported", job.stream.class));
+        return report;
+    }
     if job.stream.facet.is_some() {
         report.status = Status::Skipped;
         report.error = Some("facet streams are not exported yet".to_string());

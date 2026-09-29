@@ -239,6 +239,11 @@ pub(crate) fn snapshot_options(
                 "--stream takes a cell scope, not {scope:?}"
             );
             ensure!(
+                !crate::export::is_never_exported(export_repair::class_of(&scope)),
+                "class {} is never exported",
+                export_repair::class_of(&scope)
+            );
+            ensure!(
                 !scope.contains("/facets/"),
                 "facet streams are not exported yet"
             );

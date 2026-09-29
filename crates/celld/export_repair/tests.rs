@@ -725,6 +725,62 @@ fn an_image_without_metadata_takes_the_default_identity() {
         resolve_identity(&job, &ImageIdentity::default()).unwrap(),
         job.stream
     );
+    // Even an unpinned job with another default lands on the legacy stream.
+    let mut other = job.clone();
+    other.stream.incarnation = 7;
+    assert_eq!(
+        resolve_identity(&other, &ImageIdentity::default())
+            .unwrap()
+            .incarnation,
+        ROOT_INCARNATION
+    );
+}
+
+#[tokio::test]
+async fn a_pinned_incarnation_never_takes_a_legacy_image() {
+    let source = source().await;
+    let mut pinned = job(Target::Head);
+    pinned.pin_incarnation = true;
+    pinned.stream.incarnation = 7;
+    let (reports, records) = snapshot(&source, vec![pinned], &settings(1 << 20)).await;
+    assert_eq!(reports[0].status, Status::Skipped, "{:?}", reports[0]);
+    assert!(reports[0]
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("incarnation 0"));
+    assert!(records.is_empty());
+}
+
+#[tokio::test]
+async fn classes_never_exported_are_skipped_whatever_named_them() {
+    let source = bucket("fleet");
+    for scope in ["__Workflow.shop:one", "__Queue:q"] {
+        put(
+            &source,
+            scope,
+            1,
+            1,
+            1,
+            "CREATE TABLE _cf_KV (key TEXT PRIMARY KEY, value BLOB); INSERT INTO _cf_KV VALUES ('k', x'01');",
+        )
+        .await;
+    }
+    let jobs = ["__Workflow.shop:one", "__Queue:q"]
+        .into_iter()
+        .map(|scope| Job {
+            stream: root_stream(SCRIPT, scope).unwrap(),
+            target: Target::Head,
+            reasons: ["gap".into()].into(),
+            pin_incarnation: true,
+        })
+        .collect();
+    let (reports, records) = snapshot(&source, jobs, &settings(1 << 20)).await;
+    for report in &reports {
+        assert_eq!(report.status, Status::Skipped, "{report:?}");
+        assert!(report.error.as_deref().unwrap().contains("never exported"));
+    }
+    assert!(records.is_empty());
 }
 
 #[tokio::test]

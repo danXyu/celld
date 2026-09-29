@@ -76,6 +76,8 @@ fn repair_takes_one_stream_or_a_gaps_list() {
         &["--stream", "Cart:one", "--concurrency", "0"],
         &["--stream", "Cart:one", "--after", "Cart:a"],
         &["--stream", "Cart:one", "--frobnicate"],
+        &["--stream", "__Workflow.shop:one"],
+        &["--stream", "__Queue:q"],
     ] {
         assert!(
             snapshot_options(Mode::Repair, args(bad)).is_err(),
