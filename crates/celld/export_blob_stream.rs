@@ -593,7 +593,7 @@ mod client {
                 brokers,
                 writer_id: config.blob_stream_writer_id()?,
                 partitions,
-                writers: config.writers,
+                writers: config.blob_stream_writers(),
                 retry: config.retry,
             })
         }

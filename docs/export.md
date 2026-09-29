@@ -22,6 +22,12 @@ build leaves out; a node without it refuses to start with
 generation needs `protoc` on the build machine). A node exports through one
 sink at a time: `bucket,blob-stream` refuses to start.
 
+blob-stream partitions a topic by writer, one writer per zone of the broker
+deployment. For a topic with several writers, list its zones in writer order
+in `CELLD_EXPORT_ZONES` and give each node its zone in `CELLD_ZONE`; the
+node produces as the writer at its zone's position. A single-writer topic
+needs neither.
+
 Export is off by default, and the off state costs nothing: with
 `CELLD_EXPORT` unset or `0`, celld opens no capture session, holds no
 export buffer, and starts no export task. celld still checks the values of
@@ -47,8 +53,8 @@ relate one variable to another apply only with `CELLD_EXPORT=1`.
 | `CELLD_EXPORT_TOPIC` | `celld-changes` | The blob-stream topic. |
 | `CELLD_EXPORT_BROKERS` | unset | Comma-separated `host:port` brokers, or `k8s://NAMESPACE/SERVICE`. Required when the blob-stream sink is on. |
 | `CELLD_EXPORT_PARTITIONS` | unset | The topic's partition count, which every producer and consumer of the topic must agree on. Required when the blob-stream sink is on. |
-| `CELLD_EXPORT_WRITERS` | `1` | The topic's writer count, one per zone of the broker deployment. |
-| `CELLD_EXPORT_WRITER_ID` | `0` | The writer number of this node's zone, below `CELLD_EXPORT_WRITERS`. Required when there is more than one writer. |
+| `CELLD_EXPORT_ZONES` | unset | The topic's writer zones, comma-separated in the broker deployment's writer order: a zone's writer number is its position, from 0. Every node must list them alike. Unset means a single-writer topic. |
+| `CELLD_EXPORT_WRITER_ID` | the node's zone (`CELLD_ZONE`) | The zone whose writer this node produces as. It must be one of `CELLD_EXPORT_ZONES`. |
 | `CELLD_EXPORT_RETRY_MS` | `30000` | The blob-stream retry deadline before a record counts as dropped. |
 | `CELLD_EXPORT_RECONCILE` | `24h` | The reconciler interval, as `<n>s`, `<n>m`, `<n>h`, or `<n>d`. The loader deployment runs the reconciler, not the node. |
 

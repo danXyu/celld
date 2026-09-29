@@ -1054,6 +1054,7 @@ For the full list, run `celld -h`. This table shows the primary settings:
 | `CELLD_ADVERTISE` | The internal address that peers can reach. The same as `--advertise` |
 | `CELLD_UNSAFE_PUBLIC_ADVERTISE` | Set to `1` to permit a literal public IP in `CELLD_ADVERTISE`. This setting does not resolve a DNS name or restrict the internal listener |
 | `CELLD_NODE` | An explicit node-session ID. Use 1 to 128 ASCII letters, numbers, dots, dashes, or underscores. The value cannot be `.` or `..` |
+| `CELLD_ZONE` | The node's availability zone, such as `us-east-1a`. Use 1 to 128 ASCII letters, numbers, dots, dashes, or underscores. Change export's blob-stream sink uses it to pick the node's writer (see [export](export.md)) |
 | `CELLD_WATCH` | The local work directory for SQLite and replication |
 | `CELLD_ESBUILD` | The path of the esbuild executable |
 | `CELLD_ACTIVATIONS` | The limit for concurrent cold-cell activations (default: 8 for each available CPU, at least 16 and at most 128). A cold activation waits on the object store for most of its time, so the default is above the CPU count |

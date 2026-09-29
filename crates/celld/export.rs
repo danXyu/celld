@@ -24,7 +24,6 @@ pub const DEFAULT_MAX_RECORD_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_QUEUE_BYTES: usize = 256 * 1024 * 1024;
 pub const DEFAULT_FLUSH: Duration = Duration::from_secs(10);
 pub const DEFAULT_FLUSH_BYTES: usize = 8 * 1024 * 1024;
-pub const DEFAULT_WRITERS: u32 = 1;
 pub const DEFAULT_RETRY: Duration = Duration::from_secs(30);
 pub const DEFAULT_RECONCILE: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -97,17 +96,19 @@ pub struct Config {
     /// `CELLD_EXPORT_BROKERS`: static `host:port` brokers or one
     /// `k8s://NAMESPACE/SERVICE`. Required when the blob-stream sink is on.
     pub brokers: Option<String>,
-    /// `CELLD_EXPORT_WRITER_ID`: the blob-stream writer id, the broker
-    /// deployment's number for this node's zone, below `writers`. `None`
-    /// means writer 0, which only a single-writer topic may leave implicit:
-    /// celld has no zone numbering of its own.
+    /// `CELLD_EXPORT_WRITER_ID`: the zone whose blob-stream writer this
+    /// node produces as. `None` means the node's zone, [`Config::zone`].
     pub writer_id: Option<String>,
+    /// `CELLD_ZONE`: the node's zone, a node-level setting.
+    pub zone: Option<String>,
+    /// `CELLD_EXPORT_ZONES`: the topic's writer zones in writer order, so a
+    /// zone's writer number is its position. Every producer of a topic must
+    /// list them alike. Empty means a single-writer topic, writer 0.
+    pub zones: Vec<String>,
     /// `CELLD_EXPORT_PARTITIONS`: the topic's logical partition count.
     /// Every producer and consumer of a topic must agree on it, so it has no
     /// default. Required when the blob-stream sink is on.
     pub partitions: Option<u32>,
-    /// `CELLD_EXPORT_WRITERS`: the topic's writer count (its zones).
-    pub writers: u32,
     /// blob-stream retry deadline before a record counts as dropped.
     pub retry: Duration,
     /// Reconciler interval. Read by the loader deployment, not the node; it
@@ -180,16 +181,22 @@ impl Config {
             Some(brokers) => Some(parse_brokers(&brokers)?),
             None => None,
         };
-        let writer_id = non_empty("CELLD_EXPORT_WRITER_ID", get("CELLD_EXPORT_WRITER_ID")?)?;
+        let writer_id = match non_empty("CELLD_EXPORT_WRITER_ID", get("CELLD_EXPORT_WRITER_ID")?)? {
+            Some(zone) => Some(parse_zone("CELLD_EXPORT_WRITER_ID", &zone)?),
+            None => None,
+        };
+        let zone = match get("CELLD_ZONE")? {
+            Some(zone) => Some(parse_zone("CELLD_ZONE", &zone)?),
+            None => None,
+        };
+        let zones = match get("CELLD_EXPORT_ZONES")? {
+            None => Vec::new(),
+            Some(list) => parse_zones(&list)?,
+        };
         let partitions = crate::env_vars::parse_positive::<u32>(
             "CELLD_EXPORT_PARTITIONS",
             get("CELLD_EXPORT_PARTITIONS")?,
         )?;
-        let writers = crate::env_vars::parse_positive::<u32>(
-            "CELLD_EXPORT_WRITERS",
-            get("CELLD_EXPORT_WRITERS")?,
-        )?
-        .unwrap_or(DEFAULT_WRITERS);
         let reconcile = match get("CELLD_EXPORT_RECONCILE")? {
             None => DEFAULT_RECONCILE,
             Some(value) => parse_interval("CELLD_EXPORT_RECONCILE", &value)?,
@@ -209,13 +216,14 @@ impl Config {
                      set it to the topic's partition count"
                 );
             };
+            let writers = writer_count(&zones);
             if partitions.checked_mul(writers).is_none() {
                 bail!(
-                    "CELLD_EXPORT_PARTITIONS ({partitions}) times CELLD_EXPORT_WRITERS ({writers}) \
-                     overflows the topic's partition space"
+                    "CELLD_EXPORT_PARTITIONS ({partitions}) times the {writers} zones of \
+                     CELLD_EXPORT_ZONES overflows the topic's partition space"
                 );
             }
-            blob_stream_writer_id(writer_id.as_deref(), writers)?;
+            blob_stream_writer_id(writer_id.as_deref(), zone.as_deref(), &zones)?;
         }
         if max_record_bytes > queue_bytes {
             bail!(
@@ -237,17 +245,25 @@ impl Config {
             topic,
             brokers,
             writer_id,
+            zone,
+            zones,
             partitions,
-            writers,
             retry,
             reconcile,
         }))
     }
 
-    /// The blob-stream writer id. Checked when the config is read, so this
-    /// only fails for a config that does not use the blob-stream sink.
+    /// The blob-stream writer number: the position of this node's writer
+    /// zone in `CELLD_EXPORT_ZONES`. Checked when the config is read, so
+    /// this only fails for a config that does not use the blob-stream sink.
     pub fn blob_stream_writer_id(&self) -> anyhow::Result<u32> {
-        blob_stream_writer_id(self.writer_id.as_deref(), self.writers)
+        blob_stream_writer_id(self.writer_id.as_deref(), self.zone.as_deref(), &self.zones)
+    }
+
+    /// The topic's writer count: one per zone, or one for a topic without
+    /// zones.
+    pub fn blob_stream_writers(&self) -> u32 {
+        writer_count(&self.zones)
     }
 
     /// Whether cells of `class` are exported. A facet asks with its root's
@@ -274,22 +290,77 @@ impl Config {
     }
 }
 
-fn blob_stream_writer_id(writer_id: Option<&str>, writers: u32) -> anyhow::Result<u32> {
-    let id = match writer_id {
-        None if writers == 1 => 0,
-        None => bail!(
-            "CELLD_EXPORT_WRITERS is {writers}, so CELLD_EXPORT_WRITER_ID must name this node's \
-             writer (0 to {})",
-            writers - 1
-        ),
-        Some(value) => value.trim().parse::<u32>().map_err(|_| {
-            anyhow!("CELLD_EXPORT_WRITER_ID must be the zone's writer number for blob-stream, not {value:?}")
-        })?,
-    };
-    if id >= writers {
-        bail!("CELLD_EXPORT_WRITER_ID ({id}) must be below CELLD_EXPORT_WRITERS ({writers})");
+fn writer_count(zones: &[String]) -> u32 {
+    // parse_zones caps the list far below u32::MAX.
+    zones.len().max(1) as u32
+}
+
+/// The writer zone is `CELLD_EXPORT_WRITER_ID`, else the node's zone.
+fn blob_stream_writer_id(
+    writer_id: Option<&str>,
+    zone: Option<&str>,
+    zones: &[String],
+) -> anyhow::Result<u32> {
+    if zones.is_empty() {
+        if writer_id.is_some() {
+            bail!(
+                "CELLD_EXPORT_WRITER_ID names a zone but CELLD_EXPORT_ZONES is unset; list the \
+                 topic's zones, or unset it for a single-writer topic"
+            );
+        }
+        return Ok(0);
     }
-    Ok(id)
+    let (name, zone) = match (writer_id, zone) {
+        (Some(zone), _) => ("CELLD_EXPORT_WRITER_ID", zone),
+        (None, Some(zone)) => ("CELLD_ZONE", zone),
+        (None, None) => bail!(
+            "CELLD_EXPORT_ZONES lists the topic's zones, so this node needs its own: set \
+             CELLD_ZONE (or CELLD_EXPORT_WRITER_ID)"
+        ),
+    };
+    match zones.iter().position(|listed| listed == zone) {
+        Some(index) => Ok(index as u32),
+        None => bail!(
+            "{name} is {zone:?}, which CELLD_EXPORT_ZONES does not list ({})",
+            zones.join(",")
+        ),
+    }
+}
+
+/// A zone name: 1 to 128 ASCII letters, numbers, dots, dashes or
+/// underscores, the node-name alphabet.
+pub fn parse_zone(name: &str, value: &str) -> anyhow::Result<String> {
+    let zone = value.trim();
+    let valid = !zone.is_empty()
+        && zone.len() <= 128
+        && zone
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'));
+    if !valid {
+        bail!("{name} must be a zone name (ASCII letters, numbers, '.', '-', '_'), not {value:?}");
+    }
+    Ok(zone.to_string())
+}
+
+fn parse_zones(list: &str) -> anyhow::Result<Vec<String>> {
+    let mut zones: Vec<String> = Vec::new();
+    for item in items(list) {
+        let zone = parse_zone("CELLD_EXPORT_ZONES", item)?;
+        if zones.contains(&zone) {
+            bail!("CELLD_EXPORT_ZONES lists {zone:?} twice");
+        }
+        zones.push(zone);
+    }
+    if zones.is_empty() {
+        bail!("CELLD_EXPORT_ZONES must list at least one zone; unset it for a single-writer topic");
+    }
+    if zones.len() > 1024 {
+        bail!(
+            "CELLD_EXPORT_ZONES lists {} zones; at most 1024",
+            zones.len()
+        );
+    }
+    Ok(zones)
 }
 
 fn non_empty(name: &str, value: Option<String>) -> anyhow::Result<Option<String>> {
@@ -463,8 +534,9 @@ mod tests {
         assert_eq!(config.topic, "celld-changes");
         assert_eq!(config.brokers, None);
         assert_eq!(config.writer_id, None);
+        assert_eq!(config.zone, None);
+        assert!(config.zones.is_empty());
         assert_eq!(config.partitions, None);
-        assert_eq!(config.writers, 1);
         assert_eq!(config.retry, Duration::from_millis(30_000));
         assert_eq!(config.reconcile, Duration::from_secs(24 * 3600));
     }
@@ -484,9 +556,10 @@ mod tests {
             ("CELLD_EXPORT_RETENTION", "14d"),
             ("CELLD_EXPORT_TOPIC", "prod-changes"),
             ("CELLD_EXPORT_BROKERS", "k8s://streams/blob-stream"),
-            ("CELLD_EXPORT_WRITER_ID", "2"),
+            ("CELLD_EXPORT_WRITER_ID", "us-east-1c"),
+            ("CELLD_ZONE", "us-east-1a"),
+            ("CELLD_EXPORT_ZONES", "us-east-1a, us-east-1b,us-east-1c"),
             ("CELLD_EXPORT_PARTITIONS", "64"),
-            ("CELLD_EXPORT_WRITERS", "3"),
             ("CELLD_EXPORT_RETRY_MS", "9"),
             ("CELLD_EXPORT_RECONCILE", "6h"),
         ]);
@@ -513,10 +586,13 @@ mod tests {
         assert_eq!(config.retention, Retention::Days(14));
         assert_eq!(config.topic, "prod-changes");
         assert_eq!(config.brokers.as_deref(), Some("k8s://streams/blob-stream"));
-        assert_eq!(config.writer_id.as_deref(), Some("2"));
+        assert_eq!(config.writer_id.as_deref(), Some("us-east-1c"));
+        assert_eq!(config.zone.as_deref(), Some("us-east-1a"));
+        assert_eq!(config.zones, ["us-east-1a", "us-east-1b", "us-east-1c"]);
+        // The explicit writer zone wins over the node's zone.
         assert_eq!(config.blob_stream_writer_id().unwrap(), 2);
+        assert_eq!(config.blob_stream_writers(), 3);
         assert_eq!(config.partitions, Some(64));
-        assert_eq!(config.writers, 3);
         assert_eq!(config.retry, Duration::from_millis(9));
         assert_eq!(config.reconcile, Duration::from_secs(6 * 3600));
     }
@@ -571,8 +647,12 @@ mod tests {
             ("CELLD_EXPORT_RETENTION", "0d"),
             ("CELLD_EXPORT_TOPIC", " "),
             ("CELLD_EXPORT_WRITER_ID", ""),
+            ("CELLD_EXPORT_WRITER_ID", "us east"),
+            ("CELLD_ZONE", ""),
+            ("CELLD_ZONE", "a/b"),
+            ("CELLD_EXPORT_ZONES", " , "),
+            ("CELLD_EXPORT_ZONES", "a,b,a"),
             ("CELLD_EXPORT_PARTITIONS", "0"),
-            ("CELLD_EXPORT_WRITERS", "many"),
             ("CELLD_EXPORT_BROKERS", "k8s://streams"),
             ("CELLD_EXPORT_BROKERS", "broker-a"),
             ("CELLD_EXPORT_BROKERS", "broker-a:0"),
@@ -617,39 +697,51 @@ mod tests {
             vars.extend_from_slice(extra);
             config(&vars)
         };
-        // One writer: the id may be left out and means 0.
+        let writer = |extra: &[(&'static str, &'static str)]| {
+            let config = with(extra).unwrap().unwrap();
+            (
+                config.blob_stream_writer_id().unwrap(),
+                config.blob_stream_writers(),
+            )
+        };
+        // No zones: one writer, whatever the node's zone.
+        assert_eq!(writer(&[]), (0, 1));
+        assert_eq!(writer(&[("CELLD_ZONE", "us-east-1b")]), (0, 1));
+        // Zones: the node's zone picks the writer by position.
+        let zones = ("CELLD_EXPORT_ZONES", "us-east-1a,us-east-1b,us-east-1c");
+        assert_eq!(writer(&[zones, ("CELLD_ZONE", "us-east-1b")]), (1, 3));
         assert_eq!(
-            with(&[]).unwrap().unwrap().blob_stream_writer_id().unwrap(),
-            0
+            writer(&[zones, ("CELLD_EXPORT_WRITER_ID", "us-east-1c")]),
+            (2, 3)
         );
-        // Several: the zone's number is required and must be in range.
-        let message = with(&[("CELLD_EXPORT_WRITERS", "3")])
-            .unwrap_err()
-            .to_string();
-        assert!(message.contains("CELLD_EXPORT_WRITER_ID"), "{message}");
-        for id in ["3", "us-east-1a"] {
-            let message = with(&[
-                ("CELLD_EXPORT_WRITERS", "3"),
-                ("CELLD_EXPORT_WRITER_ID", id),
-            ])
-            .unwrap_err()
-            .to_string();
-            assert!(
-                message.contains("CELLD_EXPORT_WRITER_ID"),
-                "{id}: {message}"
-            );
+        for (extra, needle) in [
+            (vec![zones], "CELLD_ZONE"),
+            (vec![zones, ("CELLD_ZONE", "eu-west-1a")], "does not list"),
+            (
+                vec![zones, ("CELLD_EXPORT_WRITER_ID", "eu-west-1a")],
+                "does not list",
+            ),
+            (
+                vec![("CELLD_EXPORT_WRITER_ID", "us-east-1a")],
+                "CELLD_EXPORT_ZONES is unset",
+            ),
+        ] {
+            let message = with(&extra).unwrap_err().to_string();
+            assert!(message.contains(needle), "{extra:?}: {message}");
         }
-        let message = with(&[("CELLD_EXPORT_WRITERS", "4294967295")])
-            .unwrap_err()
-            .to_string();
+        let message = with(&[
+            ("CELLD_EXPORT_PARTITIONS", "4294967295"),
+            ("CELLD_EXPORT_ZONES", "a,b"),
+        ])
+        .unwrap_err()
+        .to_string();
         assert!(message.contains("overflows"), "{message}");
         // The bucket sink alone never reads them.
-        assert!(config(&[
-            ("CELLD_EXPORT", "1"),
-            ("CELLD_EXPORT_WRITER_ID", "us-east-1a")
-        ])
-        .unwrap()
-        .is_some());
+        assert!(
+            config(&[("CELLD_EXPORT", "1"), ("CELLD_EXPORT_ZONES", "a,b"),])
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
