@@ -439,18 +439,16 @@ fn recovered_records(
     cells
         .into_iter()
         .map(|cell| {
-            let class = cell
-                .cell
-                .split_once(':')
-                .map_or(cell.cell.as_str(), |(class, _)| class);
+            let (root, facet) = recovered_root(&cell.cell);
+            let class = root.split_once(':').map_or(root, |(class, _)| class);
             let head = Position::new(cell.epoch, cell.through, u64::MAX);
             Record {
                 envelope: Envelope {
                     stream: StreamId {
                         script: String::new(),
                         class: class.to_string(),
-                        cell: cell.cell.clone(),
-                        facet: None,
+                        cell: root.to_string(),
+                        facet: facet.map(str::to_string),
                         incarnation: 0,
                     },
                     cell_name: None,
@@ -470,6 +468,17 @@ fn recovered_records(
             }
         })
         .collect()
+}
+
+/// A replication stream name split into its root cell and, for a facet,
+/// the facet path below the root (`facets/<h>[/facets/<h>...]`), the
+/// `facet` a facet stream's records carry. Hashed facet names never contain
+/// `/`, so the root ends at the first `/facets/`.
+fn recovered_root(cell: &str) -> (&str, Option<&str>) {
+    match cell.find("/facets/") {
+        Some(at) => (&cell[..at], Some(&cell[at + 1..])),
+        None => (cell, None),
+    }
 }
 
 fn capture_of(file: &celld_ltx::CapturedFile) -> Capture {
@@ -993,6 +1002,31 @@ mod tests {
                 cells: 1,
             })
         );
+    }
+
+    #[test]
+    fn recovered_records_name_a_facet_by_its_root_and_path() {
+        let recovery = Recovery {
+            session: "node-a/g1".into(),
+            loss: false,
+            cells: vec![RecoveredCell {
+                cell: "Chat:01/facets/aa/facets/bb".into(),
+                epoch: 2,
+                through: 3,
+            }],
+        };
+        let records = recovered_records("node-b", &recovery, |_| true);
+        assert_eq!(
+            records[0].envelope.stream,
+            StreamId {
+                script: String::new(),
+                class: "Chat".into(),
+                cell: "Chat:01".into(),
+                facet: Some("facets/aa/facets/bb".into()),
+                incarnation: 0,
+            }
+        );
+        assert_eq!(recovered_root("Chat:01"), ("Chat:01", None));
     }
 
     #[test]

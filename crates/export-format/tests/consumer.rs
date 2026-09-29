@@ -590,3 +590,37 @@ fn only_the_unadopted_recovered_records_stay_scriptless() {
         scriptless[0].gaps
     );
 }
+
+#[test]
+fn a_recovered_facet_record_applies_to_every_incarnation_at_its_path() {
+    let path = "facets/aa";
+    let first = facet(path, 0x9e37);
+    let second = facet(path, 0x1234);
+    let other = facet("facets/bb", 0x9e37);
+    let head = Position::new(1, 5, u64::MAX);
+    let mut r = recovered(head, false);
+    r.envelope.stream.facet = Some(path.into());
+    let rows_on = |s: &StreamId| {
+        record(
+            s,
+            Position::new(1, 1, 1),
+            Origin::Live,
+            Body::Rows(RowsBody {
+                data: table_rows("t", 1, vec![put(1, "a")]),
+            }),
+        )
+    };
+    let mut c = Consumer::new();
+    c.ingest_all(vec![rows_on(&first), rows_on(&second), rows_on(&other), r])
+        .unwrap();
+    let state = c.state();
+    assert!(
+        state.keys().all(|s| !s.script.is_empty()),
+        "adopted: {state:?}"
+    );
+    assert_eq!(state[&first].gaps.len(), 1);
+    assert_eq!(state[&second].gaps.len(), 1);
+    assert!(state[&other].gaps.is_empty());
+    // The root stream, never seen, gets nothing.
+    assert!(!state.contains_key(&stream()));
+}

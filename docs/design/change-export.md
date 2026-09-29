@@ -488,10 +488,11 @@ loss visible.
   whose head is what the bucket then holds for that epoch, so a repair at
   the bucket's head reaches it; a recoverer that dies before emitting leaves
   it to the node that takes the recovery over. Recovery knows neither the
-  cell's script nor its first epoch, so the record's stream carries an empty
-  `script` and incarnation 0, and the consumer applies it to the root
-  stream of the same class and cell whose incarnation is the newest at or
-  below the head's epoch. A consumer compares the head with its certified
+  cell's script nor its incarnation, so the record's stream carries an
+  empty `script` and incarnation 0 (with the facet path for a facet), and
+  the consumer applies it to the root stream of the same class and cell
+  whose incarnation is the newest at or below the head's epoch, or, for a
+  facet, to every stream at that facet path. A consumer compares the head with its certified
   position exactly as it does a link. With `loss`, writes acknowledged past
   the head may be in no copy and the cell restores without them, so a
   consumer certified past the head holds changes the cell lost; that is a

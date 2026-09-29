@@ -72,6 +72,7 @@ before it seals the log. The record's head is what the bucket holds for that
 epoch, and `loss` marks a recovery that declared a bounded loss. Recovery
 only visits cells with rows left in the dead node's log, so a cell whose
 writes were already in the bucket gets no record, and the reconciler covers
-it. The record names the cell's class and cell but not its script or
-incarnation, which recovery does not know; a consumer matches it to the
-cell's stream by class and cell. Facets are not reported yet.
+it. The record names the cell's class and cell, and a facet's path, but not
+its script or incarnation, which recovery does not know; a consumer matches
+it to the cell's stream by class, cell and facet path. Facets are reported
+once their streams export.
