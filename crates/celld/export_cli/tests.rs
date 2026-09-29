@@ -268,6 +268,7 @@ fn record(cell: &str, kind_gap: bool, txid: u64, origin: Origin) -> Record {
                 facet: None,
                 incarnation: None,
                 subtree: false,
+                through_incarnation: None,
             })
         },
     }
