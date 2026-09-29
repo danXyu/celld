@@ -260,7 +260,10 @@ class Emulator:
         retry = int(query.get("retryCount", ["0"])[0])
         rows = [json.loads(line) for line in body.decode().splitlines() if line.strip()]
         seen = [a for a in self.appends if a[1] == request_id]
-        if request_id is None or retry != len(seen):
+        # retryCount counts the requests sent before under this id, and a
+        # request the emulator never received (the client gave up waiting
+        # before it arrived, say) is one the emulator did not see.
+        if request_id is None or retry < len(seen):
             status = 400
         elif not self.appends:
             status = 503

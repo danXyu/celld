@@ -175,6 +175,9 @@ impl Streaming {
         let request = request_id()?;
         let mut last = String::new();
         let mut delay = Duration::from_secs(1);
+        // Requests sent under this id so far: `retryCount` counts those,
+        // not attempts that failed before sending.
+        let mut sent = 0;
         for attempt in 0..ATTEMPTS {
             if attempt > 0 {
                 (self.pause)(delay);
@@ -192,17 +195,18 @@ impl Streaming {
             }
             let ingest = self.ingest.as_ref().expect("connected above");
             let url = format!(
-                "{}/v2/streaming/data/databases/{}/schemas/{}/pipes/{}/channels/ELASTIC/rows?requestId={request}&retryCount={attempt}",
+                "{}/v2/streaming/data/databases/{}/schemas/{}/pipes/{}/channels/ELASTIC/rows?requestId={request}&retryCount={sent}",
                 ingest.base, self.database, self.schema, self.pipe
             );
-            let sent = self
+            let response = self
                 .agent
                 .post(&url)
                 .header("Authorization", &format!("Bearer {}", ingest.token))
                 .header("User-Agent", "celld-export-loader")
                 .content_type("application/x-ndjson")
                 .send(payload);
-            let mut response = match sent {
+            sent += 1;
+            let mut response = match response {
                 Ok(r) => r,
                 Err(e) => {
                     last = e.to_string();
