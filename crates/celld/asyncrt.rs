@@ -591,3 +591,21 @@ pub mod rng {
 
     impl CryptoRng for Stream {}
 }
+
+/// Run a test future on one process-lifetime runtime. The process domain
+/// binds to the first runtime that touches it, so a test on its own
+/// `#[tokio::test]` runtime can leave every later test in the binary on a
+/// dropped one. Tests that reach `asyncrt` run here instead.
+#[cfg(test)]
+pub(crate) fn test_block_on<T>(future: impl Future<Output = T>) -> T {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    let runtime = RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+    });
+    set_host_handle(runtime.handle().clone());
+    runtime.block_on(future)
+}

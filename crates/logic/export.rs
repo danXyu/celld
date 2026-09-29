@@ -293,6 +293,45 @@ impl<T> Attribution<T> {
         self.release();
     }
 
+    /// A commit at `at` whose payload was shed before it reached this state,
+    /// because the export queue was over budget when the cell thread pulled
+    /// it. It takes its place in commit order as an overflow gap, labelled
+    /// like any other commit, so the gap is released with the proof that
+    /// covers it.
+    pub fn dropped(&mut self, at: WalPoint) {
+        self.order.committed(at.generation);
+        self.last_commit = Some(at);
+        let merged = match self.pending.back_mut() {
+            Some(Entry::Gap {
+                through,
+                unlabeled,
+                overflowed,
+                ..
+            }) => {
+                // This commit is the later one, so its label bounds the gap
+                // once known, as in `drop_commit`.
+                *through = None;
+                *unlabeled = Some(at);
+                *overflowed += 1;
+                true
+            }
+            _ => false,
+        };
+        if !merged {
+            self.pending.push_back(Entry::Gap {
+                through: None,
+                unlabeled: Some(at),
+                unmatched: 0,
+                overflowed: 1,
+            });
+        }
+        self.resolve();
+        self.settle_passed(at);
+        self.prune_settled();
+        self.forget_generations();
+        self.release();
+    }
+
     /// A commit the cell thread pulled whose WAL point could not be read,
     /// because the capture loop restarted or truncated the WAL between the
     /// commit and the WAL hook's read. The capture loop does that only after
