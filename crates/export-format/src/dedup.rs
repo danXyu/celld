@@ -40,7 +40,13 @@ impl RecordKey {
             ),
             Body::Schema(b) => (Some((b.table.clone(), b.generation)), None, None),
             Body::SnapshotEnd(b) => (None, Some(b.snapshot_id.clone()), None),
-            Body::Deleted(b) => (None, None, b.facet.clone().zip(b.incarnation)),
+            Body::Deleted(b) => (
+                None,
+                None,
+                b.facet
+                    .clone()
+                    .map(|f| (f, b.incarnation.or(b.through_incarnation).unwrap_or(0))),
+            ),
             _ => (None, None, None),
         };
         let bulk_tables = match &r.body {

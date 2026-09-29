@@ -150,15 +150,23 @@ impl Consumer {
             .filter(|s| {
                 targets.iter().any(|(root, d)| {
                     let path = d.facet.as_deref().expect("filtered");
-                    let exact = s.facet.as_deref() == Some(path)
-                        && d.incarnation.is_none_or(|i| i == s.incarnation);
-                    let below = d.subtree
-                        && s.facet.as_deref() != Some(path)
-                        && s.is_at_or_under(&root.script, &root.class, &root.cell, Some(path));
+                    let at_path = s.facet.as_deref() == Some(path);
+                    let under = at_path
+                        || (d.subtree
+                            && s.is_at_or_under(&root.script, &root.class, &root.cell, Some(path)));
+                    let removed = match d.through_incarnation {
+                        // Ordered incarnations: a facet recreated after the
+                        // delete, at the path or below it, is above the bound.
+                        Some(bound) => under && s.incarnation <= bound,
+                        None => {
+                            (at_path && d.incarnation.is_none_or(|i| i == s.incarnation))
+                                || (under && !at_path)
+                        }
+                    };
                     s.script == root.script
                         && s.class == root.class
                         && s.cell == root.cell
-                        && (exact || below)
+                        && removed
                 })
             })
             .cloned()
