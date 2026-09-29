@@ -25,6 +25,12 @@ incremental = true
 # the shipped release profile stays stripped.
 strip = false
 debug = "line-tables-only"
+
+# Benchmarks use optimized code with bounded link cost; shipping release stays unchanged.
+[profile.bench]
+lto = "thin"
+codegen-units = 16
+
 [profile.dev.package.sha2]
 opt-level = 3
 [profile.dev.package.rsa]
@@ -36,6 +42,7 @@ opt-level = 3
 aes = "0.8"
 aes-gcm = "0.10"
 cbc = { version = "0.1", features = ["alloc"] }
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support", "html_reports"] }
 ctr = "0.9"
 anyhow = "1"
 async-trait = "0.1"

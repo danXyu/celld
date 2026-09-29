@@ -838,3 +838,8 @@ the local disk problem, then reconcile and repair.
 | a duplicate delivery | the same record twice | nothing; readers drop duplicates |
 | export turned on for existing cells | new changes only | backfill |
 | a stream erased | tombstones in the bucket and Snowflake | nothing; every path skips it |
+
+## Performance benchmarks
+
+See [export benchmarks](export-benchmarks.md) for the Criterion suites, timing
+boundaries, local baseline comparisons and CI smoke checks.
