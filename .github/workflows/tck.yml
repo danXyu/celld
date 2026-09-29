@@ -34,10 +34,69 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # The runner's preinstalled SDKs leave too little disk for the cargo
+      # target cache below to be restored, used by BuildKit and extracted
+      # again.
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
       - uses: docker/setup-buildx-action@v3
 
+      # `docker buildx build` in a run step only reaches the gha layer cache
+      # when the Actions cache runtime is in its environment.
+      - uses: crazy-max/ghaction-github-runtime@v3
+
+      # The Dockerfile's cargo registry, git and target cache mounts live in
+      # the builder, which is new each run, so on their own they start empty
+      # and every build compiles all ~350 crates. Carry them across runs in
+      # the Actions cache instead. As in CI, only pushes to main (and manual
+      # runs) save: a pull request can restore main's entry but not another
+      # pull request's. A lockfile or toolchain change starts a fresh entry,
+      # which keeps stale dependency builds from piling up in it.
+      - name: Cache key
+        id: cache-key
+        run: |
+          set -euo pipefail
+          rust=$(sed -n 's/^ARG RUST_VERSION=//p' Dockerfile)
+          echo "prefix=tck-cargo-mounts-v1-rust-$rust-${{ hashFiles('Cargo.lock') }}-" >> "$GITHUB_OUTPUT"
+
+      - name: Restore cargo cache mounts
+        if: github.event_name == 'pull_request'
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ runner.temp }}/cargo-mounts
+          key: ${{ steps.cache-key.outputs.prefix }}${{ github.run_id }}
+          restore-keys: ${{ steps.cache-key.outputs.prefix }}
+
+      # Declared before the cache dance so that its post step, which saves,
+      # runs after the dance's post step has extracted the mounts.
+      - name: Restore and save cargo cache mounts
+        if: github.event_name != 'pull_request'
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}/cargo-mounts
+          key: ${{ steps.cache-key.outputs.prefix }}${{ github.run_id }}
+          restore-keys: ${{ steps.cache-key.outputs.prefix }}
+
+      - name: Inject cargo cache mounts
+        uses: reproducible-containers/buildkit-cache-dance@v3.4.0
+        with:
+          cache-map: |
+            {
+              "${{ runner.temp }}/cargo-mounts/registry": {"id": "celld-cargo-registry", "target": "/usr/local/cargo/registry"},
+              "${{ runner.temp }}/cargo-mounts/git": {"id": "celld-cargo-git", "target": "/usr/local/cargo/git"},
+              "${{ runner.temp }}/cargo-mounts/target": {"id": "celld-target-amd64", "target": "/src/target"}
+            }
+          scratch-dir: ${{ runner.temp }}/cache-dance-scratch
+          skip-extraction: ${{ github.event_name == 'pull_request' }}
+
       # `lab` is `release` without the fat-LTO relink: the same code at a
-      # fraction of the build time.
+      # fraction of the build time. The image skips the Dockerfile's test
+      # stage: CI's Lint and test job already runs the workspace tests and
+      # clippy on every change.
       - name: Build
         run: |
           set -euo pipefail
@@ -45,6 +104,7 @@ jobs:
           docker buildx build \
             --platform linux/amd64 \
             --build-arg CELLD_PROFILE=lab \
+            --build-arg CELLD_BINARY_FROM=build \
             --build-arg "CELLD_COMMIT=$GITHUB_SHA" \
             --build-arg "CELLD_VERSION=$version" \
             --cache-from type=gha,scope=tck-image \
