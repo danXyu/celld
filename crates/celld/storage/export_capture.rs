@@ -31,9 +31,9 @@
 //! as an inline snapshot rather than rows, or as `bulk` when it is larger than
 //! `CELLD_EXPORT_MAX_TX_BYTES`. See "DDL and table generations" in the design.
 //!
-//! What this module does not do yet: the `kv` mapping of `_cf_KV` rows, which
-//! are exported as the raw table here. Schema records already describe the
-//! key-value tables in their exported shape ([`exported_schema`]).
+//! The key-value tables are reshaped on the way out ([`kv`]): `_cf_KV` is
+//! exported as `kv`, and `__kv` gains its blob references. Their rows,
+//! snapshots, `bulk` entries and `schema` records all use the exported shape.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -45,6 +45,8 @@ use celld_export_format::{
     ColumnDef, Op, RowChange, SchemaBody, TableGen, TableRows, Value, ROWID_KEY_COLUMN,
 };
 use rusqlite::{ffi, Connection};
+
+pub(crate) mod kv;
 
 /// The generation a table name starts at.
 pub(crate) const FIRST_GENERATION: u64 = 1;
@@ -517,6 +519,11 @@ impl Capture {
         denied: HashSet<String>,
         queue: DirtyList,
     ) -> anyhow::Result<Self> {
+        let mut denied = denied;
+        // The deny list names tables as they are exported.
+        if denied.contains(kv::KV_TABLE) {
+            denied.insert(kv::KV_SOURCE.to_string());
+        }
         let filter = Box::new(FilterState {
             scope: scope.to_string(),
             excluded: RefCell::new(HashSet::new()),
@@ -860,7 +867,28 @@ impl Capture {
             let mut taken = Vec::new();
             let mut budget = self.settings.max_tx_bytes;
             for table in &whole {
-                match self.snapshot_table(connection, table, &mut budget) {
+                let rows = self
+                    .snapshot_table(connection, table, &mut budget)
+                    .and_then(|rows| {
+                        let Some(rows) = rows else { return Ok(None) };
+                        let (generation, empty) = (rows.generation, rows.table == kv::KV_SOURCE);
+                        Ok(Some(
+                            match kv::reshape(rows, &self.filter.scope, crate::export_kv::decode)? {
+                                Some(rows) => rows,
+                                // Nothing of the cell's: the snapshot still covers
+                                // the table, empty.
+                                None if empty => TableRows {
+                                    table: kv::KV_TABLE.to_string(),
+                                    generation,
+                                    columns: vec!["key".to_string(), "value".to_string()],
+                                    key_columns: vec!["key".to_string()],
+                                    rows: Vec::new(),
+                                },
+                                None => unreachable!("only {} reshapes to nothing", kv::KV_SOURCE),
+                            },
+                        ))
+                    });
+                match rows {
                     Ok(Some(rows)) => taken.push(rows),
                     Ok(None) => bulk.push(self.table_gen(table)),
                     Err(error) => {
@@ -901,6 +929,10 @@ impl Capture {
             .map(|t| (t.table_gen(), true))
             .chain(tables.iter().map(|t| (t.table_gen(), false)))
             .chain(bulk.iter().map(|tg| (tg.clone(), false)))
+            .map(|(tg, always)| {
+                let table = self.storage_name(&tg.table).to_string();
+                (TableGen { table, ..tg }, always)
+            })
             .collect();
         for (tg, always) in carried {
             let present = schemas
@@ -918,6 +950,15 @@ impl Capture {
             });
         }
         let schemas = schemas.into_iter().map(exported_schema).collect();
+        let mut named = HashSet::new();
+        let bulk = bulk
+            .into_iter()
+            .map(|table| TableGen {
+                table: kv::exported_name(&table.table).to_string(),
+                ..table
+            })
+            .filter(|table| named.insert(table.clone()))
+            .collect();
         CapturedCommit {
             seq: self.seq,
             committed_at: now_ms,
@@ -925,6 +966,19 @@ impl Capture {
             bulk,
             schemas,
             snapshot,
+        }
+    }
+
+    /// The table in the cell that exported `table` came from: rows of
+    /// `_cf_KV` are exported as `kv`.
+    fn storage_name<'a>(&self, table: &'a str) -> &'a str {
+        if table == kv::KV_TABLE
+            && self.generations.contains_key(kv::KV_SOURCE)
+            && !self.generations.contains_key(kv::KV_TABLE)
+        {
+            kv::KV_SOURCE
+        } else {
+            table
         }
     }
 
@@ -1423,8 +1477,12 @@ impl Capture {
         let mut bulk = Vec::new();
         for table in order {
             let changes = by_table.remove(&table).unwrap_or_default();
-            match self.materialize_table(connection, &table, changes) {
-                Ok(rows) => tables.push(rows),
+            let rows = self
+                .materialize_table(connection, &table, changes)
+                .and_then(|rows| kv::reshape(rows, &self.filter.scope, crate::export_kv::decode));
+            match rows {
+                Ok(Some(rows)) => tables.push(rows),
+                Ok(None) => {}
                 Err(error) => {
                     tracing::debug!(
                         scope = %self.filter.scope, table, %error,
@@ -1725,14 +1783,15 @@ fn exported_schema(mut schema: SchemaBody) -> SchemaBody {
         generated: false,
     };
     match schema.table.as_str() {
-        "_cf_KV" => {
-            schema.table = "kv".to_string();
+        kv::KV_SOURCE => {
+            schema.table = kv::KV_TABLE.to_string();
             if !schema.columns.is_empty() {
                 schema.columns = vec![column("key", "TEXT", 1), column("value", "", 0)];
             }
         }
-        "__kv" if !schema.columns.is_empty() => {
-            schema.columns.push(column("blob_key", "TEXT", 0));
+        // Only a table with `blob_id` gains `blob_key`, as its rows do.
+        kv::NAMESPACE_TABLE if schema.columns.iter().any(|c| c.name == "blob_id") => {
+            schema.columns.push(column(kv::BLOB_KEY_COLUMN, "TEXT", 0));
         }
         _ => {}
     }

@@ -417,37 +417,269 @@ fn excluded_tables_are_not_captured() {
     );
 }
 
+const KV_SCHEMA: &str = "CREATE TABLE _cf_KV (scope TEXT, k TEXT, v TEXT, PRIMARY KEY (scope, k));";
+
+fn v8(expression: &str) -> Value {
+    Value::Blob(crate::export_kv::encode_for_test(expression))
+}
+
+fn put(f: &Fixture, scope: &str, key: &str, value: &Value) {
+    f.connection
+        .execute(
+            "INSERT INTO _cf_KV(scope, k, v) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(scope, k) DO UPDATE SET v = excluded.v",
+            rusqlite::params![scope, key, to_sql(value)],
+        )
+        .unwrap();
+}
+
+fn kv_row(op: Op, key: &str, value: Value) -> RowChange {
+    RowChange(op, vec![text(key)], vec![text(key), value])
+}
+
+/// Rows in key order; a changeset lists them in its own order.
+fn by_key(rows: &[RowChange]) -> Vec<RowChange> {
+    let mut rows = rows.to_vec();
+    rows.sort_by(|a, b| a.key().cmp(b.key()));
+    rows
+}
+
 #[test]
-fn the_kv_table_is_exported() {
-    let mut f =
-        Fixture::new("CREATE TABLE _cf_KV (scope TEXT, k TEXT, v BLOB, PRIMARY KEY (scope, k));");
-    f.run("INSERT INTO _cf_KV VALUES ('s', 'key', x'0f22');");
-    let kv = f.pull();
-    let kv = table(&kv, "_cf_KV");
-    assert_eq!(kv.key_columns, ["scope", "k"]);
+fn the_kv_table_is_exported_as_kv_with_decoded_values() {
+    let mut f = Fixture::new(KV_SCHEMA);
+    let mut stub = vec![0x01];
+    stub.extend(crate::export_kv::encode_for_test("({t: 'marker'})"));
+    put(
+        &f,
+        SCOPE,
+        "object",
+        &v8("({n: 1, tags: ['a'], at: new Date(0)})"),
+    );
+    put(&f, SCOPE, "string", &v8("'hello'"));
+    put(&f, SCOPE, "legacy", &text(r#"{ "old": [1, 2] }"#));
+    put(&f, SCOPE, "number", &int(7));
+    put(&f, SCOPE, "stub", &Value::Blob(stub));
+    put(&f, SCOPE, "garbage", &Value::Blob(vec![0xff, 0x0f, b'o']));
+    put(&f, SCOPE, "not json", &text("{oops"));
+    let commit = f.pull();
+    assert!(commit.bulk.is_empty());
+    assert!(commit.tables.iter().all(|t| t.table != "_cf_KV"));
+    let kv = table(&commit, "kv");
+    assert_eq!(kv.generation, FIRST_GENERATION);
+    assert_eq!(kv.columns, ["key", "value"]);
+    assert_eq!(kv.key_columns, ["key"]);
+    assert_eq!(
+        by_key(&kv.rows),
+        [
+            kv_row(Op::Insert, "garbage", Value::Blob(vec![0xff, 0x0f, b'o'])),
+            kv_row(Op::Insert, "legacy", text(r#"{"old":[1,2]}"#)),
+            kv_row(Op::Insert, "not json", Value::Blob(b"{oops".to_vec())),
+            kv_row(Op::Insert, "number", text("7")),
+            kv_row(
+                Op::Insert,
+                "object",
+                text(r#"{"n":1,"tags":["a"],"at":{"$date":"1970-01-01T00:00:00.000Z"}}"#)
+            ),
+            kv_row(Op::Insert, "string", text(r#""hello""#)),
+            kv_row(Op::Insert, "stub", text(r#"{"$stub":{"t":"marker"}}"#)),
+        ]
+    );
+}
+
+#[test]
+fn kv_updates_and_deletes_carry_whole_decoded_rows() {
+    let mut f = Fixture::new(KV_SCHEMA);
+    put(&f, SCOPE, "a", &v8("1"));
+    put(&f, SCOPE, "b", &v8("[2]"));
+    f.pull();
+    put(&f, SCOPE, "a", &v8("new Map([['x', 1n]])"));
+    f.run(&format!(
+        "DELETE FROM _cf_KV WHERE scope = '{SCOPE}' AND k = 'b'"
+    ));
+    let commit = f.pull();
+    assert_eq!(
+        by_key(&table(&commit, "kv").rows),
+        [
+            kv_row(Op::Update, "a", text(r#"{"$map":[["x",{"$bigint":"1"}]]}"#)),
+            // The pre-image, decoded.
+            kv_row(Op::Delete, "b", text("[2]")),
+        ]
+    );
+}
+
+/// A facet's `scope` is the run's and is rewritten on every open, so the
+/// exported key is `k` alone, and rows under any other scope are not the
+/// cell's.
+#[test]
+fn kv_rows_of_another_scope_are_not_exported() {
+    let mut f = Fixture::new(KV_SCHEMA);
+    put(&f, "previous-run", "k", &v8("1"));
+    assert_eq!(f.checkpoint(), Checkpoint::Clean);
+    put(&f, "previous-run", "k", &v8("2"));
+    put(&f, SCOPE, "k", &v8("3"));
+    let commit = f.pull();
+    assert_eq!(commit.tables.len(), 1);
+    assert_eq!(
+        table(&commit, "kv").rows,
+        [kv_row(Op::Insert, "k", text("3"))]
+    );
+}
+
+#[test]
+fn kv_in_bulk_is_named_kv() {
+    let mut f = Fixture::with_settings(
+        &format!("{KV_SCHEMA} CREATE TABLE plain (v INTEGER);"),
+        Settings { max_tx_bytes: 4096 },
+    );
+    f.run("BEGIN;");
+    for i in 0..200 {
+        put(&f, SCOPE, &format!("{i:0>40}"), &v8(&i.to_string()));
+        if i % 10 == 0 {
+            assert_eq!(f.checkpoint(), Checkpoint::Deferred);
+        }
+    }
+    f.run("COMMIT;");
+    let commit = f.pull();
+    assert!(commit.tables.is_empty());
+    let bulk: Vec<_> = commit.bulk.iter().map(|t| t.table.as_str()).collect();
+    assert_eq!(bulk, ["kv", "plain"]);
+}
+
+#[test]
+fn denying_kv_stops_capturing_the_kv_table() {
+    let connection = Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch(&format!("{KV_SCHEMA} CREATE TABLE plain (v INTEGER);"))
+        .unwrap();
+    let queue = DirtyList::default();
+    let mut capture = Capture::install(
+        &connection,
+        SCOPE,
+        settings(),
+        ["kv".to_string()].into(),
+        queue.clone(),
+    )
+    .unwrap();
+    connection
+        .execute_batch(&format!(
+            "INSERT INTO _cf_KV VALUES ('{SCOPE}', 'k', 'true'); INSERT INTO plain VALUES (1);"
+        ))
+        .unwrap();
+    let Checkpoint::Pulled(commit) = capture.checkpoint(&connection, 0) else {
+        panic!("expected a commit");
+    };
+    let tables: Vec<_> = commit.tables.iter().map(|t| t.table.as_str()).collect();
+    assert_eq!(tables, ["plain"]);
+}
+
+const NAMESPACE_SCHEMA: &str = "CREATE TABLE __kv (
+    name TEXT PRIMARY KEY, value BLOB, blob_id TEXT, size INTEGER NOT NULL,
+    tag TEXT NOT NULL, metadata TEXT, expires_at INTEGER) WITHOUT ROWID;";
+
+#[test]
+fn kv_namespace_rows_carry_their_blob_key() {
+    let digest = "ab".repeat(32);
+    let mut f = Fixture::new(NAMESPACE_SCHEMA);
+    f.run(&format!(
+        "INSERT INTO __kv VALUES ('small', x'6869', NULL, 2, 'text', '{{\"m\":1}}', 99);
+         INSERT INTO __kv VALUES ('large', NULL, 'v2:e3:{digest}', 2000000, 'bytes', NULL, NULL);
+         INSERT INTO __kv VALUES ('legacy', NULL, '{digest}', 5, 'bytes', NULL, NULL);"
+    ));
+    let commit = f.pull();
+    let kv = table(&commit, "__kv");
+    assert_eq!(
+        kv.columns,
+        [
+            "name",
+            "value",
+            "blob_id",
+            "size",
+            "tag",
+            "metadata",
+            "expires_at",
+            "blob_key"
+        ]
+    );
+    assert_eq!(kv.key_columns, ["name"]);
+    let rows: Vec<_> = by_key(&kv.rows).iter().map(|r| r.row().to_vec()).collect();
+    assert_eq!(
+        rows,
+        [
+            vec![
+                text("large"),
+                Value::Null,
+                text(&format!("v2:e3:{digest}")),
+                int(2000000),
+                text("bytes"),
+                Value::Null,
+                Value::Null,
+                text(&format!("kv/blobs-v2/{SCOPE}/e3/{digest}")),
+            ],
+            vec![
+                text("legacy"),
+                Value::Null,
+                text(&digest),
+                int(5),
+                text("bytes"),
+                Value::Null,
+                Value::Null,
+                text(&format!("kv/blobs/{SCOPE}/{digest}")),
+            ],
+            vec![
+                text("small"),
+                Value::Blob(b"hi".to_vec()),
+                Value::Null,
+                int(2),
+                text("text"),
+                text(r#"{"m":1}"#),
+                int(99),
+                Value::Null,
+            ],
+        ]
+    );
+}
+
+/// The reference consumer applies `kv` records like any table's and ends up
+/// with one row per live key.
+#[test]
+fn the_consumer_holds_the_decoded_kv_state() {
+    let mut f = Fixture::new(KV_SCHEMA);
+    let mut consumer = Consumer::new();
+    put(&f, SCOPE, "a", &v8("({v: 1})"));
+    put(&f, SCOPE, "b", &v8("'two'"));
+    ingest(&mut consumer, &f.pull());
+    put(&f, SCOPE, "a", &v8("({v: 2})"));
+    f.run(&format!(
+        "DELETE FROM _cf_KV WHERE scope = '{SCOPE}' AND k = 'b'"
+    ));
+    put(&f, SCOPE, "c", &text("null"));
+    ingest(&mut consumer, &f.pull());
+    let state = consumer.stream(&stream()).unwrap();
+    let kv = state.table("kv").unwrap();
+    assert_eq!(kv.columns, ["key", "value"]);
     assert_eq!(
         kv.rows,
-        [RowChange(
-            Op::Insert,
-            vec![text("s"), text("key")],
-            vec![text("s"), text("key"), Value::Blob(vec![0x0f, 0x22])]
-        )]
+        [
+            (vec![text("a")], vec![text("a"), text(r#"{"v":2}"#)]),
+            (vec![text("c")], vec![text("c"), text("null")]),
+        ]
+        .into_iter()
+        .collect()
     );
 }
 
 /// The key-value tables are described in the shape they are exported in:
-/// `_cf_KV` as `kv (key, value)`, and `__kv` with its `blob_key`.
+/// `_cf_KV` as `kv (key, value)`, and `__kv` with its `blob_key` when its
+/// rows carry one.
 #[test]
 fn key_value_tables_are_described_as_exported() {
-    let mut f = Fixture::new(
-        "CREATE TABLE _cf_KV (scope TEXT, k TEXT, v BLOB, PRIMARY KEY (scope, k));
-         CREATE TABLE __kv (key TEXT PRIMARY KEY, value BLOB, metadata TEXT, expiration INTEGER);",
-    );
-    f.run(
-        "INSERT INTO _cf_KV VALUES ('s', 'key', x'0f22');
-         INSERT INTO __kv VALUES ('a', x'00', NULL, NULL);",
-    );
+    let mut f = Fixture::new(&format!("{KV_SCHEMA} {NAMESPACE_SCHEMA}"));
+    put(&f, SCOPE, "key", &v8("1"));
+    f.run("INSERT INTO __kv VALUES ('a', x'00', NULL, 1, 'bytes', NULL, NULL);");
     let commit = f.pull();
+    // One description of `kv`, under its exported name.
+    let names: Vec<_> = commit.schemas.iter().map(|s| s.table.as_str()).collect();
+    assert_eq!(names, ["kv", "__kv"]);
     let kv = schema(&commit, "kv");
     assert_eq!(kv.generation, 1);
     let columns: Vec<_> = kv
@@ -463,13 +695,26 @@ fn key_value_tables_are_described_as_exported() {
         .collect();
     assert_eq!(
         namespace,
-        ["key", "value", "metadata", "expiration", "blob_key"]
+        [
+            "name",
+            "value",
+            "blob_id",
+            "size",
+            "tag",
+            "metadata",
+            "expires_at",
+            "blob_key"
+        ]
     );
-    // deleteAll drops and recreates `_cf_KV`: the drop names `kv` too.
-    f.run(
-        "DROP TABLE _cf_KV;
-         CREATE TABLE _cf_KV (scope TEXT, k TEXT, v BLOB, PRIMARY KEY (scope, k));",
-    );
+    assert_eq!(table(&commit, "__kv").columns, namespace);
+
+    // deleteAll drops and recreates `_cf_KV`: the new generation is
+    // snapshotted as `kv`, holding only the cell's rows.
+    f.run(&format!(
+        "DROP TABLE _cf_KV; {KV_SCHEMA}
+         INSERT INTO _cf_KV VALUES ('another', 'x', 'true');"
+    ));
+    put(&f, SCOPE, "after", &v8("2"));
     let commit = f.pull();
     let kv: Vec<_> = commit
         .schemas
@@ -477,6 +722,48 @@ fn key_value_tables_are_described_as_exported() {
         .map(|s| (s.table.as_str(), s.generation))
         .collect();
     assert_eq!(kv, [("kv", 2)]);
+    let snapshot = snapshotted(&commit, "kv");
+    assert_eq!(snapshot.generation, 2);
+    assert_eq!(snapshot.columns, ["key", "value"]);
+    assert_eq!(snapshot.rows, [kv_row(Op::Insert, "after", text("2"))]);
+    assert!(
+        commit.tables.is_empty() && commit.bulk.is_empty(),
+        "{commit:?}"
+    );
+
+    // Recreated with none of the cell's rows, the snapshot still covers it.
+    f.run(&format!(
+        "DROP TABLE _cf_KV; {KV_SCHEMA}
+         INSERT INTO _cf_KV VALUES ('another', 'x', 'true');"
+    ));
+    let commit = f.pull();
+    let snapshot = snapshotted(&commit, "kv");
+    assert_eq!((snapshot.generation, snapshot.rows.len()), (3, 0));
+    let covered: Vec<_> = commit
+        .snapshot
+        .iter()
+        .flat_map(|s| &s.tables)
+        .map(|t| t.table.as_str())
+        .collect();
+    assert_eq!(covered, ["kv"]);
+}
+
+/// A namespace table from the first release, without `blob_id`, is exported
+/// with its own columns only, and described so.
+#[test]
+fn a_namespace_table_without_blob_ids_gains_no_blob_key() {
+    let mut f = Fixture::new(
+        "CREATE TABLE __kv (key TEXT PRIMARY KEY, value BLOB, metadata TEXT, expiration INTEGER);",
+    );
+    f.run("INSERT INTO __kv VALUES ('a', x'00', NULL, NULL);");
+    let commit = f.pull();
+    let described: Vec<_> = schema(&commit, "__kv")
+        .columns
+        .iter()
+        .map(|c| c.name.clone())
+        .collect();
+    assert_eq!(described, ["key", "value", "metadata", "expiration"]);
+    assert_eq!(table(&commit, "__kv").columns, described);
 }
 
 #[test]
@@ -1511,12 +1798,20 @@ mod on_the_cell_connection {
 
         // Writes under the user-SQL authorizer to a generated-column table.
         exec("INSERT INTO t(id, v) VALUES (1, 'a')");
-        storage::put_many_serialized(CELL, &[("k".into(), vec![1, 2])]).unwrap();
+        let value = crate::export_kv::encode_for_test("({n: 1})");
+        storage::put_many_serialized(CELL, &[("k".into(), value)]).unwrap();
         storage::export_checkpoint();
         let commits = take();
         assert_eq!(commits.len(), 1);
-        let kv = table(&commits[0], "_cf_KV");
-        assert_eq!(kv.rows[0].key()[1], text("k"));
+        let kv = table(&commits[0], "kv");
+        assert_eq!(
+            kv.rows,
+            [RowChange(
+                Op::Insert,
+                vec![text("k")],
+                vec![text("k"), text(r#"{"n":1}"#)]
+            )]
+        );
         assert_eq!(
             commits[0].bulk,
             [TableGen {
