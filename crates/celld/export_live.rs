@@ -931,8 +931,7 @@ struct Stream {
     /// before a commit released ahead of it (or before an advance).
     last_txid: u64,
     /// The newest position this stream has submitted or advanced to.
-    last_position: Position,
-    /// No ticket this stream asks for later is below this.
+    delivered: Position,
     next_ticket: u64,
     /// The ticket in flight and the position it asked for.
     outstanding: Option<(u64, u64)>,
@@ -948,7 +947,7 @@ struct Stream {
     counted_commits: u64,
     /// The newest committed-write position a commit carried, which a
     /// ticket for a facet delete asks for.
-    last_write: u64,
+    last_position: u64,
     sequencer: Sequencer<Option<CapturedCommit>>,
 }
 
@@ -1021,9 +1020,9 @@ impl<T> Sequencer<T> {
         self.deletes.len()
     }
 
-    /// Released entries wait behind a facet delete.
-    fn holding(&self) -> bool {
-        !self.held.is_empty()
+    /// Nothing is held back: every released commit has gone out.
+    fn idle(&self) -> bool {
+        self.held.is_empty() && self.deletes.is_empty()
     }
 
     /// Take what may go out now. `drained` says the attribution holds no
@@ -1086,7 +1085,7 @@ impl Stream {
             attribution: Attribution::new(),
             next_commit: 1,
             last_txid: 0,
-            last_position: Position::new(epoch, 0, 0),
+            delivered: Position::new(epoch, 0, 0),
             next_ticket: 1,
             outstanding: None,
             wanted: None,
@@ -1096,7 +1095,7 @@ impl Stream {
             this,
             counted_bytes: 0,
             counted_commits: 0,
-            last_write: 0,
+            last_position: 0,
             sequencer: Sequencer::default(),
         }
     }
@@ -1173,7 +1172,7 @@ impl Stream {
                     counters.bulk_commits.fetch_add(1, Ordering::Relaxed);
                 }
                 self.sequencer.commit();
-                self.last_write = self.last_write.max(position);
+                self.last_position = self.last_position.max(position);
                 match stamp {
                     WalStamp::At {
                         salt1,
@@ -1195,7 +1194,7 @@ impl Stream {
                 // A shed commit still takes its place in the stream, as a
                 // gap that counts it.
                 self.sequencer.commit();
-                self.last_write = self.last_write.max(position);
+                self.last_position = self.last_position.max(position);
                 match stamp {
                     WalStamp::At {
                         salt1,
@@ -1218,10 +1217,8 @@ impl Stream {
                     },
                 position,
             }) => {
-                // Attributed and released like any commit, so it counts
-                // toward the commits a facet delete follows.
                 self.sequencer.commit();
-                self.last_write = self.last_write.max(position);
+                self.last_position = self.last_position.max(position);
                 self.attribution.commit(
                     WalPoint {
                         generation: WalGeneration { salt1, salt2 },
@@ -1241,7 +1238,7 @@ impl Stream {
                 // The delete needs a ticket of its own, asked after it.
                 self.wanted = Some(
                     self.wanted
-                        .map_or(self.last_write, |wanted| wanted.max(self.last_write)),
+                        .map_or(self.last_position, |wanted| wanted.max(self.last_position)),
                 );
             }
             Some(Input::Captured(capture)) => self.attribution.captured(&capture),
@@ -1286,9 +1283,9 @@ impl Stream {
             .sequencer
             .take(released, self.attribution.pending_len() == 0);
         self.release(out);
-        // Commits the sequencer holds behind a facet delete are below the
-        // released position; advancing past them would sort them behind it.
-        if !self.sequencer.holding() {
+        // Commits held behind a facet delete are submitted later, so the
+        // delivered position may not pass them yet.
+        if self.sequencer.idle() {
             self.advance();
         }
         self.account(
@@ -1372,10 +1369,10 @@ impl Stream {
     fn advance(&mut self) {
         let released = self.attribution.released_position();
         let position = Position::new(self.key.1, released, self.next_commit - 1);
-        if position <= self.last_position {
+        if position <= self.delivered {
             return;
         }
-        self.last_position = position;
+        self.delivered = position;
         self.last_txid = self.last_txid.max(released);
         self.exporter.advance(Submitted {
             key: self.key.clone(),
@@ -1392,7 +1389,7 @@ impl Stream {
     /// Submit the residency's `link`, ahead of every commit.
     fn submit_link(&mut self, link: ActivationLink) {
         let position = link_position(self.key.1, &link);
-        self.last_position = self.last_position.max(position);
+        self.delivered = self.delivered.max(position);
         let envelope = self.exporter.envelope(
             &self.identity,
             &self.cell_name,
@@ -1598,7 +1595,7 @@ impl Stream {
             }
             let last = records.len().saturating_sub(1);
             if let Some(record) = records.last() {
-                self.last_position = self.last_position.max(record.envelope.position);
+                self.delivered = self.delivered.max(record.envelope.position);
             }
             for (index, record) in records.into_iter().enumerate() {
                 let meta = Submitted {

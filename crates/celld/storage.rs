@@ -483,15 +483,15 @@ pub fn schema(c: &Connection) -> anyhow::Result<()> {
             [],
         )?;
     }
-    // Change export's stream incarnation: the epoch a root cell's stream
-    // began in (`export_live`), or a facet's ordered incarnation stamped on
-    // its first open (`crate::facet_streams`). Kept beside the actor name
-    // because `deleteAll` keeps this table.
     let metadata_columns = {
         let mut statement = c.prepare("PRAGMA table_info(_cf_METADATA)")?;
         let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
         columns.collect::<rusqlite::Result<Vec<_>>>()?
     };
+    // Change export's stream incarnation, kept beside the actor name
+    // because `deleteAll` keeps this table: a root cell's first exported
+    // epoch (`export_live`), or the one `crate::facet_streams` hands a facet
+    // on its first open.
     if !metadata_columns
         .iter()
         .any(|column| column == "incarnation")
@@ -4492,7 +4492,8 @@ fn set_actor_name_inner(scope: &str, name: &str) -> anyhow::Result<()> {
         // incarnation in it at open.
         let named = connection.execute(
             "INSERT INTO _cf_METADATA(scope, actor_name) VALUES(?1, ?2) \
-             ON CONFLICT(scope) DO UPDATE SET actor_name=?2 WHERE actor_name IS NULL",
+             ON CONFLICT(scope) DO UPDATE SET actor_name=excluded.actor_name \
+             WHERE actor_name IS NULL",
             rusqlite::params![scope, name],
         )?;
         let stored: Option<String> = connection
@@ -4524,7 +4525,7 @@ fn set_actor_name_inner(scope: &str, name: &str) -> anyhow::Result<()> {
 
 pub fn get_actor_name(scope: &str) -> anyhow::Result<Option<String>> {
     with(scope, |connection| {
-        // A facet's row can hold only its incarnation.
+        // A row can hold only the export incarnation.
         connection
             .query_row(
                 "SELECT actor_name FROM _cf_METADATA WHERE scope=?1",

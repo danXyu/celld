@@ -13,8 +13,7 @@ watermarks that certify what the bucket holds. Every activation of a cell
 starts its stream with a `link` record naming the state it restored, so a
 consumer sees a gap across a restart or a move between nodes. Each facet
 exports on a stream of its own, and deleting a facet puts a `deleted`
-record for it and every facet below it on its root's stream. Repair is not
-built yet.
+record for it and every facet below it on its root's stream.
 
 The blob-stream sink sends each record to a
 [blob-stream](https://github.com/bitdriftlabs/blob-stream) topic instead. Its
