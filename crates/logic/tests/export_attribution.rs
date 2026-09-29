@@ -703,3 +703,38 @@ fn an_unplaced_commit_becomes_a_gap_bounded_by_the_latest_capture() {
     assert_eq!(state.unmatched_total(), 1);
     assert_eq!(state.pending_bytes(), 0);
 }
+
+#[test]
+fn a_commit_shed_before_it_arrived_is_a_gap_in_its_place() {
+    let mut state = Attribution::new();
+    state.commit(at(1, 1), 10, 1u32);
+    state.dropped(at(1, 2));
+    state.dropped(at(1, 3));
+    state.commit(at(1, 5), 10, 4);
+    // Nothing is labelled yet, so nothing is released even with a proof.
+    state.proven(10);
+    assert_eq!(state.take_released(), vec![]);
+    state.captured(&partial(1, 1, 0, 2));
+    state.captured(&partial(2, 1, 2, 5));
+    assert_eq!(
+        state.take_released(),
+        vec![
+            Released::Commit {
+                label: 1,
+                payload: 1
+            },
+            // The later shed commit's label bounds the merged gap.
+            Released::Gap {
+                after: 0,
+                through: 2,
+                unmatched: 0,
+                overflowed: 2
+            },
+            Released::Commit {
+                label: 2,
+                payload: 4
+            },
+        ]
+    );
+    assert_eq!(state.pending_len(), 0);
+}
