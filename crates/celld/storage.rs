@@ -923,12 +923,10 @@ fn finish_open(
             return (None, None);
         };
         let export_stream = match crate::export_live::installed() {
-            Some(exporter) => {
-                match exporter.attach(scope, epoch, &cells.export_script.borrow()) {
-                    Some(stream) => Some(stream),
-                    None => return (None, None),
-                }
-            }
+            Some(exporter) => match exporter.attach(scope, epoch, &cells.export_script.borrow()) {
+                Some(stream) => Some(stream),
+                None => return (None, None),
+            },
             None => None,
         };
         let denied = export_stream

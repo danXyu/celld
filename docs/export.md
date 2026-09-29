@@ -5,9 +5,14 @@ cells as a stream of records, for a warehouse such as Snowflake to load.
 The [design](design/change-export.md) describes the record format, the
 capture, and the delivery guarantees.
 
-The feature is under construction. This page lists its settings, which
-celld already checks. A node with `CELLD_EXPORT=1` currently validates the
-configuration and exports nothing yet.
+The feature is under construction. A node with `CELLD_EXPORT=1` exports
+the row changes of its root cells through the bucket sink: Parquet objects
+under `export/changes/<node>/` in the bucket, released only after the
+change is durable and the node still owns the cell, and followed by
+watermarks that certify what the bucket holds. Facets, schema records,
+activation links, the `kv` mapping of `_cf_KV`, repair and the blob-stream
+sink are not built yet. A node with `CELLD_EXPORT_SINK=blob-stream` refuses
+to start.
 
 Export is off by default, and the off state costs nothing: with
 `CELLD_EXPORT` unset or `0`, celld opens no capture session, holds no

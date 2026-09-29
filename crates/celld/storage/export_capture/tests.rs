@@ -28,7 +28,14 @@ impl Fixture {
         let connection = Connection::open_in_memory().unwrap();
         connection.execute_batch(schema).unwrap();
         let queue = DirtyList::default();
-        let capture = Capture::install(&connection, SCOPE, settings, Default::default(), queue.clone()).unwrap();
+        let capture = Capture::install(
+            &connection,
+            SCOPE,
+            settings,
+            Default::default(),
+            queue.clone(),
+        )
+        .unwrap();
         Self {
             connection,
             capture,

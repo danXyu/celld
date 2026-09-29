@@ -417,7 +417,9 @@ impl Capture {
             ffi::sqlite3_wal_hook(
                 capture.database,
                 Some(wal_hook),
-                (&*capture.wal as *const WalState).cast_mut().cast::<c_void>(),
+                (&*capture.wal as *const WalState)
+                    .cast_mut()
+                    .cast::<c_void>(),
             );
         }
         Ok(capture)

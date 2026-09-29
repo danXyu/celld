@@ -53,12 +53,10 @@ use crate::export_sink::{
 };
 use crate::storage::export_capture::{CapturedCommit, WalStamp};
 use celld_export_format::{
-    split, Body, BulkBody, Envelope, GapBody, Origin, Position, Record, RowsBody, Split,
-    StreamId, TableGen, WatermarkBody,
+    split, Body, BulkBody, Envelope, GapBody, Origin, Position, Record, RowsBody, Split, StreamId,
+    TableGen, WatermarkBody,
 };
-use celld_logic::export::{
-    Attribution, Capture, CapturedWal, Released, WalGeneration, WalPoint,
-};
+use celld_logic::export::{Attribution, Capture, CapturedWal, Released, WalGeneration, WalPoint};
 use celld_logic::RequestError;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -92,7 +90,9 @@ pub struct TicketAsk {
 enum Input {
     /// The script of the cell's deployment, sent when the cell's
     /// connection attaches.
-    Identity { script: String },
+    Identity {
+        script: String,
+    },
     /// A pulled commit and the committed-write position after it.
     Commit {
         stamp: WalStamp,
@@ -247,7 +247,10 @@ impl Exporter {
         let key = (cell.to_string(), epoch);
         let tx = {
             let mut streams = self.streams.lock().unwrap_or_else(|e| e.into_inner());
-            match streams.get(&key).and_then(mpsc::WeakUnboundedSender::upgrade) {
+            match streams
+                .get(&key)
+                .and_then(mpsc::WeakUnboundedSender::upgrade)
+            {
                 Some(tx) => tx,
                 None => {
                     let (tx, rx) = mpsc::unbounded_channel();
@@ -423,7 +426,9 @@ impl Stream {
         this: mpsc::WeakUnboundedSender<Input>,
     ) -> Self {
         let (cell, _) = &key;
-        let class = cell.split_once(':').map_or(cell.as_str(), |(class, _)| class);
+        let class = cell
+            .split_once(':')
+            .map_or(cell.as_str(), |(class, _)| class);
         let identity = StreamId {
             script: String::new(),
             class: class.to_string(),
@@ -453,9 +458,10 @@ impl Stream {
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<Input>) {
         loop {
             let input = match self.retry_at {
-                Some(at) => tokio::select! {
-                    input = rx.recv() => input,
-                    () = crate::asyncrt::sleep_until(at) => {
+                // `recv` is cancel-safe, so the deadline loses nothing.
+                Some(at) => match crate::asyncrt::timeout_at(at, rx.recv()).await {
+                    Ok(input) => input,
+                    Err(crate::asyncrt::Elapsed) => {
                         self.retry_at = None;
                         self.step(None);
                         continue;
@@ -608,9 +614,10 @@ impl Stream {
         counters
             .pending_bytes
             .fetch_add(bytes.wrapping_sub(self.counted_bytes), Ordering::Relaxed);
-        counters
-            .pending_commits
-            .fetch_add(commits.wrapping_sub(self.counted_commits), Ordering::Relaxed);
+        counters.pending_commits.fetch_add(
+            commits.wrapping_sub(self.counted_commits),
+            Ordering::Relaxed,
+        );
         self.counted_bytes = bytes;
         self.counted_commits = commits;
     }
@@ -751,9 +758,7 @@ async fn deliver(exporter: Arc<Exporter>, mut outcomes: mpsc::UnboundedReceiver<
                     exporter.counters.gaps.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(cell = %meta.key.0, epoch = meta.key.1, %reason, "export: sink dropped a record; the delivered position freezes");
                     state.frozen = true;
-                    let from = state
-                        .position
-                        .unwrap_or(Position::new(meta.key.1, 0, 0));
+                    let from = state.position.unwrap_or(Position::new(meta.key.1, 0, 0));
                     let record = Record {
                         envelope: exporter.envelope(
                             &meta.stream,
