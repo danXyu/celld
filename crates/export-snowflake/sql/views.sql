@@ -322,15 +322,16 @@ LEFT JOIN bulk b
 -- held in its range. `certify` in consumer.rs.
 CREATE OR REPLACE VIEW CELL_CERTIFIED AS
 WITH RECURSIVE sent AS (
-    -- What the node's sink sent: every whole record but repair output and
-    -- watermarks.
+    -- What the node's sink sent: every whole record but repair output,
+    -- watermarks, and the `recovered` records another node emits for the
+    -- stream.
     SELECT script, class, cell, facet, incarnation, position_key
     FROM CELL_CHANGES_CURRENT
     WHERE origin <> 'repair' AND fragment = 1
     UNION ALL
     SELECT script, class, cell, facet, incarnation, position_key
     FROM CELL_META_CURRENT
-    WHERE origin <> 'repair' AND kind <> 'watermark'
+    WHERE origin <> 'repair' AND kind NOT IN ('watermark', 'recovered')
 ),
 marks AS (
     SELECT
