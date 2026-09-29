@@ -191,86 +191,109 @@ fn expired_reads_only_its_own_layout() {
     assert!(!expired("p", "p", cutoff));
 }
 
+/// The dev store does its I/O through `asyncrt::blocking`, whose process
+/// domain binds to the first runtime that touches it. A per-test runtime
+/// would leave later tests on a dropped one, so every dev-store test runs
+/// on this process-lifetime runtime.
+fn run(future: impl std::future::Future<Output = ()>) {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    let runtime = RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+    });
+    crate::asyncrt::set_host_handle(runtime.handle().clone());
+    runtime.block_on(future);
+}
+
 fn dev_bucket() -> (tempfile::TempDir, Bucket) {
     let dir = tempfile::tempdir().unwrap();
     let bucket = Bucket::open_dev(&dir.path().join("bucket.sqlite")).unwrap();
     (dir, bucket)
 }
 
-#[tokio::test]
-async fn put_returns_the_key_it_wrote() {
-    let (_dir, bucket) = dev_bucket();
-    let bytes = encode_rows(&[("a", 1, None, None)]);
-    let key = put(
-        &bucket,
-        "export/changes",
-        "node-1",
-        NOW_US,
-        bytes.clone(),
-        &[("celld-schema", "v1")],
-    )
-    .await
-    .unwrap();
-    assert!(
-        key.starts_with("export/changes/node-1/2026/09/29/12/"),
-        "{key}"
-    );
-    let (stored, _) = bucket.get(&key).await.unwrap().expect("object written");
-    assert_eq!(stored.as_ref(), bytes.as_slice());
-    let (_, schema) = bucket
-        .head_with_meta(&key, "celld-schema")
+#[test]
+fn put_returns_the_key_it_wrote() {
+    run(async {
+        let (_dir, bucket) = dev_bucket();
+        let bytes = encode_rows(&[("a", 1, None, None)]);
+        let key = put(
+            &bucket,
+            "export/changes",
+            "node-1",
+            NOW_US,
+            bytes.clone(),
+            &[("celld-schema", "v1")],
+        )
         .await
-        .unwrap()
         .unwrap();
-    assert_eq!(schema.as_deref(), Some("v1"));
-}
-
-#[tokio::test]
-async fn sweep_once_deletes_only_expired_keys_under_its_prefixes() {
-    let (_dir, bucket) = dev_bucket();
-    let day = 86_400 * 1_000_000;
-    let old = NOW_US - 40 * day;
-    let mut keep = Vec::new();
-    for prefix in ["a/one", "a/two", "b"] {
-        put(&bucket, prefix, "n", old, vec![1], &[]).await.unwrap();
-        keep.push(
-            put(&bucket, prefix, "n", NOW_US, vec![2], &[])
-                .await
-                .unwrap(),
+        assert!(
+            key.starts_with("export/changes/node-1/2026/09/29/12/"),
+            "{key}"
         );
-    }
-    let undated = "a/one/n/not-a-date.parquet".to_string();
-    bucket.put(&undated, vec![3]).await.unwrap();
-    keep.push(undated);
-    let b_old = bucket.list("b").await.unwrap();
-    assert_eq!(b_old.len(), 2);
-
-    let deleted = sweep_once(&bucket, &["a/one", "a/two"], cutoff_date(NOW_US, 30)).await;
-    assert_eq!(deleted, 2);
-
-    let mut left: Vec<String> = Vec::new();
-    for prefix in ["a", "b"] {
-        for object in bucket.list(prefix).await.unwrap() {
-            left.push(object.location.to_string());
-        }
-    }
-    left.sort();
-    // The unswept prefix keeps its expired object.
-    let mut expected: Vec<String> = keep;
-    expected.extend(
-        b_old
-            .into_iter()
-            .map(|object| object.location.to_string())
-            .filter(|key| key.contains("/2026/08/")),
-    );
-    expected.sort();
-    assert_eq!(left, expected);
+        let (stored, _) = bucket.get(&key).await.unwrap().expect("object written");
+        assert_eq!(stored.as_ref(), bytes.as_slice());
+        let (_, schema) = bucket
+            .head_with_meta(&key, "celld-schema")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(schema.as_deref(), Some("v1"));
+    });
 }
 
-#[tokio::test]
-async fn sweep_once_with_no_prefixes_deletes_nothing() {
-    let (_dir, bucket) = dev_bucket();
-    put(&bucket, "a", "n", 0, vec![1], &[]).await.unwrap();
-    assert_eq!(sweep_once(&bucket, &[], cutoff_date(NOW_US, 0)).await, 0);
-    assert_eq!(bucket.list("a").await.unwrap().len(), 1);
+#[test]
+fn sweep_once_deletes_only_expired_keys_under_its_prefixes() {
+    run(async {
+        let (_dir, bucket) = dev_bucket();
+        let day = 86_400 * 1_000_000;
+        let old = NOW_US - 40 * day;
+        let mut keep = Vec::new();
+        for prefix in ["a/one", "a/two", "b"] {
+            put(&bucket, prefix, "n", old, vec![1], &[]).await.unwrap();
+            keep.push(
+                put(&bucket, prefix, "n", NOW_US, vec![2], &[])
+                    .await
+                    .unwrap(),
+            );
+        }
+        let undated = "a/one/n/not-a-date.parquet".to_string();
+        bucket.put(&undated, vec![3]).await.unwrap();
+        keep.push(undated);
+        let b_old = bucket.list("b").await.unwrap();
+        assert_eq!(b_old.len(), 2);
+
+        let deleted = sweep_once(&bucket, &["a/one", "a/two"], cutoff_date(NOW_US, 30)).await;
+        assert_eq!(deleted, 2);
+
+        let mut left: Vec<String> = Vec::new();
+        for prefix in ["a", "b"] {
+            for object in bucket.list(prefix).await.unwrap() {
+                left.push(object.location.to_string());
+            }
+        }
+        left.sort();
+        // The unswept prefix keeps its expired object.
+        let mut expected: Vec<String> = keep;
+        expected.extend(
+            b_old
+                .into_iter()
+                .map(|object| object.location.to_string())
+                .filter(|key| key.contains("/2026/08/")),
+        );
+        expected.sort();
+        assert_eq!(left, expected);
+    });
+}
+
+#[test]
+fn sweep_once_with_no_prefixes_deletes_nothing() {
+    run(async {
+        let (_dir, bucket) = dev_bucket();
+        put(&bucket, "a", "n", 0, vec![1], &[]).await.unwrap();
+        assert_eq!(sweep_once(&bucket, &[], cutoff_date(NOW_US, 0)).await, 0);
+        assert_eq!(bucket.list("a").await.unwrap().len(), 1);
+    });
 }
