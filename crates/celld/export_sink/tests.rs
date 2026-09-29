@@ -159,7 +159,7 @@ fn every_kind() -> Vec<Record> {
             facet: Some("child".into()),
             incarnation: Some(u64::MAX),
             subtree: true,
-            through_incarnation: None,
+            through_incarnation: Some(u64::MAX - 1),
         }),
         Body::Watermark(WatermarkBody {
             from: None,
@@ -680,7 +680,30 @@ fn retention_defaults_to_none() {
     assert_eq!(config.retention, Retention::None);
     assert_eq!(config.flush, Duration::from_secs(10));
     assert_eq!(config.flush_bytes, 8 * 1024 * 1024);
-    assert_eq!(Retention::Days(30).label(), "30d");
+    assert_eq!(retention_label(Retention::Days(30)), "30d");
+}
+
+#[test]
+fn settings_come_from_the_export_configuration() {
+    let env = [
+        ("CELLD_EXPORT", "1"),
+        ("CELLD_EXPORT_FLUSH_MS", "250"),
+        ("CELLD_EXPORT_FLUSH_BYTES", "4096"),
+        ("CELLD_EXPORT_RETENTION", "7d"),
+    ];
+    let config = crate::export::Config::from_lookup(|name| {
+        Ok(env
+            .iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| value.to_string()))
+    })
+    .unwrap()
+    .expect("export on");
+    let sink = BucketSinkConfig::from_export(&config);
+    assert_eq!(sink.flush, Duration::from_millis(250));
+    assert_eq!(sink.flush_bytes, 4096);
+    assert_eq!(sink.retention, Retention::Days(7));
+    assert_eq!(sink.put_attempts, BucketSinkConfig::default().put_attempts);
 }
 
 #[test]
