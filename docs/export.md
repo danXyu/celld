@@ -10,8 +10,7 @@ the row changes of its root cells through the bucket sink: Parquet objects
 under `export/changes/<node>/` in the bucket, released only after the
 change is durable and the node still owns the cell, and followed by
 watermarks that certify what the bucket holds. Facets, schema records,
-activation links, the `kv` mapping of `_cf_KV` and repair are not built
-yet.
+activation links and repair are not built yet.
 
 The blob-stream sink sends each record to a
 [blob-stream](https://github.com/bitdriftlabs/blob-stream) topic instead. Its
@@ -65,6 +64,28 @@ bucket uses the fleet bucket's endpoint and credentials.
 Queue brokers (`__Queue`), Workflow instances (`__Workflow` and every
 `__Workflow.<script>` class), and cron cells (`.cron`) are never exported.
 celld refuses to start when `CELLD_EXPORT_CLASSES` names one of them.
+
+## Key-value tables
+
+The Durable Object key-value API (`ctx.storage.get`, `put`, `kv`) keeps its
+values in `_cf_KV`. The export carries that table as `kv`, with columns
+`key` and `value` and the key alone as its primary key. `value` is JSON
+text: V8's own deserializer reads the stored bytes, and the types JSON
+lacks come out as one-key objects, for example `{"$bigint": "12"}`,
+`{"$date": "2026-01-01T00:00:00.000Z"}`, `{"$map": [[key, value]]}`,
+`{"$undefined": true}` or `{"$bytes": {"base64": …, "type": "Uint8Array"}}`.
+A stored object with a key that starts with `$` comes out wrapped as
+`{"$object": {…}}`, so every such key in the JSON is one of these tags. The
+full list is in `crates/celld/export_kv.rs`. A value that does not decode,
+such as one that refers to itself, one stored in more than 2 MiB, or one
+whose JSON would grow far past its stored size (a large sparse array), is
+exported as its stored bytes, a `{"$blob": …}` in the record.
+`CELLD_EXPORT_TABLES` names the table as `Class.kv`.
+
+A KV namespace's `__kv` table keeps its columns and gains `blob_key`: the
+bucket object that holds a value too large to store inline, such as
+`kv/blobs-v2/<cell>/e<epoch>/<digest>`, or `NULL`. The export does not copy
+the blob.
 
 ## Metrics
 
