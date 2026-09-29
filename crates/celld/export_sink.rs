@@ -51,7 +51,11 @@ use tokio::sync::mpsc;
 use tokio::sync::watch;
 
 /// Where the bucket sink writes, under `<node>/<yyyy>/<mm>/<dd>/<hh>/`.
-pub const CHANGES_PREFIX: &str = "export/changes";
+pub use crate::export::CHANGES_PREFIX;
+/// How long to keep what the bucket sink writes; the same choice as
+/// telemetry's. `None` leaves lifecycle to the consumer and is the default,
+/// because the bucket may be the only copy a consumer has not loaded yet.
+pub use crate::telemetry::Retention;
 
 /// Stamped on every object as `celld-schema`. Bumped when the Parquet
 /// layout below changes incompatibly.
@@ -132,31 +136,19 @@ pub trait ExportSink: Send + Sync {
     fn close(&self) -> BoxFuture<'static, ()>;
 }
 
-/// How long to keep what the bucket sink writes.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Retention {
-    /// No sweep. Lifecycle is the consumer's, which is the default because
-    /// the bucket may be the only copy a consumer has not loaded yet.
-    #[default]
-    None,
-    /// Delete day partitions older than this many whole days.
-    Days(u32),
-}
-
-impl Retention {
-    fn label(self) -> String {
-        match self {
-            Retention::None => "none".to_string(),
-            Retention::Days(days) => format!("{days}d"),
-        }
+/// The `celld-retention` stamp on each object.
+fn retention_label(retention: Retention) -> String {
+    match retention {
+        Retention::None => "none".to_string(),
+        Retention::Days(days) => format!("{days}d"),
     }
 }
 
-/// Bucket sink settings. Defaults follow the design's configuration table;
-/// `CELLD_EXPORT_FLUSH_MS`, `CELLD_EXPORT_FLUSH_BYTES` and
-/// `CELLD_EXPORT_RETENTION` map onto the first three fields. Which bucket
-/// it writes to (`CELLD_EXPORT_BUCKET`) is the [`Bucket`] it is started
-/// with.
+/// Bucket sink settings. Defaults follow the design's configuration table,
+/// and [`BucketSinkConfig::from_export`] takes `CELLD_EXPORT_FLUSH_MS`,
+/// `CELLD_EXPORT_FLUSH_BYTES` and `CELLD_EXPORT_RETENTION` from the parsed
+/// export configuration. Which bucket it writes to (`CELLD_EXPORT_BUCKET`)
+/// is the [`Bucket`] it is started with.
 #[derive(Clone, Debug)]
 pub struct BucketSinkConfig {
     /// Flush interval. Ten seconds by default: a one-second flush on a
@@ -174,11 +166,24 @@ pub struct BucketSinkConfig {
 impl Default for BucketSinkConfig {
     fn default() -> Self {
         Self {
-            flush: Duration::from_millis(10_000),
-            flush_bytes: 8_388_608,
+            flush: crate::export::DEFAULT_FLUSH,
+            flush_bytes: crate::export::DEFAULT_FLUSH_BYTES as u64,
             retention: Retention::None,
             put_attempts: 3,
             retry_backoff: Duration::from_secs(1),
+        }
+    }
+}
+
+impl BucketSinkConfig {
+    /// The bucket sink's settings from the export configuration, with the
+    /// default retry policy.
+    pub fn from_export(config: &crate::export::Config) -> Self {
+        Self {
+            flush: config.flush,
+            flush_bytes: config.flush_bytes as u64,
+            retention: config.retention,
+            ..Self::default()
         }
     }
 }
@@ -231,7 +236,7 @@ impl BucketSink {
             bucket = %bucket.name,
             flush_ms = config.flush.as_millis() as u64,
             flush_bytes = config.flush_bytes,
-            retention = %config.retention.label(),
+            retention = %retention_label(config.retention),
             "export bucket sink on"
         );
         if let Retention::Days(days) = config.retention {
@@ -328,7 +333,7 @@ async fn run(
     let writer = Writer {
         bucket,
         node,
-        retention: config.retention.label(),
+        retention: retention_label(config.retention),
         put_attempts: config.put_attempts.max(1),
         retry_backoff: config.retry_backoff,
     };
