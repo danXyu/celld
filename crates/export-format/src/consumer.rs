@@ -87,6 +87,9 @@ pub struct StreamState {
     pub gaps: Vec<Gap>,
     /// Set when a `deleted` record removed the stream at this position.
     pub deleted_at: Option<Position>,
+    /// The position of the complete stream-wide snapshot the state starts
+    /// from, if any. Everything at or below it is replaced by the snapshot.
+    pub snapshot_at: Option<Position>,
 }
 
 impl StreamState {
@@ -399,6 +402,7 @@ fn derive(all: &[&Record]) -> StreamState {
     }
 
     state.certified = certify(&records);
+    state.snapshot_at = stream_cut.map(|c| c.position);
 
     // Gaps a stream-wide snapshot has not covered.
     let covered = |epoch: u64, txid: u64| {

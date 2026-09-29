@@ -340,6 +340,8 @@ pub mod drain_token;
 pub mod engine_api;
 pub mod env_vars;
 pub mod export;
+pub mod export_audit;
+pub mod export_cli;
 pub mod export_live;
 pub mod export_restore;
 pub mod export_sink;
