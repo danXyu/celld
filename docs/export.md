@@ -17,8 +17,9 @@ format and the delivery guarantees.
 Change export is on `main` and is not in a fork release yet. What works
 today:
 
-- Row changes, schema changes and key-value data of root cells, exported
-  through the **bucket sink** as Parquet objects in the fleet bucket.
+- Row changes, schema changes and key-value data of root cells and their
+  facets, exported through the **bucket sink** as Parquet objects in the
+  fleet bucket. Each facet exports on a stream of its own.
 - The **blob-stream sink**, in builds with the `export-blob-stream` Cargo
   feature.
 - Completeness records: watermarks, activation links, facet deletes, and
@@ -30,9 +31,8 @@ today:
 
 Still to come:
 
-- **Facet row streams.** A facet's rows are not exported yet; only its
-  deletion is, on its root's stream. Facet streams are in review in
-  [#57](https://github.com/ewhauser/celld/pull/57).
+- **Repairing facet streams.** `repair` and `backfill` skip facet streams;
+  a gap in one is reported but cannot be filled yet.
 - **A Snowflake loader for blob-stream.** The loader reads the bucket sink's
   files. Nothing in this repository consumes the blob-stream topic yet.
 - **Both sinks at once.** A node exports through one sink:
@@ -377,8 +377,13 @@ the blob.
 
 ### Facets
 
-A facet's rows are not exported yet ([#57](https://github.com/ewhauser/celld/pull/57)).
-Deleting a facet is: the root's stream carries a `deleted` record with
+Each facet exports on a stream of its own, named by its root's class and
+cell plus the facet path, with the facet's incarnation. The stream starts
+with a `link` record like a root's, and its commits are released only after
+the root's node proves it still owns the root cell. A nested facet gets its
+own stream at its full path.
+
+Deleting a facet ends its stream: the root's stream carries a `deleted` record with
 `subtree` set, which removes the facet and every facet below it, including
 facets created before the delete that were never resident on the node. A
 facet recreated at the same path afterwards has a higher incarnation and is
@@ -600,7 +605,8 @@ Options for `repair` and `backfill`:
 
 Both print one JSON report per stream, with the position its snapshot
 reached, and exit non-zero when any stream failed. Tombstoned streams are
-skipped. Facet streams are skipped until facets are exported.
+skipped. Facet streams are skipped: restoring a facet's state is not built
+yet.
 
 #### inspect
 

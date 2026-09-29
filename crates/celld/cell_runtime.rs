@@ -57,6 +57,12 @@ impl CellRuntime {
         region: String,
     ) -> anyhow::Result<Self> {
         require_cell_scope_capacity(&data_dir)?;
+        // Change export proves facet streams through the same replication.
+        if let (Some(exporter), Some(replication)) =
+            (crate::export_live::installed(), replication.as_ref())
+        {
+            exporter.set_replication(replication.clone());
+        }
         Ok(Self {
             generations: Arc::new(std::sync::RwLock::new(Generations {
                 current: generation,

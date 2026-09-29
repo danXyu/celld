@@ -32,8 +32,9 @@
 //! and is skipped.
 //!
 //! **Not yet.** Table generations are the capture's first generation until
-//! piece 11 records real ones, facets are refused because they are not
-//! exported yet, and tombstoned streams (piece 16) are not checked.
+//! piece 11 records real ones, facet streams are refused because restoring
+//! a facet's state is not built, and tombstoned streams (piece 16) are not
+//! checked.
 #![allow(clippy::disallowed_methods)] // Offline operator path, outside Actor execution.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -863,7 +864,7 @@ async fn run_job(
     }
     if job.stream.facet.is_some() {
         report.status = Status::Skipped;
-        report.error = Some("facet streams are not exported yet".to_string());
+        report.error = Some("facet streams cannot be repaired yet".to_string());
         return report;
     }
     match snapshot_job(

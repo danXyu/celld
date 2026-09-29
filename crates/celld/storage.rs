@@ -966,8 +966,14 @@ fn finish_open(
         let Some(settings) = cells.export_capture.get() else {
             return (None, None);
         };
+        // A facet's stream is named by its replication stream, not by the
+        // scope of this run.
+        let export_key = match &backing {
+            StorageBacking::Embedded { stream, .. } => stream.as_str(),
+            StorageBacking::File { .. } => scope,
+        };
         let export_stream = match crate::export_live::installed() {
-            Some(exporter) => match exporter.attach(scope, epoch) {
+            Some(exporter) => match exporter.attach(export_key, epoch) {
                 Some(stream) => {
                     // Before the session installs: this write is the
                     // engine's, and the link must precede every commit.
@@ -1021,7 +1027,8 @@ fn finish_open(
 }
 
 /// The export stream identity of the cell on `c`: its incarnation, stored at
-/// the first exported open as the epoch it opened in, and its name.
+/// the first exported open as the epoch it opened in, and its name. A facet's
+/// incarnation was stamped before this (`open_embedded`), so it is kept.
 fn export_identity(
     c: &Connection,
     scope: &str,

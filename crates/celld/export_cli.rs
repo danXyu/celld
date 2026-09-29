@@ -251,7 +251,7 @@ pub(crate) fn snapshot_options(
             );
             ensure!(
                 !scope.contains("/facets/"),
-                "facet streams are not exported yet"
+                "facet streams cannot be repaired yet"
             );
             Source::Stream { scope, at }
         }

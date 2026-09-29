@@ -48,7 +48,7 @@ for (const page of pages) {
     });
   }).join('\n');
   const notice = page.slug === 'export'
-    ? ':::caution[On main — not in v0.6.0-ewhauser.2]\nThis page follows development on main. Change export is not in a fork release yet, and facet row streams are still in review. See the status below before enabling it.\n:::\n\n'
+    ? ':::caution[On main — not in v0.6.0-ewhauser.2]\nThis page follows development on main. Change export is not in a fork release yet. See the status below before enabling it.\n:::\n\n'
     : '';
   const metadata = { title: page.title, description: page.description, editUrl: `${repo}/edit/main/${page.source}` };
   const frontmatter = Object.entries(metadata).map(([key, value]) => `${key}: ${JSON.stringify(value)}`).join('\n');
