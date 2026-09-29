@@ -9,8 +9,9 @@ The feature is under construction. A node with `CELLD_EXPORT=1` exports
 the row changes of its root cells through the bucket sink: Parquet objects
 under `export/changes/<node>/` in the bucket, released only after the
 change is durable and the node still owns the cell, and followed by
-watermarks that certify what the bucket holds. Facets, schema records,
-activation links, repair and the blob-stream sink are not built yet. A node with `CELLD_EXPORT_SINK=blob-stream` refuses
+watermarks that certify what the bucket holds. Facets, activation links,
+repair and the blob-stream sink are not built yet. A node with
+`CELLD_EXPORT_SINK=blob-stream` refuses
 to start.
 
 Export is off by default, and the off state costs nothing: with
@@ -48,6 +49,25 @@ bucket uses the fleet bucket's endpoint and credentials.
 Queue brokers (`__Queue`), Workflow instances (`__Workflow` and every
 `__Workflow.<script>` class), and cron cells (`.cron`) are never exported.
 celld refuses to start when `CELLD_EXPORT_CLASSES` names one of them.
+
+## Schema changes
+
+Every exported table has a generation, and rows of different generations
+never merge. celld compares each cell's schema with what it last exported
+at the same safe point it pulls row changes. A create opens generation
+one. A drop closes the generation. An alteration, a rename, or a drop and
+recreate under the same name opens the next generation, and so does a
+table that changed while export was off for its cell. Each change is a
+`schema` record at the commit that made it, and every generation that
+opens is snapshotted inline at that commit, or exported as `bulk` when it
+is larger than `CELLD_EXPORT_MAX_TX_BYTES`.
+
+Generations are stored in the cell itself, in the `_cf_EXPORT` table, so
+they survive restarts, moves and restores, and `deleteAll()` keeps them: a
+table created after it continues from its old generation, so old rows
+cannot come back. A cell's first export starts every table it already has
+at generation one with no snapshot, like any change that happened before
+export was on; the planned `celld export backfill` covers those.
 
 ## Key-value tables
 
