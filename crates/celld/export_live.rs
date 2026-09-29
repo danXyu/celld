@@ -777,25 +777,45 @@ impl Stream {
     fn submit_link(&mut self, link: ActivationLink) {
         let position = link_position(self.key.1, &link);
         self.last_position = self.last_position.max(position);
-        let record = Record {
-            envelope: self.exporter.envelope(
-                &self.identity,
-                &self.cell_name,
-                position,
-                crate::asyncrt::wall_ms(),
-            ),
-            body: Body::Link(link_body(&link)),
-        };
-        let meta = Submitted {
-            key: self.key.clone(),
-            stream: self.identity.clone(),
-            cell_name: self.cell_name.clone(),
+        let envelope = self.exporter.envelope(
+            &self.identity,
+            &self.cell_name,
             position,
-            whole: true,
-            closes: true,
-            watermark: false,
-        };
-        self.exporter.submit(vec![(record, meta)]);
+            crate::asyncrt::wall_ms(),
+        );
+        let mut records = vec![Record {
+            envelope: envelope.clone(),
+            body: Body::Link(link_body(&link)),
+        }];
+        // A predecessor whose position the activation could not read may
+        // hold records the consumer never got. A link without `prev_txid`
+        // reads as gap-free, so the unknown span is reported as a gap over
+        // the whole predecessor epoch, at the link's position.
+        if let (Some(prev_epoch), None) = (link.prev_epoch, link.prev_txid) {
+            self.exporter.counters.gaps.fetch_add(1, Ordering::Relaxed);
+            records.push(Record {
+                envelope,
+                body: Body::Gap(unknown_predecessor(prev_epoch)),
+            });
+        }
+        let last = records.len() - 1;
+        let out = records
+            .into_iter()
+            .enumerate()
+            .map(|(index, record)| {
+                let meta = Submitted {
+                    key: self.key.clone(),
+                    stream: self.identity.clone(),
+                    cell_name: self.cell_name.clone(),
+                    position,
+                    whole: true,
+                    closes: index == last,
+                    watermark: false,
+                };
+                (record, meta)
+            })
+            .collect();
+        self.exporter.submit(out);
     }
 
     /// Turn released commits and gaps into records and submit them.
@@ -1070,6 +1090,15 @@ fn link_position(epoch: u64, link: &ActivationLink) -> Position {
     Position::new(epoch, link.start_txid, 0)
 }
 
+/// The gap a link reports when its predecessor's position is unknown.
+fn unknown_predecessor(prev_epoch: u64) -> GapBody {
+    GapBody {
+        from: Position::new(prev_epoch, 0, 0),
+        to: Position::new(prev_epoch, u64::MAX, u64::MAX),
+        reason: "the activation could not read its predecessor's position".to_string(),
+    }
+}
+
 fn link_body(link: &ActivationLink) -> LinkBody {
     LinkBody {
         start_txid: link.start_txid,
@@ -1115,6 +1144,47 @@ mod tests {
                 mode: LinkMode::Resume,
             }
         );
+    }
+
+    #[test]
+    fn an_unknown_predecessor_is_a_gap() {
+        use celld_export_format::Consumer;
+        let stream = StreamId {
+            script: "s".into(),
+            class: "C".into(),
+            cell: "C:x".into(),
+            facet: None,
+            incarnation: 1,
+        };
+        let record = |body| Record {
+            envelope: Envelope {
+                stream: stream.clone(),
+                cell_name: None,
+                position: Position::new(8, 1, 0),
+                committed_at: 0,
+                node: "n".into(),
+                origin: Origin::Live,
+                fragment: 1,
+                fragments: 1,
+            },
+            body,
+        };
+        let link = ActivationLink {
+            mode: ActivationMode::Clone,
+            start_txid: 1,
+            prev_epoch: Some(7),
+            prev_txid: None,
+        };
+        let mut consumer = Consumer::new();
+        consumer
+            .ingest_all([
+                record(Body::Link(link_body(&link))),
+                record(Body::Gap(unknown_predecessor(7))),
+            ])
+            .unwrap();
+        let state = consumer.state();
+        let (_, state) = state.iter().find(|(id, _)| **id == stream).unwrap();
+        assert_eq!(state.gaps.len(), 1, "{:?}", state.gaps);
     }
 
     #[test]
