@@ -388,6 +388,9 @@ impl Ownership {
 }
 
 pub enum Message {
+    /// The change exporter asks the output gate to prove a cell's committed
+    /// position durable before it releases what it captured.
+    ExportTicket(crate::export_live::TicketAsk),
     /// A periodic resource sample. The measuring is the shell's job; every
     /// decision that follows belongs to the core.
     SampleLoad,
@@ -2857,6 +2860,22 @@ impl Actor {
             Message::WebSocketClosed { cell, websocket } => {
                 self.drive(Event::WebSocketClosed { cell, websocket }, out);
             }
+            Message::ExportTicket(crate::export_live::TicketAsk {
+                cell,
+                epoch,
+                position,
+                ticket,
+            }) => {
+                self.drive(
+                    Event::ExportTicket {
+                        cell,
+                        epoch,
+                        position,
+                        ticket,
+                    },
+                    out,
+                );
+            }
             Message::AlarmObserved {
                 cell,
                 alarm,
@@ -4120,6 +4139,24 @@ impl Actor {
                     if reply.send(WorkerRouted { request, route }).is_err() && reserved {
                         immediate.push_back(Event::ActivityFinished { request });
                     }
+                }
+            }
+            // The exporter releases up to the TXID the proof covered, read
+            // now that the ticket has settled.
+            Effect::ExportProven {
+                cell,
+                epoch,
+                ticket,
+                result,
+            } => {
+                if let Some(exporter) = crate::export_live::installed() {
+                    let result = result.map(|()| {
+                        self.host
+                            .as_ref()
+                            .and_then(|host| host.export_proven_txid(&cell, epoch))
+                            .unwrap_or(0)
+                    });
+                    exporter.proven(&cell, epoch, ticket, result);
                 }
             }
             Effect::CloseWebSocket { cell, websocket } => {

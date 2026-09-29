@@ -873,6 +873,8 @@ fn certification() -> Scenario {
         Body::Recovered(RecoveredBody {
             session: "s-1".into(),
             head: pos(2, 1, 1),
+            loss: false,
+            cells: 1,
         }),
     ));
     s.emit(record(
@@ -882,6 +884,8 @@ fn certification() -> Scenario {
         Body::Recovered(RecoveredBody {
             session: "s-2".into(),
             head: pos(2, 3, 3),
+            loss: false,
+            cells: 1,
         }),
     ));
     s.emit(record(
@@ -1209,6 +1213,8 @@ fn random(seed: u64) -> Scenario {
                 Body::Recovered(RecoveredBody {
                     session: "dead".into(),
                     head,
+                    loss: false,
+                    cells: 1,
                 }),
             ));
         }

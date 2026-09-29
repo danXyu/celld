@@ -14,10 +14,16 @@
 //! neither live beside the connection in `OpenCell` nor set
 //! `SQLITE_SESSION_OBJCONFIG_ROWID`. [`Capture`] drives the C API directly.
 //!
-//! What this module does not do yet: positions (the WAL stamp and the LTX
-//! label arrive with the live path), table generations (every table is at
-//! [`FIRST_GENERATION`] until DDL tracking lands), and the `kv` mapping of
-//! `_cf_KV`, which is exported as the raw table here.
+//! A WAL hook on the same connection stamps each commit with where its last
+//! frame landed ([`WalStamp`]), which release matches against the LTX files
+//! the capture loop reports. Installing the hook replaces SQLite's default
+//! autocheckpoint, so the hook runs the same passive checkpoint itself.
+//!
+//! The key-value tables are reshaped on the way out ([`kv`]): `_cf_KV` is
+//! exported as `kv`, and `__kv` gains its blob references.
+//!
+//! What this module does not do yet: table generations (every table is at
+//! [`FIRST_GENERATION`] until DDL tracking lands).
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -27,6 +33,8 @@ use std::rc::Rc;
 
 use celld_export_format::{Op, RowChange, TableGen, TableRows, Value, ROWID_KEY_COLUMN};
 use rusqlite::{ffi, Connection};
+
+pub(crate) mod kv;
 
 /// The generation every table is exported at until DDL tracking assigns real
 /// ones.
@@ -112,60 +120,149 @@ pub(crate) fn safe_point(connection: &Connection) -> bool {
             != ffi::SQLITE_TXN_WRITE
 }
 
+/// SQLite's default `wal_autocheckpoint`. The cell connection never sets
+/// one, so this is what it ran before the export hook replaced the default.
+pub(crate) const AUTOCHECKPOINT_FRAMES: c_int = 1000;
+
+/// Where a commit's last frame landed in the WAL.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WalStamp {
+    /// The WAL generation named by its header salts, and the number of
+    /// frames in it through the commit (the WAL hook's count).
+    At { salt1: u32, salt2: u32, frames: u64 },
+    /// The hook could not read the generation its commit landed in: the WAL
+    /// was restarted or truncated between the commit and the read. Only the
+    /// capture loop does that, and only after it captured every frame, so
+    /// the file holding the commit was already reported.
+    Unplaced,
+}
+
+/// What the WAL hook needs. Boxed for the same reason as [`FilterState`].
+struct WalState {
+    /// The newest commit's stamp since the last pull.
+    last: Cell<Option<WalStamp>>,
+}
+
+/// SQLite calls this after each commit on the connection, with the number
+/// of frames now in the WAL.
+///
+/// # Safety
+///
+/// `context` is the `WalState` the owning `Capture` registered, which
+/// outlives the hook: `Capture` removes the hook when it drops.
+unsafe extern "C" fn wal_hook(
+    context: *mut c_void,
+    database: *mut ffi::sqlite3,
+    name: *const c_char,
+    frames: c_int,
+) -> c_int {
+    let state = unsafe { &*context.cast::<WalState>() };
+    if unsafe { CStr::from_ptr(name) }.to_bytes() == b"main" {
+        // Read on this thread before any later statement runs, so the header
+        // is the one the commit wrote into unless the capture loop restarted
+        // the WAL in between; the frame's own salts catch that.
+        let stamp = unsafe { read_stamp(database, u64::try_from(frames).unwrap_or(0)) };
+        state.last.set(Some(stamp.unwrap_or(WalStamp::Unplaced)));
+    }
+    // The default hook's passive checkpoint, which this hook replaced.
+    if frames >= AUTOCHECKPOINT_FRAMES {
+        unsafe { ffi::sqlite3_wal_checkpoint(database, name) };
+    }
+    ffi::SQLITE_OK
+}
+
+/// Read the WAL header's salts and check that frame `frames` is a commit
+/// frame of that generation. `None` when the WAL no longer holds it.
+///
+/// # Safety
+///
+/// `database` is a live connection in WAL mode.
+unsafe fn read_stamp(database: *mut ffi::sqlite3, frames: u64) -> Option<WalStamp> {
+    if frames == 0 {
+        return None;
+    }
+    let mut file: *mut ffi::sqlite3_file = ptr::null_mut();
+    // The pager's own handle on the WAL, through whatever VFS opened it.
+    let rc = unsafe {
+        ffi::sqlite3_file_control(
+            database,
+            c"main".as_ptr(),
+            ffi::SQLITE_FCNTL_JOURNAL_POINTER,
+            (&mut file as *mut *mut ffi::sqlite3_file).cast::<c_void>(),
+        )
+    };
+    if rc != ffi::SQLITE_OK || file.is_null() {
+        return None;
+    }
+    let methods = unsafe { (*file).pMethods };
+    if methods.is_null() {
+        return None;
+    }
+    let read = unsafe { (*methods).xRead }?;
+    let mut header = [0u8; 32];
+    let rc = unsafe { read(file, header.as_mut_ptr().cast(), 32, 0) };
+    if rc != ffi::SQLITE_OK {
+        return None;
+    }
+    let word = |bytes: &[u8], at: usize| u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap());
+    let page_size = u64::from(word(&header, 8));
+    let (salt1, salt2) = (word(&header, 16), word(&header, 20));
+    let offset = 32 + (frames - 1) * (24 + page_size);
+    let mut frame = [0u8; 24];
+    let rc = unsafe {
+        read(
+            file,
+            frame.as_mut_ptr().cast(),
+            24,
+            i64::try_from(offset).ok()?,
+        )
+    };
+    // A commit frame records the database size after the commit; a frame of
+    // a later generation carries that generation's salts.
+    (rc == ffi::SQLITE_OK
+        && page_size > 0
+        && word(&frame, 4) != 0
+        && word(&frame, 8) == salt1
+        && word(&frame, 12) == salt2)
+        .then_some(WalStamp::At {
+            salt1,
+            salt2,
+            frames,
+        })
+}
+
 /// What the table filter needs. Boxed so its address survives moves of the
 /// [`Capture`] that owns it, since the session holds a pointer to it.
 struct FilterState {
     scope: String,
     /// Virtual tables and their shadow tables, as of the last refresh.
     excluded: RefCell<HashSet<String>>,
-    /// `WITHOUT ROWID` tables, as of the last refresh.
-    without_rowid: RefCell<HashSet<String>>,
-    /// What the filter learned per table since the last refresh.
-    traits: RefCell<HashMap<String, Traits>>,
-    /// Tables with generated columns the session saw a write to. They are
+    /// Tables the operator's `CELLD_EXPORT_TABLES` denies for this class.
+    denied: HashSet<String>,
+    /// Per table seen since the last refresh, whether it has generated
+    /// columns. The session cannot track such a table: its changeset fails
+    /// as a whole with `SQLITE_SCHEMA`.
+    generated: RefCell<HashMap<String, bool>>,
+    /// Tables with generated columns the transaction wrote. They are
     /// exported as `bulk`.
     untracked: RefCell<Vec<String>>,
-    /// Tables whose declared key can hold `NULL` that the session saw a write
-    /// to, with whether a row with a `NULL` key existed before that write.
-    nullable_touched: RefCell<Vec<(String, bool)>>,
     dirty: Cell<bool>,
     queue: DirtyList,
     database: *mut ffi::sqlite3,
 }
 
-/// What the filter needs to know about a table the session sees.
-#[derive(Clone, Debug, Default)]
-struct Traits {
-    /// The session cannot track a table with a generated column: its
-    /// changeset fails as a whole with `SQLITE_SCHEMA`.
-    generated: bool,
-    /// The declared key columns that can hold `NULL`. A rowid table's
-    /// declared key accepts `NULL` unless the column is `NOT NULL` (or is the
-    /// rowid alias, whose probe is then free), and the session silently
-    /// skips a row whose key holds `NULL`.
-    nullable_key: Vec<String>,
-    /// Their column numbers, for the pre-update values.
-    nullable_key_columns: Vec<c_int>,
-}
-
 impl FilterState {
-    fn traits(&self, table: &str) -> Traits {
-        if let Some(known) = self.traits.borrow().get(table) {
-            return known.clone();
+    fn has_generated_columns(&self, table: &str) -> bool {
+        if let Some(&known) = self.generated.borrow().get(table) {
+            return known;
         }
-        let without_rowid = self.without_rowid.borrow().contains(table);
         // SAFETY: the connection is live while its session is, and SQLite
         // runs its own table-info query at this point too.
-        let traits = unsafe { read_traits(self.database, table, without_rowid) }
-            // A table that cannot be inspected is treated as untrackable.
-            .unwrap_or(Traits {
-                generated: true,
-                ..Traits::default()
-            });
-        self.traits
-            .borrow_mut()
-            .insert(table.to_string(), traits.clone());
-        traits
+        let found = unsafe { generated_columns(self.database, table) };
+        // A table that cannot be inspected is treated as untrackable.
+        let found = found.unwrap_or(true);
+        self.generated.borrow_mut().insert(table.to_string(), found);
+        found
     }
 
     fn mark_dirty(&self) {
@@ -175,17 +272,13 @@ impl FilterState {
     }
 }
 
-/// Run `sql` and hand each row to `row`. `None` when it fails.
+/// Whether `table` has a generated column, read with `PRAGMA table_xinfo`.
 ///
 /// # Safety
 ///
 /// `database` is a live connection.
-unsafe fn raw_query(
-    database: *mut ffi::sqlite3,
-    sql: &str,
-    mut row: impl FnMut(*mut ffi::sqlite3_stmt),
-) -> Option<()> {
-    let sql = std::ffi::CString::new(sql).ok()?;
+unsafe fn generated_columns(database: *mut ffi::sqlite3, table: &str) -> Option<bool> {
+    let sql = std::ffi::CString::new(format!("PRAGMA main.table_xinfo({})", quote(table))).ok()?;
     let mut statement = ptr::null_mut();
     let rc = unsafe {
         ffi::sqlite3_prepare_v2(database, sql.as_ptr(), -1, &mut statement, ptr::null_mut())
@@ -193,96 +286,17 @@ unsafe fn raw_query(
     if rc != ffi::SQLITE_OK {
         return None;
     }
+    let mut found = false;
     let result = loop {
         match unsafe { ffi::sqlite3_step(statement) } {
-            ffi::SQLITE_ROW => row(statement),
-            ffi::SQLITE_DONE => break Some(()),
+            // `hidden` is 2 for a virtual and 3 for a stored generated column.
+            ffi::SQLITE_ROW => found |= unsafe { ffi::sqlite3_column_int(statement, 6) } >= 2,
+            ffi::SQLITE_DONE => break Some(found),
             _ => break None,
         }
     };
     unsafe { ffi::sqlite3_finalize(statement) };
     result
-}
-
-/// Read `table`'s [`Traits`] with `PRAGMA table_xinfo`.
-///
-/// # Safety
-///
-/// `database` is a live connection.
-unsafe fn read_traits(
-    database: *mut ffi::sqlite3,
-    table: &str,
-    without_rowid: bool,
-) -> Option<Traits> {
-    let mut traits = Traits::default();
-    let sql = format!("PRAGMA main.table_xinfo({})", quote(table));
-    unsafe {
-        raw_query(database, &sql, |statement| {
-            // `hidden` is 2 for a virtual and 3 for a stored generated column.
-            traits.generated |= ffi::sqlite3_column_int(statement, 6) >= 2;
-            let not_null = ffi::sqlite3_column_int(statement, 3) != 0;
-            let pk = ffi::sqlite3_column_int(statement, 5) > 0;
-            // `WITHOUT ROWID` enforces `NOT NULL` on its key.
-            if pk && !not_null && !without_rowid {
-                let name = ffi::sqlite3_column_text(statement, 1);
-                if !name.is_null() {
-                    let name = CStr::from_ptr(name.cast()).to_string_lossy().into_owned();
-                    traits.nullable_key.push(name);
-                    traits
-                        .nullable_key_columns
-                        .push(ffi::sqlite3_column_int(statement, 0));
-                }
-            }
-        })?;
-    }
-    Some(traits)
-}
-
-/// The query that says whether `table` holds a row whose key has a `NULL`.
-fn null_key_sql(table: &str, columns: &[String]) -> String {
-    let predicate = columns
-        .iter()
-        .map(|c| format!("{} IS NULL", quote(c)))
-        .collect::<Vec<_>>()
-        .join(" OR ");
-    format!(
-        "SELECT EXISTS (SELECT 1 FROM main.{} WHERE {predicate})",
-        quote(table)
-    )
-}
-
-/// Whether the row the current pre-update callback is about to update or
-/// delete has a `NULL` in `columns`. False for an insert, which has no old row.
-///
-/// # Safety
-///
-/// Called from inside a pre-update callback on `database`, which the session
-/// filter is.
-unsafe fn old_row_has_null_key(database: *mut ffi::sqlite3, columns: &[c_int]) -> bool {
-    columns.iter().any(|&column| {
-        let mut value = ptr::null_mut();
-        let rc = unsafe { ffi::sqlite3_preupdate_old(database, column, &mut value) };
-        rc == ffi::SQLITE_OK
-            && !value.is_null()
-            && unsafe { ffi::sqlite3_value_type(value) } == ffi::SQLITE_NULL
-    })
-}
-
-/// # Safety
-///
-/// `database` is a live connection.
-unsafe fn has_null_key(
-    database: *mut ffi::sqlite3,
-    table: &str,
-    columns: &[String],
-) -> Option<bool> {
-    let mut found = false;
-    unsafe {
-        raw_query(database, &null_key_sql(table, columns), |statement| {
-            found = ffi::sqlite3_column_int(statement, 0) != 0;
-        })?;
-    }
-    Some(found)
 }
 
 /// SQLite calls this the first time a session sees a change to `table`.
@@ -294,32 +308,19 @@ unsafe fn has_null_key(
 unsafe extern "C" fn table_filter(context: *mut c_void, table: *const c_char) -> c_int {
     let state = unsafe { &*context.cast::<FilterState>() };
     let table = unsafe { CStr::from_ptr(table) }.to_string_lossy();
-    if !exported_table(&table) || state.excluded.borrow().contains(table.as_ref()) {
+    if !exported_table(&table)
+        || state.denied.contains(table.as_ref())
+        || state.excluded.borrow().contains(table.as_ref())
+    {
         return 0;
     }
     state.mark_dirty();
-    let traits = state.traits(&table);
-    if traits.generated {
+    if state.has_generated_columns(&table) {
         let mut untracked = state.untracked.borrow_mut();
         if !untracked.iter().any(|t| t == table.as_ref()) {
             untracked.push(table.into_owned());
         }
         return 0;
-    }
-    if !traits.nullable_key.is_empty() {
-        // The filter runs inside the pre-update callback of the first change
-        // the session sees to the table. SQLite may already have changed the
-        // key index for that row, so the probe covers every other row and
-        // the row itself is read from its pre-update values.
-        // SAFETY: as for `traits`, and this is a pre-update callback.
-        let had_null = unsafe {
-            has_null_key(state.database, &table, &traits.nullable_key).unwrap_or(true)
-                || old_row_has_null_key(state.database, &traits.nullable_key_columns)
-        };
-        state
-            .nullable_touched
-            .borrow_mut()
-            .push((table.into_owned(), had_null));
     }
     1
 }
@@ -365,6 +366,7 @@ pub(crate) struct Capture {
     session: *mut ffi::sqlite3_session,
     database: *mut ffi::sqlite3,
     filter: Box<FilterState>,
+    wal: Box<WalState>,
     settings: Settings,
     /// Tracking stopped for the current transaction because it exceeded
     /// `max_tx_bytes`.
@@ -382,15 +384,20 @@ impl Capture {
         connection: &Connection,
         scope: &str,
         settings: Settings,
+        denied: HashSet<String>,
         queue: DirtyList,
     ) -> anyhow::Result<Self> {
+        let mut denied = denied;
+        // The deny list names tables as they are exported.
+        if denied.contains(kv::KV_TABLE) {
+            denied.insert(kv::KV_SOURCE.to_string());
+        }
         let filter = Box::new(FilterState {
             scope: scope.to_string(),
             excluded: RefCell::new(HashSet::new()),
-            without_rowid: RefCell::new(HashSet::new()),
-            traits: RefCell::new(HashMap::new()),
+            denied,
+            generated: RefCell::new(HashMap::new()),
             untracked: RefCell::new(Vec::new()),
-            nullable_touched: RefCell::new(Vec::new()),
             dirty: Cell::new(false),
             queue,
             // SAFETY: as for `database` below.
@@ -402,6 +409,9 @@ impl Capture {
             // capture before the connection.
             database: unsafe { connection.handle() },
             filter,
+            wal: Box::new(WalState {
+                last: Cell::new(None),
+            }),
             settings,
             overflowed: false,
             seq: 0,
@@ -410,7 +420,24 @@ impl Capture {
         };
         capture.refresh_schema(connection)?;
         capture.start_session()?;
+        // SAFETY: the connection is live, and `wal` is boxed and outlives the
+        // hook, which `Drop` removes.
+        unsafe {
+            ffi::sqlite3_wal_hook(
+                capture.database,
+                Some(wal_hook),
+                (&*capture.wal as *const WalState)
+                    .cast_mut()
+                    .cast::<c_void>(),
+            );
+        }
         Ok(capture)
+    }
+
+    /// Where the newest commit since the last call landed, and forget it.
+    /// `None` when no commit ran since.
+    pub(crate) fn take_wal_stamp(&self) -> Option<WalStamp> {
+        self.wal.last.take()
     }
 
     fn start_session(&mut self) -> anyhow::Result<()> {
@@ -502,7 +529,6 @@ impl Capture {
         // Every write so far is pulled or accounted for as bulk.
         self.filter.dirty.set(false);
         self.filter.untracked.borrow_mut().clear();
-        self.filter.nullable_touched.borrow_mut().clear();
         self.refresh_schema(connection)?;
         self.start_session()
     }
@@ -531,7 +557,16 @@ impl Capture {
         if self.overflowed {
             return self.bulk_everything(connection, now_ms);
         }
-        let untracked = self.untracked_tables(connection);
+        let untracked: Vec<TableGen> = self
+            .filter
+            .untracked
+            .borrow()
+            .iter()
+            .map(|table| TableGen {
+                table: table.clone(),
+                generation: FIRST_GENERATION,
+            })
+            .collect();
         // SAFETY: a live session.
         if unsafe { ffi::sqlite3session_isempty(self.session) } != 0 {
             return (!untracked.is_empty()).then(|| self.commit(now_ms, Vec::new(), untracked));
@@ -547,47 +582,12 @@ impl Capture {
                 return self.bulk_everything(connection, now_ms);
             }
         };
-        let (mut tables, mut bulk) = self.materialize(connection, changes);
-        // A table that is bulk carries no rows: they would be partial.
-        tables.retain(|rows| !untracked.iter().any(|t| t.table == rows.table));
-        bulk.retain(|table| !untracked.contains(table));
+        let (tables, mut bulk) = self.materialize(connection, changes);
         bulk.extend(untracked);
         if tables.is_empty() && bulk.is_empty() {
             return None;
         }
         Some(self.commit(now_ms, tables, bulk))
-    }
-
-    /// The tables the session saw writes to but could not track: tables with
-    /// generated columns, and tables that held a row with a `NULL` key before
-    /// or after the session's writes. A change to such a row is invisible to
-    /// the session, so the table is exported as `bulk`.
-    fn untracked_tables(&self, connection: &Connection) -> Vec<TableGen> {
-        let mut tables: Vec<String> = self.filter.untracked.borrow().clone();
-        let traits = self.filter.traits.borrow();
-        for (table, had_null) in self.filter.nullable_touched.borrow().iter() {
-            let columns = traits
-                .get(table)
-                .map(|t| t.nullable_key.clone())
-                .unwrap_or_default();
-            let has_null = *had_null
-                || columns.is_empty()
-                || connection
-                    .query_row(&null_key_sql(table, &columns), [], |row| {
-                        row.get::<_, bool>(0)
-                    })
-                    .unwrap_or(true);
-            if has_null && !tables.contains(table) {
-                tables.push(table.clone());
-            }
-        }
-        tables
-            .into_iter()
-            .map(|table| TableGen {
-                table,
-                generation: FIRST_GENERATION,
-            })
-            .collect()
     }
 
     fn commit(
@@ -597,6 +597,15 @@ impl Capture {
         bulk: Vec<TableGen>,
     ) -> CapturedCommit {
         self.seq += 1;
+        let mut named = HashSet::new();
+        let bulk = bulk
+            .into_iter()
+            .map(|table| TableGen {
+                table: kv::exported_name(&table.table).to_string(),
+                ..table
+            })
+            .filter(|table| named.insert(table.clone()))
+            .collect();
         CapturedCommit {
             seq: self.seq,
             committed_at: now_ms,
@@ -638,6 +647,7 @@ impl Capture {
             if schema == "main"
                 && kind == "table"
                 && exported_table(&name)
+                && !self.filter.denied.contains(&name)
                 && !excluded.contains(&name)
             {
                 tables.push(name);
@@ -655,24 +665,17 @@ impl Capture {
             return Ok(());
         }
         let mut excluded = HashSet::new();
-        let mut without_rowid = HashSet::new();
         let mut statement = connection.prepare("PRAGMA table_list")?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
-            let (schema, name, kind, wr): (String, String, String, i64) =
-                (row.get(0)?, row.get(1)?, row.get(2)?, row.get(4)?);
-            if schema != "main" {
-                continue;
-            }
-            if kind == "virtual" || kind == "shadow" {
+            let (schema, name, kind): (String, String, String) =
+                (row.get(0)?, row.get(1)?, row.get(2)?);
+            if schema == "main" && (kind == "virtual" || kind == "shadow") {
                 excluded.insert(name);
-            } else if wr != 0 {
-                without_rowid.insert(name);
             }
         }
         *self.filter.excluded.borrow_mut() = excluded;
-        *self.filter.without_rowid.borrow_mut() = without_rowid;
-        self.filter.traits.borrow_mut().clear();
+        self.filter.generated.borrow_mut().clear();
         self.shapes.clear();
         self.schema_version = Some(version);
         Ok(())
@@ -734,8 +737,12 @@ impl Capture {
         let mut bulk = Vec::new();
         for table in order {
             let changes = by_table.remove(&table).unwrap_or_default();
-            match self.materialize_table(connection, &table, changes) {
-                Ok(rows) => tables.push(rows),
+            let rows = self
+                .materialize_table(connection, &table, changes)
+                .and_then(|rows| kv::reshape(rows, &self.filter.scope, crate::export_kv::decode));
+            match rows {
+                Ok(Some(rows)) => tables.push(rows),
+                Ok(None) => {}
                 Err(error) => {
                     tracing::warn!(
                         scope = %self.filter.scope, table, %error,
@@ -811,6 +818,10 @@ impl Capture {
 impl Drop for Capture {
     fn drop(&mut self) {
         self.end_session();
+        // SAFETY: the connection outlives the capture (`OpenCell` drops the
+        // capture first). Put the default autocheckpoint back, which also
+        // removes the hook that points at `wal`.
+        unsafe { ffi::sqlite3_wal_autocheckpoint(self.database, AUTOCHECKPOINT_FRAMES) };
     }
 }
 

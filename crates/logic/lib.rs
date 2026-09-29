@@ -15,6 +15,7 @@ pub mod cron;
 pub mod dead_node_reconciliation;
 pub mod drain;
 pub mod durability;
+pub mod export;
 pub mod format;
 pub mod gate;
 pub mod http;
@@ -363,6 +364,11 @@ enum GateOwner {
         snapshot: wake::AlarmSnapshot,
         covered: bool,
     },
+    /// The change exporter's proof, returned to the shell as
+    /// [`Effect::ExportProven`] with the exporter's own ticket. It reveals
+    /// nothing to a client, so no read-only output trails it and a failed
+    /// proof does not reset the cell.
+    Export { ticket: u64 },
 }
 
 /// One local write held open by the output gate.
@@ -379,6 +385,14 @@ struct Barrier {
     /// share the write's verdict -- one proof, one verdict, however many
     /// channels are waiting on it.
     followers: Vec<Held>,
+}
+
+impl Barrier {
+    /// Whether a read-only output may wait on this barrier's verdict. The
+    /// exporter's barrier reveals nothing, so no reader depends on it.
+    fn trailable(&self) -> bool {
+        !matches!(self.owner, GateOwner::Export { .. })
+    }
 }
 
 /// One withheld output: which request raised it, and which way it leaves.
@@ -1648,6 +1662,11 @@ impl State {
                         ));
                     }
                 }
+                // The exporter's proof pins nothing either, and may outlive
+                // the residency it was asked for: it still settles, through
+                // its proof or its deadline, and the verdict goes to an
+                // exporter that is gone.
+                GateOwner::Export { .. } => {}
             }
             // A follower is always an output: an alarm opens a barrier and
             // never trails one.
@@ -5192,7 +5211,12 @@ impl State {
                 .values()
                 .any(|kind| matches!(kind, WebSocketKind::Regular | WebSocketKind::Outbound))
             && !matches!(cell.alarm, Some(AlarmState::Firing { .. }))
-            && !self.barriers.values().any(|barrier| barrier.cell == id)
+            // The exporter's proof does not hold a swap: a swap keeps the
+            // epoch, and the proof is of the epoch, not the runtime.
+            && !self
+                .barriers
+                .values()
+                .any(|barrier| barrier.cell == id && barrier.trailable())
     }
 
     /// The swap pump, run after every event once a generation change has
@@ -6319,6 +6343,14 @@ impl State {
                         effects,
                     );
                 }
+                // The epoch's unproven writes are discarded, so its exporter
+                // releases nothing more.
+                GateOwner::Export { ticket } => effects.push(Effect::ExportProven {
+                    cell: gate.cell.clone(),
+                    epoch: gate.epoch,
+                    ticket,
+                    result: Err(RequestError::DurabilityUnproven),
+                }),
             }
             for held in gate.followers {
                 effects.push(Effect::Release {
@@ -6505,12 +6537,20 @@ impl State {
             // op and clears the alarm, and the wake entry is left where it is,
             // so the node that takes the cell next discovers it and fires
             // again.
-            if let GateOwner::Output(held) = gate.owner {
-                effects.push(Effect::Release {
+            match gate.owner {
+                GateOwner::Output(held) => effects.push(Effect::Release {
                     request: held.request,
                     channel: held.channel,
                     result: Err(RequestError::NodeFenced),
-                });
+                }),
+                // A fenced node releases nothing, and its exporter stops.
+                GateOwner::Export { ticket } => effects.push(Effect::ExportProven {
+                    cell: gate.cell.clone(),
+                    epoch: gate.epoch,
+                    ticket,
+                    result: Err(RequestError::NodeFenced),
+                }),
+                GateOwner::Alarm { .. } => {}
             }
             for held in gate.followers {
                 effects.push(Effect::Release {
@@ -6740,6 +6780,12 @@ pub fn on_event(state: &mut State, event: Event) -> Vec<Effect> {
         Event::OwnershipVerified { op, result } => {
             state.ownership_verified(op, result, &mut effects)
         }
+        Event::ExportTicket {
+            cell,
+            epoch,
+            position,
+            ticket,
+        } => state.export_ticket(cell, epoch, position, ticket, &mut effects),
         Event::WebSocketOpened {
             cell,
             websocket,

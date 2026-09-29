@@ -2052,6 +2052,14 @@ impl LtxRepl {
                 "computed restore plan"
             );
         }
+        // Change export: every file the capture loop writes for this
+        // residency is reported to the cell's export stream.
+        let mut db = db;
+        if let Some(observer) =
+            crate::export_live::installed().and_then(|exporter| exporter.open_stream(cell, epoch))
+        {
+            db.set_capture_observer(observer);
+        }
         let mut replica = Replica::new(db, client.clone());
         if let Some(pos) = seed {
             replica.seed_pos(pos);
@@ -2396,6 +2404,24 @@ impl LtxRepl {
             .wait_for_durability_ticket(&handle, cell, epoch, ticket)
             .await?;
         Ok((position, source))
+    }
+
+    /// What a settled export ticket proved: `max(durable_txid,
+    /// shipped_txid)`, since a fleet proof advances only the shipped
+    /// watermark. `None` when the residency is gone.
+    pub fn export_proven_txid(&self, cell: &str, epoch: u64) -> Option<u64> {
+        let handle = self
+            .cells
+            .lock()
+            .unwrap()
+            .get(&(cell.to_string(), epoch))
+            .cloned()?;
+        Some(
+            handle
+                .durable_txid
+                .load(Ordering::SeqCst)
+                .max(handle.shipped_txid.load(Ordering::SeqCst)),
+        )
     }
 
     /// Prove that every write before handoff nomination reached either the

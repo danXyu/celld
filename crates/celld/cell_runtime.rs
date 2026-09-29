@@ -211,6 +211,11 @@ impl CellRuntime {
         }
     }
 
+    /// The TXID a settled export ticket proved, for change export.
+    pub fn export_proven_txid(&self, cell: &str, epoch: u64) -> Option<u64> {
+        self.replication.as_ref()?.export_proven_txid(cell, epoch)
+    }
+
     /// Activate a facet's stream and answer its database file.
     pub async fn open_facet(
         &self,

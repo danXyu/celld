@@ -112,6 +112,14 @@ impl CellHost {
         }
     }
 
+    pub(crate) fn export_proven_txid(&self, cell: &str, epoch: u64) -> Option<u64> {
+        match self {
+            Self::Engine(runtime) => runtime.export_proven_txid(cell, epoch),
+            #[cfg(all(test, celld_internal_tests))]
+            Self::Scripted(_) => None,
+        }
+    }
+
     pub(crate) async fn stop_cell(
         &self,
         cell: &str,
