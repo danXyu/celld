@@ -373,9 +373,17 @@ async fn exported_rows_match_the_restored_cell() {
     // Repair both streams from the same bucket at its head. The snapshot on
     // its own holds each cell's rows, and applied over the live records it
     // changes nothing and closes no gap that was not there.
-    let streams: Vec<celld_export_format::StreamId> = cells
+    // Cells a and b, told from the other cells by the rows they hold.
+    let streams: Vec<celld_export_format::StreamId> = [&live_a, &live_b]
         .iter()
-        .filter_map(|cell| {
+        .filter_map(|live| {
+            let cell = cells.iter().find(|cell| {
+                stream_state(&records, cell).is_some_and(|(state, _)| {
+                    exported_rows(&state, "items")
+                        == cell_rows(live, "items", &["id", "name", "qty"])
+                        && exported_rows(&state, "notes") == cell_rows(live, "notes", &["body"])
+                })
+            })?;
             records
                 .iter()
                 .find(|r| &r.envelope.stream.cell == cell)
