@@ -10,9 +10,17 @@ the row changes of its root cells through the bucket sink: Parquet objects
 under `export/changes/<node>/` in the bucket, released only after the
 change is durable and the node still owns the cell, and followed by
 watermarks that certify what the bucket holds. Facets, schema records,
-activation links, the `kv` mapping of `_cf_KV`, repair and the blob-stream
-sink are not built yet. A node with `CELLD_EXPORT_SINK=blob-stream` refuses
-to start.
+activation links, the `kv` mapping of `_cf_KV` and repair are not built
+yet.
+
+The blob-stream sink sends each record to a
+[blob-stream](https://github.com/bitdriftlabs/blob-stream) topic instead. Its
+client is behind the `export-blob-stream` Cargo feature, which a default
+build leaves out; a node without it refuses to start with
+`CELLD_EXPORT_SINK=blob-stream`. Build with
+`cargo build --features export-blob-stream` (the client's protobuf code
+generation needs `protoc` on the build machine). A node exports through one
+sink at a time: `bucket,blob-stream` refuses to start.
 
 Export is off by default, and the off state costs nothing: with
 `CELLD_EXPORT` unset or `0`, celld opens no capture session, holds no
@@ -38,7 +46,9 @@ relate one variable to another apply only with `CELLD_EXPORT=1`.
 | `CELLD_EXPORT_RETENTION` | `none` | `<n>d` makes the bucket sink delete its files after `n` days. `none` leaves the lifecycle to the consumer. |
 | `CELLD_EXPORT_TOPIC` | `celld-changes` | The blob-stream topic. |
 | `CELLD_EXPORT_BROKERS` | unset | Comma-separated `host:port` brokers, or `k8s://NAMESPACE/SERVICE`. Required when the blob-stream sink is on. |
-| `CELLD_EXPORT_WRITER_ID` | the node's zone | The blob-stream writer id. |
+| `CELLD_EXPORT_PARTITIONS` | unset | The topic's partition count, which every producer and consumer of the topic must agree on. Required when the blob-stream sink is on. |
+| `CELLD_EXPORT_WRITERS` | `1` | The topic's writer count, one per zone of the broker deployment. |
+| `CELLD_EXPORT_WRITER_ID` | `0` | The writer number of this node's zone, below `CELLD_EXPORT_WRITERS`. Required when there is more than one writer. |
 | `CELLD_EXPORT_RETRY_MS` | `30000` | The blob-stream retry deadline before a record counts as dropped. |
 | `CELLD_EXPORT_RECONCILE` | `24h` | The reconciler interval, as `<n>s`, `<n>m`, `<n>h`, or `<n>d`. The loader deployment runs the reconciler, not the node. |
 

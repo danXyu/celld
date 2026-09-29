@@ -172,7 +172,7 @@ pub struct Exporter {
 }
 
 impl Exporter {
-    /// Start the bucket sink and the delivery task, and install the
+    /// Start the configured sink and the delivery task, and install the
     /// exporter for the node. `ask` hands a ticket to the actor. Must run
     /// inside the node's runtime, before any cell activates.
     pub fn start(
@@ -181,29 +181,35 @@ impl Exporter {
         node: String,
         ask: impl Fn(TicketAsk) + Send + Sync + 'static,
     ) -> anyhow::Result<Arc<Exporter>> {
+        // Delivered positions are tracked for one sink; running both at once
+        // needs a position per sink.
         anyhow::ensure!(
-            !config.sinks.blob_stream,
-            "CELLD_EXPORT_SINK=blob-stream is not available in this build yet; use bucket"
+            !(config.sinks.bucket && config.sinks.blob_stream),
+            "CELLD_EXPORT_SINK=bucket,blob-stream is not supported yet; choose one sink"
         );
         let (outcomes_tx, outcomes_rx) = mpsc::unbounded_channel();
-        let sink = BucketSink::start(
-            bucket,
-            node.clone(),
-            BucketSinkConfig {
-                flush: config.flush,
-                flush_bytes: config.flush_bytes as u64,
-                retention: match config.retention {
-                    crate::telemetry::Retention::None => Retention::None,
-                    crate::telemetry::Retention::Days(days) => Retention::Days(days),
+        let sink: Arc<dyn ExportSink> = if config.sinks.blob_stream {
+            crate::export_blob_stream::start(&config, outcomes_tx)?
+        } else {
+            Arc::new(BucketSink::start(
+                bucket,
+                node.clone(),
+                BucketSinkConfig {
+                    flush: config.flush,
+                    flush_bytes: config.flush_bytes as u64,
+                    retention: match config.retention {
+                        crate::telemetry::Retention::None => Retention::None,
+                        crate::telemetry::Retention::Days(days) => Retention::Days(days),
+                    },
+                    ..BucketSinkConfig::default()
                 },
-                ..BucketSinkConfig::default()
-            },
-            outcomes_tx,
-        );
+                outcomes_tx,
+            ))
+        };
         let exporter = Arc::new(Exporter {
             node,
             config,
-            sink: Arc::new(sink),
+            sink,
             streams: Mutex::new(HashMap::new()),
             ask: Box::new(ask),
             next_seq: AtomicU64::new(1),
