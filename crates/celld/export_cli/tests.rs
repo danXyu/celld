@@ -147,65 +147,68 @@ fn positions_parse_as_reports_print_them() {
     }
 }
 
-#[tokio::test]
-async fn backfill_plans_every_cell_of_the_class_for_the_current_script() {
-    // The class walk pages through the store's paginated listing, which the
-    // local store serves.
-    let dir = tempfile::tempdir().unwrap();
-    let bucket = Bucket::open_dev(&dir.path().join("objects.sqlite3")).unwrap();
-    for scope in ["Cart:a", "Cart:b", "Cart:c", "Carton:z", "Other:q"] {
+#[test]
+fn backfill_plans_every_cell_of_the_class_for_the_current_script() {
+    crate::asyncrt::test_block_on(async {
+        // The class walk pages through the store's paginated listing, which the
+        // local store serves.
+        let dir = tempfile::tempdir().unwrap();
+        let bucket = Bucket::open_dev(&dir.path().join("objects.sqlite3")).unwrap();
+        for scope in ["Cart:a", "Cart:b", "Cart:c", "Carton:z", "Other:q"] {
+            bucket
+                .put(&format!("cells/{scope}/ltx/e1/0000.ltx"), vec![1])
+                .await
+                .unwrap();
+        }
         bucket
-            .put(&format!("cells/{scope}/ltx/e1/0000.ltx"), vec![1])
-            .await
-            .unwrap();
-    }
-    bucket
         .put(
             "deploy/current.json",
             br#"{"script_name":"shop","version":"v1","prefix":"deploy/shop/v1","rollout":{"percent":100}}"#.to_vec(),
         )
         .await
         .unwrap();
-    let options = snapshot_options(
-        Mode::Backfill,
-        args(&["--class", "Cart", "--after", "Cart:a"]),
-    )
-    .unwrap()
-    .unwrap();
-    let jobs = plan(&options, &bucket).await.unwrap();
-    let cells: Vec<_> = jobs.iter().map(|j| j.stream.cell.as_str()).collect();
-    assert_eq!(cells, ["Cart:b", "Cart:c"]);
-    for job in &jobs {
-        assert_eq!(job.stream.script, "shop");
-        assert_eq!(job.stream.class, "Cart");
-        assert_eq!(job.target, Target::Head);
-    }
-
-    // --script wins over the pointer.
-    let options = snapshot_options(
-        Mode::Repair,
-        args(&["--stream", "Cart:a", "--script", "other"]),
-    )
-    .unwrap()
-    .unwrap();
-    let jobs = plan(&options, &bucket).await.unwrap();
-    assert_eq!(jobs[0].stream.script, "other");
-    assert_eq!(jobs[0].target, Target::Head);
-
-    // Without either, the command says what to pass.
-    let empty = self::bucket();
-    let options = snapshot_options(Mode::Repair, args(&["--stream", "Cart:a"]))
+        let options = snapshot_options(
+            Mode::Backfill,
+            args(&["--class", "Cart", "--after", "Cart:a"]),
+        )
         .unwrap()
         .unwrap();
-    let error = plan(&options, &empty).await.unwrap_err();
-    assert!(format!("{error:#}").contains("--script"), "{error:#}");
+        let jobs = plan(&options, &bucket).await.unwrap();
+        let cells: Vec<_> = jobs.iter().map(|j| j.stream.cell.as_str()).collect();
+        assert_eq!(cells, ["Cart:b", "Cart:c"]);
+        for job in &jobs {
+            assert_eq!(job.stream.script, "shop");
+            assert_eq!(job.stream.class, "Cart");
+            assert_eq!(job.target, Target::Head);
+        }
+
+        // --script wins over the pointer.
+        let options = snapshot_options(
+            Mode::Repair,
+            args(&["--stream", "Cart:a", "--script", "other"]),
+        )
+        .unwrap()
+        .unwrap();
+        let jobs = plan(&options, &bucket).await.unwrap();
+        assert_eq!(jobs[0].stream.script, "other");
+        assert_eq!(jobs[0].target, Target::Head);
+
+        // Without either, the command says what to pass.
+        let empty = self::bucket();
+        let options = snapshot_options(Mode::Repair, args(&["--stream", "Cart:a"]))
+            .unwrap()
+            .unwrap();
+        let error = plan(&options, &empty).await.unwrap_err();
+        assert!(format!("{error:#}").contains("--script"), "{error:#}");
+    });
 }
 
-#[tokio::test]
-async fn a_gaps_file_plans_repair_through_its_bounds_and_backfill_at_the_head() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("gaps.jsonl");
-    std::fs::write(
+#[test]
+fn a_gaps_file_plans_repair_through_its_bounds_and_backfill_at_the_head() {
+    crate::asyncrt::test_block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gaps.jsonl");
+        std::fs::write(
         &path,
         concat!(
             r#"{"SCRIPT":"shop","CLASS":"Cart","CELL":"Cart:a","FACET":"","INCARNATION":0,"GAP_KIND":"gap","BOUND_EPOCH":2,"BOUND_TXID":5}"#,
@@ -215,34 +218,35 @@ async fn a_gaps_file_plans_repair_through_its_bounds_and_backfill_at_the_head() 
         ),
     )
     .unwrap();
-    let path = path.to_str().unwrap();
-    let bucket = bucket();
+        let path = path.to_str().unwrap();
+        let bucket = bucket();
 
-    let options = snapshot_options(Mode::Repair, args(&["--gaps", path]))
-        .unwrap()
-        .unwrap();
-    let jobs = plan(&options, &bucket).await.unwrap();
-    assert_eq!(jobs.len(), 2);
-    assert_eq!(jobs[0].stream.cell, "Book:x");
-    assert_eq!(jobs[0].target, Target::Head);
-    assert_eq!(
-        jobs[1].target,
-        Target::AtOrAfter(export_restore::Position { epoch: 2, txid: 5 })
-    );
+        let options = snapshot_options(Mode::Repair, args(&["--gaps", path]))
+            .unwrap()
+            .unwrap();
+        let jobs = plan(&options, &bucket).await.unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0].stream.cell, "Book:x");
+        assert_eq!(jobs[0].target, Target::Head);
+        assert_eq!(
+            jobs[1].target,
+            Target::AtOrAfter(export_restore::Position { epoch: 2, txid: 5 })
+        );
 
-    let options = snapshot_options(Mode::Repair, args(&["--gaps", path, "--class", "Cart"]))
-        .unwrap()
-        .unwrap();
-    assert_eq!(plan(&options, &bucket).await.unwrap().len(), 1);
+        let options = snapshot_options(Mode::Repair, args(&["--gaps", path, "--class", "Cart"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan(&options, &bucket).await.unwrap().len(), 1);
 
-    let options = snapshot_options(Mode::Backfill, args(&["--gaps", path]))
-        .unwrap()
-        .unwrap();
-    assert!(plan(&options, &bucket)
-        .await
-        .unwrap()
-        .iter()
-        .all(|j| j.target == Target::Head));
+        let options = snapshot_options(Mode::Backfill, args(&["--gaps", path]))
+            .unwrap()
+            .unwrap();
+        assert!(plan(&options, &bucket)
+            .await
+            .unwrap()
+            .iter()
+            .all(|j| j.target == Target::Head));
+    });
 }
 
 fn record(cell: &str, kind_gap: bool, txid: u64, origin: Origin) -> Record {
@@ -324,79 +328,81 @@ fn inspect_options_select_objects_and_filter_records() {
     }
 }
 
-#[tokio::test]
-async fn inspect_lists_bounded_pages_and_decodes_records() {
-    let bucket = bucket();
-    let keys = [
-        "export/changes/n1/2026/09/29/01/1-a.parquet",
-        "export/changes/n1/2026/09/29/02/2-b.parquet",
-        "export/changes/n1/2026/09/29/02/3-c.parquet",
-        "export/changes/n2/2026/09/29/02/4-d.parquet",
-    ];
-    for (i, key) in keys.iter().enumerate() {
-        let body = crate::export_sink::encode_records(vec![
-            record("Cart:a", true, i as u64 + 1, Origin::Live),
-            record("Cart:b", false, i as u64 + 1, Origin::Live),
-        ])
-        .unwrap();
-        bucket.put(key, body).await.unwrap();
-    }
-    bucket
-        .put("export/changes/n1/not-an-object.txt", vec![0])
-        .await
-        .unwrap();
+#[test]
+fn inspect_lists_bounded_pages_and_decodes_records() {
+    crate::asyncrt::test_block_on(async {
+        let bucket = bucket();
+        let keys = [
+            "export/changes/n1/2026/09/29/01/1-a.parquet",
+            "export/changes/n1/2026/09/29/02/2-b.parquet",
+            "export/changes/n1/2026/09/29/02/3-c.parquet",
+            "export/changes/n2/2026/09/29/02/4-d.parquet",
+        ];
+        for (i, key) in keys.iter().enumerate() {
+            let body = crate::export_sink::encode_records(vec![
+                record("Cart:a", true, i as u64 + 1, Origin::Live),
+                record("Cart:b", false, i as u64 + 1, Origin::Live),
+            ])
+            .unwrap();
+            bucket.put(key, body).await.unwrap();
+        }
+        bucket
+            .put("export/changes/n1/not-an-object.txt", vec![0])
+            .await
+            .unwrap();
 
-    let mut options = inspect_options(args(&["--node", "n1", "--objects", "2"]))
-        .unwrap()
-        .unwrap();
-    let (page, more) = list_objects(&bucket, &options).await.unwrap();
-    assert_eq!(page, keys[..2]);
-    assert!(more);
-    options.after = Some(page[1].clone());
-    let (page, more) = list_objects(&bucket, &options).await.unwrap();
-    assert_eq!(page, keys[2..3]);
-    assert!(!more);
+        let mut options = inspect_options(args(&["--node", "n1", "--objects", "2"]))
+            .unwrap()
+            .unwrap();
+        let (page, more) = list_objects(&bucket, &options).await.unwrap();
+        assert_eq!(page, keys[..2]);
+        assert!(more);
+        options.after = Some(page[1].clone());
+        let (page, more) = list_objects(&bucket, &options).await.unwrap();
+        assert_eq!(page, keys[2..3]);
+        assert!(!more);
 
-    let options = inspect_options(args(&["--node", "n1", "--hour", "2026/09/29/02"]))
-        .unwrap()
-        .unwrap();
-    let (page, _) = list_objects(&bucket, &options).await.unwrap();
-    assert_eq!(page, keys[1..3]);
+        let options = inspect_options(args(&["--node", "n1", "--hour", "2026/09/29/02"]))
+            .unwrap()
+            .unwrap();
+        let (page, _) = list_objects(&bucket, &options).await.unwrap();
+        assert_eq!(page, keys[1..3]);
 
-    // Every record, tagged with its object, reads back as a record.
-    let mut out = Vec::new();
-    let mut summary = Summary::default();
-    let (bytes, _) = bucket.get(keys[0]).await.unwrap().unwrap();
-    let records = crate::export_sink::decode_records(bytes.to_vec()).unwrap();
-    emit(&mut out, &options, &mut summary, keys[0], records.clone()).unwrap();
-    let lines: Vec<serde_json::Value> = String::from_utf8(out)
-        .unwrap()
-        .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect();
-    assert_eq!(lines.len(), 2);
-    assert_eq!(lines[0]["object"], keys[0]);
-    assert_eq!(
-        Record::from_json(lines[1].to_string().as_bytes()).unwrap(),
-        records[1]
-    );
-
-    // The summary counts per stream instead.
-    let options = inspect_options(args(&["--summary", "--cell", "Cart:a"]))
-        .unwrap()
-        .unwrap();
-    let mut out = Vec::new();
-    for key in keys {
-        let (bytes, _) = bucket.get(key).await.unwrap().unwrap();
+        // Every record, tagged with its object, reads back as a record.
+        let mut out = Vec::new();
+        let mut summary = Summary::default();
+        let (bytes, _) = bucket.get(keys[0]).await.unwrap().unwrap();
         let records = crate::export_sink::decode_records(bytes.to_vec()).unwrap();
-        emit(&mut out, &options, &mut summary, key, records).unwrap();
-    }
-    assert!(out.is_empty());
-    let a = &summary.streams[&crate::export_repair::root_stream("shop", "Cart:a").unwrap()];
-    // One from the earlier non-summary pass is not counted; four here.
-    assert_eq!(a.records, 4);
-    assert_eq!(a.kinds["gap"], 4);
-    assert_eq!(a.first, Some(Position::new(1, 1, 1)));
-    assert_eq!(a.last, Some(Position::new(1, 4, 1)));
-    assert_eq!(summary.streams.len(), 1);
+        emit(&mut out, &options, &mut summary, keys[0], records.clone()).unwrap();
+        let lines: Vec<serde_json::Value> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["object"], keys[0]);
+        assert_eq!(
+            Record::from_json(lines[1].to_string().as_bytes()).unwrap(),
+            records[1]
+        );
+
+        // The summary counts per stream instead.
+        let options = inspect_options(args(&["--summary", "--cell", "Cart:a"]))
+            .unwrap()
+            .unwrap();
+        let mut out = Vec::new();
+        for key in keys {
+            let (bytes, _) = bucket.get(key).await.unwrap().unwrap();
+            let records = crate::export_sink::decode_records(bytes.to_vec()).unwrap();
+            emit(&mut out, &options, &mut summary, key, records).unwrap();
+        }
+        assert!(out.is_empty());
+        let a = &summary.streams[&crate::export_repair::root_stream("shop", "Cart:a").unwrap()];
+        // One from the earlier non-summary pass is not counted; four here.
+        assert_eq!(a.records, 4);
+        assert_eq!(a.kinds["gap"], 4);
+        assert_eq!(a.first, Some(Position::new(1, 1, 1)));
+        assert_eq!(a.last, Some(Position::new(1, 4, 1)));
+        assert_eq!(summary.streams.len(), 1);
+    });
 }
