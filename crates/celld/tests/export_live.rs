@@ -39,6 +39,24 @@ export class Items {
     const url = new URL(request.url);
     const op = url.searchParams.get("op");
     const id = Number(url.searchParams.get("id"));
+    if (op === "ddl") {
+      // Schema changes, including deleteAll()'s drops, which run with the
+      // SQL authorizer off.
+      const step = url.searchParams.get("step");
+      if (step === "create") {
+        this.sql.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
+        this.sql.exec("INSERT INTO t VALUES (1, 'one'), (2, 'two')");
+      } else if (step === "alter") {
+        this.sql.exec("ALTER TABLE t ADD COLUMN w INTEGER DEFAULT 5");
+      } else if (step === "wipe") {
+        await this.storage.deleteAll();
+        return Response.json({});
+      } else if (step === "again") {
+        this.sql.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
+        this.sql.exec("INSERT INTO t VALUES (3, 'three')");
+      }
+      return Response.json({ t: this.sql.exec("SELECT * FROM t ORDER BY id").toArray() });
+    }
     if (op === "put") {
       this.sql.exec(
         "INSERT INTO items(id, name, qty) VALUES(?, ?, ?) " +
@@ -268,6 +286,10 @@ async fn exported_rows_match_the_restored_cell() {
         "cell=a&op=delete&id=2",
         "cell=b&op=put&id=2&name=kiwi&qty=0.5",
         "cell=b&op=delete&id=1",
+        "cell=c&op=ddl&step=create",
+        "cell=c&op=ddl&step=alter",
+        "cell=c&op=ddl&step=wipe",
+        "cell=c&op=ddl&step=again",
     ] {
         dev.call(&client, query).await;
     }
@@ -309,7 +331,26 @@ async fn exported_rows_match_the_restored_cell() {
                 })
             })
         });
-        if done {
+        // Cell c: `t` was created, altered, dropped by deleteAll() along
+        // with the constructor's tables, and created again. Only the third
+        // generation's row is live; nothing of the first two resurrects.
+        let recreated = cells.iter().any(|cell| {
+            stream_state(&records, cell).is_some_and(|(state, newest)| {
+                let open: Vec<(&str, u64)> = state
+                    .tables
+                    .keys()
+                    .map(|tg| (tg.table.as_str(), tg.generation))
+                    .collect();
+                open == [("t", 3)]
+                    && exported_rows(&state, "t").len() == 1
+                    && exported_rows(&state, "t")["3"]
+                        == [serde_json::json!(3.0), serde_json::json!("three")]
+                    && state.certified_head() == Some(newest)
+                    && state.gaps.is_empty()
+                    && state.uncertain.is_empty()
+            })
+        });
+        if done && recreated {
             break records;
         }
         assert!(

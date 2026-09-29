@@ -53,8 +53,8 @@ use crate::export_sink::{
 };
 use crate::storage::export_capture::{CapturedCommit, WalStamp};
 use celld_export_format::{
-    split, Body, BulkBody, Envelope, GapBody, Origin, Position, Record, RowsBody, Split, StreamId,
-    TableGen, WatermarkBody,
+    split, Body, BulkBody, Envelope, GapBody, Origin, Position, Record, RowsBody, SchemaBody,
+    SnapshotBody, SnapshotEndBody, SnapshotScope, Split, StreamId, TableGen, WatermarkBody,
 };
 use celld_logic::export::{Attribution, Capture, CapturedWal, Released, WalGeneration, WalPoint};
 use celld_logic::RequestError;
@@ -383,14 +383,22 @@ fn capture_of(file: &celld_ltx::CapturedFile) -> Capture {
     }
 }
 
-/// Encoded size of a commit's rows, for the queue budget.
+/// Encoded size of a commit's rows, snapshots and schema records, for the
+/// queue budget.
 fn encoded_bytes(commit: &CapturedCommit) -> u64 {
+    let snapshots = commit.snapshot.iter().flat_map(|s| s.tables.iter());
     let rows: usize = commit
         .tables
         .iter()
+        .chain(snapshots)
         .map(|table| serde_json::to_vec(table).map_or(0, |bytes| bytes.len()))
         .sum();
-    (rows + 64 * commit.bulk.len() + 256) as u64
+    let schemas: usize = commit
+        .schemas
+        .iter()
+        .map(|schema| serde_json::to_vec(schema).map_or(0, |bytes| bytes.len()))
+        .sum();
+    (rows + schemas + 64 * commit.bulk.len() + 256) as u64
 }
 
 /// The attribution and release of one cell residency.
@@ -639,6 +647,59 @@ impl Stream {
                         self.exporter
                             .envelope(&self.identity, position, payload.committed_at);
                     let mut bulk: Vec<TableGen> = payload.bulk;
+                    // Definitions first, so a consumer reading the commit in
+                    // order meets a generation before its rows.
+                    records.extend(
+                        payload
+                            .schemas
+                            .into_iter()
+                            .map(|schema: SchemaBody| Record {
+                                envelope: envelope.clone(),
+                                body: Body::Schema(schema),
+                            }),
+                    );
+                    if let Some(snapshot) = payload.snapshot {
+                        let mut covered = Vec::new();
+                        let mut count = 0u64;
+                        for table in snapshot.tables {
+                            let record = Record {
+                                envelope: envelope.clone(),
+                                body: Body::Snapshot(SnapshotBody {
+                                    snapshot_id: snapshot.id.clone(),
+                                    data: table,
+                                }),
+                            };
+                            match split(record, max_record) {
+                                Split::Fragments(fragments) => {
+                                    if let Some(Body::Snapshot(first)) =
+                                        fragments.first().map(|f| &f.body)
+                                    {
+                                        covered.push(first.data.table_gen());
+                                    }
+                                    count += 1;
+                                    records.extend(fragments);
+                                }
+                                // A row too large for any record: the table
+                                // leaves the snapshot and is unknown instead.
+                                Split::Bulk(record) => {
+                                    if let Body::Bulk(body) = record.body {
+                                        bulk.extend(body.tables);
+                                    }
+                                }
+                            }
+                        }
+                        if !covered.is_empty() {
+                            records.push(Record {
+                                envelope: envelope.clone(),
+                                body: Body::SnapshotEnd(SnapshotEndBody {
+                                    snapshot_id: snapshot.id,
+                                    scope: SnapshotScope::Tables,
+                                    tables: covered,
+                                    records: count,
+                                }),
+                            });
+                        }
+                    }
                     for table in payload.tables {
                         let record = Record {
                             envelope: envelope.clone(),
