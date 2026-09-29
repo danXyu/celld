@@ -31,6 +31,7 @@ anyhow.workspace = true
 axum.workspace = true
 base64.workspace = true
 bytes.workspace = true
+celld-export-format.workspace = true
 celld-logic.workspace = true
 celld-ltx = { workspace = true, features = ["s3"] }
 encoding_rs.workspace = true
@@ -94,3 +95,4 @@ nix.workspace = true
 
 [dev-dependencies]
 lz4_flex.workspace = true
+proptest.workspace = true
