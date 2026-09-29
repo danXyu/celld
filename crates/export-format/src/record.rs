@@ -344,6 +344,12 @@ pub struct RecoveredBody {
 /// absent it names the record's own stream and takes effect at its position.
 /// With them present it is emitted on the root's stream and names the facet
 /// stream, with `subtree` extending it to every facet below that path.
+///
+/// A node's facet delete sets `through_incarnation` instead of
+/// `incarnation`: it removes every stream at the path (and below it, with
+/// `subtree`) whose incarnation is at or below the bound. Facet
+/// incarnations are ordered, so a facet recreated after the delete, at the
+/// path or below it, has a larger incarnation and is not removed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeletedBody {
     #[serde(
@@ -360,6 +366,8 @@ pub struct DeletedBody {
     pub incarnation: Option<u64>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub subtree: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub through_incarnation: Option<u64>,
 }
 
 /// Certifies a delivered position. `commits` and `records` count what lies

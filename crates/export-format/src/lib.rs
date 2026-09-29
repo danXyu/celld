@@ -19,7 +19,9 @@
 //! - a `watermark` carries `from` and `through` positions with its counts,
 //!   and a watermark with no `from` counts from the start of its epoch;
 //! - a `deleted` record naming a facet carries `target_facet`,
-//!   `target_incarnation`, and `subtree`, since it rides the root's stream.
+//!   `target_incarnation`, and `subtree`, since it rides the root's stream;
+//!   a node's facet delete carries `through_incarnation`, a bound on the
+//!   ordered incarnations it removed, in place of `target_incarnation`.
 //!
 //! Pure: no I/O, clocks, or randomness.
 
