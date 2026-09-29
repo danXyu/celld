@@ -142,6 +142,10 @@ BEGIN
 END;
 $$;
 
+-- statement: resume_route_task
+-- A new task starts suspended. The deploying role needs EXECUTE TASK.
+ALTER TASK EXPORT_ROUTE RESUME;
+
 -- statement: erase_tombstoned
 -- The erase task's statements: delete a tombstoned stream's rows. Time
 -- travel on these tables is one day, so the rows are gone a day later.
@@ -169,3 +173,6 @@ BEGIN
     {{ERASE_TOMBSTONED_META}};
 END;
 $$;
+
+-- statement: resume_erase_task
+ALTER TASK EXPORT_ERASE RESUME;

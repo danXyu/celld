@@ -291,3 +291,23 @@ def test_erasure(warehouse, scenarios):
     assert not warehouse.rows("SELECT * FROM CELL_CHANGES WHERE cell = 'r3'")
     assert not warehouse.rows("SELECT * FROM CELL_META WHERE cell = 'r3'")
     assert warehouse.rows("SELECT * FROM CELL_CHANGES WHERE cell = 'r2'")
+
+
+def test_bulk_only_generation_needs_repair(warehouse):
+    # The table's first record is `bulk`: no schema or rows have arrived. The
+    # repair driver must still see the generation. The reference consumer
+    # only tracks generations it has seen rows or schema for, so this case
+    # is checked on its own.
+    bulk = {
+        "kind": "bulk", "script": "app", "class": "Room", "cell": "r9",
+        "cell_name": None, "facet": None, "incarnation": 1,
+        "epoch": 1, "txid": 1, "commit": 1, "committed_at": 1790000000000,
+        "node": "node-a", "origin": "live", "fragment": 1, "fragments": 1,
+        "body": json.dumps({"tables": [{"table": "items", "generation": 1}]}),
+    }
+    load(warehouse, {"tombstones": [], "stage_rows": [bulk], "dynamic_tables": []})
+    assert warehouse.run("SELECT kind FROM CELL_META") == [("bulk",)]
+    gaps = warehouse.rows("SELECT * FROM EXPORT_GAPS")
+    assert [(g["gap_kind"], g["cell"], g["table_name"], int(g["generation"])) for g in gaps] == [
+        ("bulk", "r9", "items", 1)
+    ]

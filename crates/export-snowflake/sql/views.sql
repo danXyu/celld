@@ -215,6 +215,14 @@ seen AS (
     UNION ALL
     SELECT script, class, cell, facet, incarnation, table_name, generation, position_key
     FROM schemas
+    UNION ALL
+    -- A generation whose first record is `bulk` exists too: it needs a
+    -- snapshot even when no schema or row record for it has arrived.
+    SELECT
+        m.script, m.class, m.cell, m.facet, m.incarnation,
+        t.value:table::STRING, t.value:generation::NUMBER(20, 0), m.position_key
+    FROM CELL_META_CURRENT m, LATERAL FLATTEN(input => m.body:tables) t
+    WHERE m.kind = 'bulk'
 ),
 opened AS (
     SELECT

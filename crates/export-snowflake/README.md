@@ -20,7 +20,8 @@ renders it; it connects to nothing. The loader deploys it and runs it.
    or split, hence the landing table.
 3. The route task reads new landed rows through a stream and, in one
    transaction, puts `rows` and `snapshot` records into `CELL_CHANGES` and
-   the rest into `CELL_META`, dropping tombstoned streams.
+   the rest into `CELL_META`, dropping tombstoned streams. Setup resumes the
+   route and erase tasks, which Snowflake creates suspended.
 4. The views derive current state from the two tables, dropping duplicates
    and incomplete fragments, the way the reference consumer in
    `crates/export-format` does. `EXPORT_GAPS` is what the repair driver polls.
@@ -38,7 +39,8 @@ renders it; it connects to nothing. The loader deploys it and runs it.
   `_CF_COLUMNS` carry every row exactly as exported. NUMERIC affinity, no
   declared type, and a type that changes across generations are VARIANT.
 - `EXPORT_GAPS` also lists table generations a `bulk` record left unknown,
-  since those need a repair snapshot too.
+  since those need a repair snapshot too, including a generation whose
+  only record so far is the `bulk`.
 
 ## Tests
 

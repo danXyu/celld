@@ -271,10 +271,25 @@ mod tests {
         for s in &all {
             assert!(!s.sql.contains("{{"), "{}: {}", s.name, s.sql);
         }
+        let pos = |n: &str| all.iter().position(|s| s.name == n).unwrap();
         let task = all.iter().find(|s| s.name == "export_route_task").unwrap();
         let route = statement(LOAD_SQL, "route_changes").unwrap();
         assert!(task.sql.contains(&route.sql));
         assert!(task.sql.contains("WAREHOUSE = EXPORT_WH"));
+        // Tasks start suspended; setup resumes each after creating it.
+        for (task, resume) in [
+            ("export_route_task", "resume_route_task"),
+            ("export_erase_task", "resume_erase_task"),
+        ] {
+            assert!(pos(task) < pos(resume));
+        }
+        assert_eq!(
+            all.iter()
+                .find(|s| s.name == "resume_route_task")
+                .unwrap()
+                .sql,
+            "ALTER TASK EXPORT_ROUTE RESUME"
+        );
         let pipe = all.iter().find(|s| s.name == "export_pipe").unwrap();
         assert!(pipe
             .sql
@@ -284,7 +299,6 @@ mod tests {
             .sql
             .contains("URL = 's3://fleet-bucket/export/changes/'"));
         // Tables first, then loading, then views that read both.
-        let pos = |n: &str| all.iter().position(|s| s.name == n).unwrap();
         assert!(pos("cell_changes") < pos("export_route_task"));
         assert!(pos("export_route_task") < pos("cell_streams"));
     }
