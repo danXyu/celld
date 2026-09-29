@@ -95,3 +95,4 @@ nix.workspace = true
 
 [dev-dependencies]
 lz4_flex.workspace = true
+proptest.workspace = true

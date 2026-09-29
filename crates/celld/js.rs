@@ -3593,6 +3593,7 @@ impl InFlight {
                 counts_against_limit,
             );
         }
+        storage::export_checkpoint();
     }
 
     /// Whether a claimed alarm's outcome is still unrecorded. True only
@@ -6394,6 +6395,10 @@ macro_rules! ops {
                     }
                     let before = asyncrt::spawn_count();
                     $op(scope, args, rv);
+                    // Change export pulls the cells this op wrote. There is
+                    // no single place storage calls return, so every op
+                    // ends at the check point.
+                    storage::export_checkpoint();
                     if asyncrt::spawn_count() != before {
                         if let Some(owner) = operation_continuation_id(scope) {
                             asyncrt::attribute_spawns(before, owner);

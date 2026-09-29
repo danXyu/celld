@@ -365,6 +365,7 @@ dependencies = [
  "pbkdf2",
  "percent-encoding",
  "pkcs8",
+ "proptest",
  "rand 0.8.7",
  "regex",
  "reqwest",
