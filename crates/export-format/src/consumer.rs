@@ -178,7 +178,7 @@ impl Consumer {
         let gone = self.facet_deletions();
         self.records
             .keys()
-            .filter(|s| !gone.contains(*s) && !self.adopted(s))
+            .filter(|s| !gone.contains(*s) && !self.fully_adopted(s))
             .map(|s| (s.clone(), derive(&self.records_of(s))))
             .collect()
     }
@@ -193,12 +193,14 @@ impl Consumer {
     }
 
     /// A stream's own records and the scriptless `recovered` records that
-    /// apply to it.
+    /// apply to it. A scriptless stream keeps only the records no other
+    /// stream adopted.
     fn records_of(&self, stream: &StreamId) -> Vec<&Record> {
-        let mut out: Vec<&Record> = self.records.get(stream).into_iter().flatten().collect();
+        let own = self.records.get(stream).into_iter().flatten();
         if stream.script.is_empty() {
-            return out;
+            return own.filter(|r| !self.adopted(stream, r)).collect();
         }
+        let mut out: Vec<&Record> = own.collect();
         for (s, rs) in self.records.iter().filter(|(s, _)| s.script.is_empty()) {
             out.extend(rs.iter().filter(|r| match &r.body {
                 Body::Recovered(b) => stream.recovered_matches(s, &b.head, self.records.keys()),
@@ -208,18 +210,22 @@ impl Consumer {
         out
     }
 
-    /// A scriptless stream whose records are all `recovered` records that
-    /// apply to other streams.
-    fn adopted(&self, stream: &StreamId) -> bool {
-        stream.script.is_empty()
-            && self.records[stream].iter().all(|r| match &r.body {
-                Body::Recovered(b) => self
-                    .records
-                    .keys()
-                    .filter(|s| !s.script.is_empty())
-                    .any(|s| s.recovered_matches(stream, &b.head, self.records.keys())),
-                _ => false,
-            })
+    /// A record of the scriptless stream `stream` that is a `recovered`
+    /// record applying to a stream with a script.
+    fn adopted(&self, stream: &StreamId, record: &Record) -> bool {
+        match &record.body {
+            Body::Recovered(b) => self
+                .records
+                .keys()
+                .filter(|s| !s.script.is_empty())
+                .any(|s| s.recovered_matches(stream, &b.head, self.records.keys())),
+            _ => false,
+        }
+    }
+
+    /// A scriptless stream every record of which another stream adopted.
+    fn fully_adopted(&self, stream: &StreamId) -> bool {
+        stream.script.is_empty() && self.records[stream].iter().all(|r| self.adopted(stream, r))
     }
 }
 

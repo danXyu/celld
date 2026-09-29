@@ -295,12 +295,18 @@ impl ConsumerView for BucketConsumer {
     }
 
     async fn recovered(&self) -> anyhow::Result<Vec<RecoveredSession>> {
-        let mut sessions: BTreeMap<&str, (u64, BTreeSet<(&str, u64)>, bool)> = BTreeMap::new();
+        // A recovered cell epoch is its cell, facet path and epoch.
+        type Held<'a> = BTreeSet<(&'a str, Option<&'a str>, u64)>;
+        let mut sessions: BTreeMap<&str, (u64, Held<'_>, bool)> = BTreeMap::new();
         for r in &self.records {
             if let Body::Recovered(b) = &r.body {
                 let s = sessions.entry(b.session.as_str()).or_default();
                 s.0 = s.0.max(b.cells);
-                s.1.insert((r.stream().cell.as_str(), b.head.epoch));
+                s.1.insert((
+                    r.stream().cell.as_str(),
+                    r.stream().facet.as_deref(),
+                    b.head.epoch,
+                ));
                 s.2 |= b.loss;
             }
         }

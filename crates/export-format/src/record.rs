@@ -22,9 +22,10 @@ pub struct StreamId {
 impl StreamId {
     /// True when a `recovered` record of `recovered` applies to this stream,
     /// among the streams `candidates` the consumer holds. The record's own
-    /// stream names no script or incarnation (see [`RecoveredBody`]), so it
-    /// applies to the root stream of its class and cell whose incarnation is
-    /// the newest at or below the recovered epoch.
+    /// stream names no script or incarnation (see [`RecoveredBody`]), so for
+    /// a root it applies to the stream of its class and cell whose
+    /// incarnation is the newest at or below the recovered epoch, and for a
+    /// facet to every stream of its class, cell and facet path.
     pub fn recovered_matches<'a>(
         &self,
         recovered: &StreamId,
@@ -32,14 +33,20 @@ impl StreamId {
         candidates: impl IntoIterator<Item = &'a StreamId>,
     ) -> bool {
         let fits = |s: &StreamId| {
-            s.facet.is_none()
+            s.facet == recovered.facet
                 && s.class == recovered.class
                 && s.cell == recovered.cell
-                && s.incarnation <= head.epoch
+                && (s.facet.is_some() || s.incarnation <= head.epoch)
                 && (recovered.script.is_empty() || s.script == recovered.script)
         };
         if !fits(self) {
             return false;
+        }
+        // A facet's incarnation is a random stamp, not an epoch, so the
+        // record applies to every incarnation at its path; a deleted one is
+        // removed by its `deleted` record anyway.
+        if self.facet.is_some() {
+            return true;
         }
         candidates
             .into_iter()
@@ -360,10 +367,12 @@ pub struct LinkBody {
 /// bundles or follower tails, so a cell the session wrote and had already
 /// folded gets no record; the reconciler is the bound for those.
 ///
-/// Recovery does not know a cell's script or first epoch. The envelope
-/// carries an empty `script` and incarnation 0, and a consumer applies the
-/// record to the root stream of the same class and cell whose incarnation is
-/// the newest at or below `head.epoch` ([`StreamId::recovered_matches`]).
+/// Recovery does not know a cell's script or incarnation. The envelope
+/// carries an empty `script` and incarnation 0, and the root's class and
+/// cell with the facet path for a facet. A consumer applies a root's record
+/// to the root stream whose incarnation is the newest at or below
+/// `head.epoch`, and a facet's to every stream at that facet path
+/// ([`StreamId::recovered_matches`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveredBody {
     /// The dead session, `<node>/<generation>`.
