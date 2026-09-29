@@ -70,7 +70,7 @@ use celld_export_format::{
 use celld_logic::export::{Attribution, Capture, CapturedWal, Released, WalGeneration, WalPoint};
 use celld_logic::RequestError;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -104,11 +104,19 @@ enum Input {
     Identity {
         script: String,
     },
-    /// A pulled commit and the committed-write position after it.
+    /// A pulled commit and the committed-write position after it. `bytes`
+    /// is already reserved against the queue budget.
     Commit {
         stamp: WalStamp,
         position: u64,
+        bytes: u64,
         commit: CapturedCommit,
+    },
+    /// A pulled commit the cell thread shed because the queue was over
+    /// budget. It keeps its place in commit order as a gap.
+    Shed {
+        stamp: WalStamp,
+        position: u64,
     },
     CaughtUp,
     Captured(Capture),
@@ -139,6 +147,7 @@ pub(crate) fn facet_path<'a>(root: &str, stream: &'a str) -> Option<&'a str> {
 /// The cell thread's handle on its stream.
 #[derive(Clone)]
 pub(crate) struct CellStream {
+    exporter: Arc<Exporter>,
     tx: mpsc::UnboundedSender<Input>,
     denied: HashSet<String>,
 }
@@ -149,12 +158,29 @@ impl CellStream {
         self.denied.clone()
     }
 
+    /// Queue a pulled commit, or, when the shared budget cannot hold its
+    /// rows, a gap in its place. The budget is charged here, before the
+    /// rows wait on the FIFO, so a stream that falls behind cannot hold
+    /// more than the budget.
     pub(crate) fn commit(&self, stamp: WalStamp, position: u64, commit: CapturedCommit) {
-        let _ = self.tx.send(Input::Commit {
-            stamp,
-            position,
-            commit,
-        });
+        let bytes = encoded_bytes(&commit);
+        let input = if self.exporter.reserve(bytes) {
+            Input::Commit {
+                stamp,
+                position,
+                bytes,
+                commit,
+            }
+        } else {
+            self.exporter
+                .counters
+                .dropped_records
+                .fetch_add(1, Ordering::Relaxed);
+            Input::Shed { stamp, position }
+        };
+        if let Err(mpsc::error::SendError(Input::Commit { bytes, .. })) = self.tx.send(input) {
+            self.exporter.release_queued(bytes);
+        }
     }
 
     pub(crate) fn caught_up(&self) {
@@ -165,6 +191,9 @@ impl CellStream {
 /// Counters for `/state`.
 #[derive(Default)]
 struct Counters {
+    /// Commits on a stream's FIFO, charged when the cell thread queues them.
+    queued_bytes: AtomicU64,
+    /// Commits waiting in a stream's attribution for a proof.
     pending_bytes: AtomicU64,
     pending_commits: AtomicU64,
     dropped_records: AtomicU64,
@@ -196,6 +225,9 @@ pub struct Exporter {
     ask: Box<dyn Fn(TicketAsk) + Send + Sync>,
     next_seq: AtomicU64,
     submitted: Mutex<HashMap<u64, Submitted>>,
+    /// Set while the delivery task handles a batch of results, which can
+    /// submit watermarks and gaps of its own.
+    delivering: AtomicBool,
     counters: Counters,
 }
 
@@ -228,21 +260,31 @@ impl Exporter {
             },
             outcomes_tx,
         );
-        let exporter = Arc::new(Exporter {
-            node,
-            config,
-            sink: Arc::new(sink),
-            streams: Mutex::new(HashMap::new()),
-            ask: Box::new(ask),
-            next_seq: AtomicU64::new(1),
-            submitted: Mutex::new(HashMap::new()),
-            counters: Counters::default(),
-        });
+        let exporter = Exporter::new(config, node, Arc::new(sink), Box::new(ask));
         EXPORTER
             .set(exporter.clone())
             .map_err(|_| anyhow::anyhow!("the change exporter is already installed"))?;
         crate::asyncrt::spawn(deliver(exporter.clone(), outcomes_rx));
         Ok(exporter)
+    }
+
+    fn new(
+        config: Config,
+        node: String,
+        sink: Arc<dyn ExportSink>,
+        ask: Box<dyn Fn(TicketAsk) + Send + Sync>,
+    ) -> Arc<Exporter> {
+        Arc::new(Exporter {
+            node,
+            config,
+            sink,
+            streams: Mutex::new(HashMap::new()),
+            ask,
+            next_seq: AtomicU64::new(1),
+            submitted: Mutex::new(HashMap::new()),
+            delivering: AtomicBool::new(false),
+            counters: Counters::default(),
+        })
     }
 
     /// Capture settings for every isolate on the node.
@@ -296,7 +338,12 @@ impl Exporter {
 
     /// The cell thread's handle on the stream of `scope` at `epoch`, when
     /// its replica opened one.
-    pub(crate) fn attach(&self, scope: &str, epoch: u64, script: &str) -> Option<CellStream> {
+    pub(crate) fn attach(
+        self: &Arc<Self>,
+        scope: &str,
+        epoch: u64,
+        script: &str,
+    ) -> Option<CellStream> {
         let tx = self
             .streams
             .lock()
@@ -314,7 +361,11 @@ impl Exporter {
             .filter(|(denied_class, _)| denied_class == class)
             .map(|(_, table)| table.clone())
             .collect();
-        Some(CellStream { tx, denied })
+        Some(CellStream {
+            exporter: self.clone(),
+            tx,
+            denied,
+        })
     }
 
     /// The actor's verdict on a ticket.
@@ -364,8 +415,43 @@ impl Exporter {
         });
     }
 
-    /// Flush the sink and wait for its results. Called at shutdown.
+    /// Charge `bytes` to the shared budget for a commit going onto a
+    /// FIFO. `false` when the budget cannot hold it.
+    fn reserve(&self, bytes: u64) -> bool {
+        let budget = self.config.queue_bytes as u64;
+        let held = self.counters.pending_bytes.load(Ordering::Relaxed) + self.sink.buffered_bytes();
+        self.counters
+            .queued_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |queued| {
+                (queued + held + bytes <= budget).then_some(queued + bytes)
+            })
+            .is_ok()
+    }
+
+    fn release_queued(&self, bytes: u64) {
+        self.counters
+            .queued_bytes
+            .fetch_sub(bytes, Ordering::Relaxed);
+    }
+
+    /// Write what the sink holds and the watermarks its acknowledgements
+    /// earn, then close the sink. Called at shutdown, under its deadline.
     pub async fn close(&self) {
+        // Each flush's results can make the delivery task submit
+        // watermarks, which need a flush of their own; stop once a flush
+        // leaves nothing submitted and nothing being delivered.
+        loop {
+            self.sink.flush();
+            crate::asyncrt::sleep(Duration::from_millis(20)).await;
+            let unresolved = !self
+                .submitted
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty();
+            if !unresolved && !self.delivering.load(Ordering::SeqCst) {
+                break;
+            }
+        }
         self.sink.close().await;
     }
 
@@ -374,7 +460,9 @@ impl Exporter {
         let c = &self.counters;
         let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
         serde_json::json!({
-            "queue_bytes": load(&c.pending_bytes) + self.sink.buffered_bytes(),
+            "queue_bytes": load(&c.queued_bytes)
+                + load(&c.pending_bytes)
+                + self.sink.buffered_bytes(),
             "pending_commits": load(&c.pending_commits),
             "dropped_records": load(&c.dropped_records),
             "gaps": load(&c.gaps),
@@ -439,14 +527,33 @@ fn capture_of(file: &celld_ltx::CapturedFile) -> Capture {
     }
 }
 
-/// Encoded size of a commit's rows, for the queue budget.
+/// About the encoded size of a commit's rows, for the queue budget. An
+/// estimate from the values, so the cell thread does not encode twice.
 fn encoded_bytes(commit: &CapturedCommit) -> u64 {
-    let rows: usize = commit
+    fn value(value: &celld_export_format::Value) -> usize {
+        use celld_export_format::Value;
+        match value {
+            Value::Null => 4,
+            Value::Integer(_) | Value::Real(_) => 24,
+            Value::Text(text) => text.len() + 2,
+            Value::Blob(blob) => blob.len().div_ceil(3) * 4 + 12,
+        }
+    }
+    let tables: usize = commit
         .tables
         .iter()
-        .map(|table| serde_json::to_vec(table).map_or(0, |bytes| bytes.len()))
+        .map(|table| {
+            let names: usize = table.columns.iter().map(|c| c.len() + 3).sum::<usize>()
+                + table.key_columns.iter().map(|c| c.len() + 3).sum::<usize>();
+            let rows: usize = table
+                .rows
+                .iter()
+                .map(|row| 12 + row.key().iter().chain(row.row()).map(value).sum::<usize>())
+                .sum();
+            table.table.len() + names + rows + 64
+        })
         .sum();
-    (rows + 64 * commit.bulk.len() + 256) as u64
+    (tables + 64 * commit.bulk.len() + 256) as u64
 }
 
 /// The attribution and release of one cell residency.
@@ -673,12 +780,15 @@ impl Stream {
             Some(Input::Commit {
                 stamp,
                 position,
+                bytes,
                 commit,
             }) => {
+                // The reservation moves from the FIFO to the pending list,
+                // which `account` charges below.
+                exporter.release_queued(bytes);
                 if !commit.bulk.is_empty() {
                     counters.bulk_commits.fetch_add(1, Ordering::Relaxed);
                 }
-                let bytes = encoded_bytes(&commit);
                 self.sequencer.commit();
                 self.last_position = self.last_position.max(position);
                 match stamp {
@@ -695,6 +805,32 @@ impl Stream {
                         commit,
                     ),
                     WalStamp::Unplaced => self.attribution.unplaced(bytes, commit),
+                }
+                self.wanted = Some(self.wanted.map_or(position, |wanted| wanted.max(position)));
+            }
+            Some(Input::Shed { stamp, position }) => {
+                // A shed commit still takes its place in the stream, as a
+                // gap that counts it.
+                self.sequencer.commit();
+                self.last_position = self.last_position.max(position);
+                match stamp {
+                    WalStamp::At {
+                        salt1,
+                        salt2,
+                        frames,
+                    } => self.attribution.dropped(WalPoint {
+                        generation: WalGeneration { salt1, salt2 },
+                        frames,
+                    }),
+                    WalStamp::Unplaced => self.attribution.unplaced(
+                        0,
+                        CapturedCommit {
+                            seq: 0,
+                            committed_at: 0,
+                            tables: Vec::new(),
+                            bulk: Vec::new(),
+                        },
+                    ),
                 }
                 self.wanted = Some(self.wanted.map_or(position, |wanted| wanted.max(position)));
             }
@@ -918,6 +1054,7 @@ struct Delivered {
 async fn deliver(exporter: Arc<Exporter>, mut outcomes: mpsc::UnboundedReceiver<Outcome>) {
     let mut streams: BTreeMap<(String, u64), Delivered> = BTreeMap::new();
     while let Some(outcome) = outcomes.recv().await {
+        exporter.delivering.store(true, Ordering::SeqCst);
         let mut follow_up: Vec<(Record, Submitted)> = Vec::new();
         for (seq, result) in outcome.results {
             let Some(meta) = exporter
@@ -1016,12 +1153,216 @@ async fn deliver(exporter: Arc<Exporter>, mut outcomes: mpsc::UnboundedReceiver<
             state.marked = Some(through);
         }
         exporter.submit(follow_up);
+        exporter.delivering.store(false, Ordering::SeqCst);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use celld_export_format::{Op, RowChange, TableRows, Value};
+    use futures_util::future::BoxFuture;
+
+    fn config(queue_bytes: usize) -> Config {
+        Config::from_lookup(|name| {
+            Ok(match name {
+                "CELLD_EXPORT" => Some("1".to_string()),
+                "CELLD_EXPORT_QUEUE_BYTES" => Some(queue_bytes.to_string()),
+                "CELLD_EXPORT_MAX_RECORD_BYTES" => Some("65536".to_string()),
+                _ => None,
+            })
+        })
+        .unwrap()
+        .unwrap()
+    }
+
+    /// Holds what it is given until a flush, then acknowledges all of it.
+    struct FakeSink {
+        outcomes: mpsc::UnboundedSender<Outcome>,
+        held: Mutex<Vec<SinkRecord>>,
+        /// What happened, in order: `rows`, `gap`, `watermark`, `close`.
+        log: Mutex<Vec<&'static str>>,
+        closed: AtomicBool,
+    }
+
+    impl ExportSink for FakeSink {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+
+        fn submit(&self, records: Vec<SinkRecord>) -> Result<(), crate::export_sink::Closed> {
+            if self.closed.load(Ordering::SeqCst) {
+                return Err(crate::export_sink::Closed);
+            }
+            self.held.lock().unwrap().extend(records);
+            Ok(())
+        }
+
+        fn flush(&self) {
+            let held = std::mem::take(&mut *self.held.lock().unwrap());
+            if held.is_empty() {
+                return;
+            }
+            let mut results = Vec::new();
+            for record in held {
+                self.log.lock().unwrap().push(match record.record.body {
+                    Body::Watermark(_) => "watermark",
+                    Body::Gap(_) => "gap",
+                    _ => "rows",
+                });
+                results.push((
+                    record.seq,
+                    SinkDelivery::Acknowledged {
+                        object: Arc::from("object"),
+                    },
+                ));
+            }
+            let _ = self.outcomes.send(Outcome {
+                sink: "fake",
+                results,
+            });
+        }
+
+        fn buffered_bytes(&self) -> u64 {
+            0
+        }
+
+        fn close(&self) -> BoxFuture<'static, ()> {
+            self.flush();
+            self.closed.store(true, Ordering::SeqCst);
+            self.log.lock().unwrap().push("close");
+            Box::pin(async {})
+        }
+    }
+
+    fn exporter(
+        queue_bytes: usize,
+    ) -> (
+        Arc<Exporter>,
+        Arc<FakeSink>,
+        mpsc::UnboundedReceiver<Outcome>,
+    ) {
+        let (outcomes, outcomes_rx) = mpsc::unbounded_channel();
+        let sink = Arc::new(FakeSink {
+            outcomes,
+            held: Mutex::new(Vec::new()),
+            log: Mutex::new(Vec::new()),
+            closed: AtomicBool::new(false),
+        });
+        let exporter = Exporter::new(
+            config(queue_bytes),
+            "node-a".to_string(),
+            sink.clone(),
+            Box::new(|_| {}),
+        );
+        (exporter, sink, outcomes_rx)
+    }
+
+    fn commit_of(text_bytes: usize) -> CapturedCommit {
+        CapturedCommit {
+            seq: 1,
+            committed_at: 0,
+            tables: vec![TableRows {
+                table: "items".to_string(),
+                generation: 0,
+                columns: vec!["id".to_string(), "body".to_string()],
+                key_columns: vec!["id".to_string()],
+                rows: vec![RowChange(
+                    Op::Insert,
+                    vec![Value::Integer(1)],
+                    vec![Value::Integer(1), Value::Text("x".repeat(text_bytes))],
+                )],
+            }],
+            bulk: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn commits_past_the_budget_queue_as_gaps() {
+        let budget = 1024 * 1024;
+        let (exporter, _sink, _outcomes) = exporter(budget);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let stream = CellStream {
+            exporter: exporter.clone(),
+            tx,
+            denied: HashSet::new(),
+        };
+        let stamp = WalStamp::At {
+            salt1: 1,
+            salt2: 2,
+            frames: 1,
+        };
+        for position in 1..=100 {
+            stream.commit(stamp, position, commit_of(32 * 1024));
+        }
+        let (mut queued, mut commits, mut shed) = (0, 0, 0);
+        let mut last = 0;
+        while let Ok(input) = rx.try_recv() {
+            match input {
+                Input::Commit {
+                    position, bytes, ..
+                } => {
+                    assert_eq!(shed, 0, "a commit queued after one was shed");
+                    queued += bytes;
+                    commits += 1;
+                    last = position;
+                }
+                Input::Shed { position, .. } => {
+                    shed += 1;
+                    last = position;
+                }
+                _ => unreachable!(),
+            }
+        }
+        assert_eq!(last, 100, "every commit keeps its place on the FIFO");
+        assert_eq!(commits + shed, 100);
+        assert!(shed > 0 && commits > 0);
+        assert!(queued <= budget as u64);
+        let state = exporter.state();
+        assert_eq!(state["queue_bytes"], queued);
+        assert_eq!(state["dropped_records"], shed);
+
+        // Once the stream takes its commits off the FIFO the budget frees.
+        exporter.release_queued(queued);
+        stream.commit(stamp, 101, commit_of(32 * 1024));
+        assert!(matches!(rx.try_recv(), Ok(Input::Commit { .. })));
+    }
+
+    #[test]
+    fn close_writes_the_watermark_before_closing_the_sink() {
+        crate::asyncrt::test_block_on(async {
+            let (exporter, sink, outcomes) = exporter(1024 * 1024);
+            #[allow(clippy::disallowed_methods)]
+            tokio::spawn(deliver(exporter.clone(), outcomes));
+            let stream = StreamId {
+                script: "app".to_string(),
+                class: "Items".to_string(),
+                cell: "Items:a".to_string(),
+                facet: None,
+                incarnation: 0,
+            };
+            let position = Position::new(1, 0, 1);
+            exporter.submit(vec![(
+                Record {
+                    envelope: exporter.envelope(&stream, position, 0),
+                    body: Body::Rows(RowsBody {
+                        data: commit_of(8).tables.remove(0),
+                    }),
+                },
+                Submitted {
+                    key: ("Items:a".to_string(), 1),
+                    stream,
+                    position,
+                    whole: true,
+                    closes: true,
+                    watermark: false,
+                },
+            )]);
+            exporter.close().await;
+            assert_eq!(*sink.log.lock().unwrap(), ["rows", "watermark", "close"]);
+            assert_eq!(exporter.state()["watermarks"], 1);
+        });
+    }
 
     fn delete_body(through: u64) -> DeletedBody {
         DeletedBody {
