@@ -50,12 +50,18 @@ use rusqlite::{ffi, Connection};
 pub(crate) const FIRST_GENERATION: u64 = 1;
 
 /// Where a cell keeps its table generations: one row per table name the
-/// exporter has seen, with the name's newest generation and the definition
-/// it was exported under, or `NULL` once no table has the name. The `_cf_`
-/// prefix keeps it out of application SQL and out of the export, and
-/// `deleteAll` leaves it in place, so a table recreated afterwards continues
-/// from the old generation instead of reusing it.
+/// exporter has seen, with the name's newest generation, the definition and
+/// root page it was exported under, or `NULL` once no table has the name.
+/// The `_cf_` prefix keeps it out of application SQL and out of the export,
+/// and `deleteAll` leaves it in place, so a table recreated afterwards
+/// continues from the old generation instead of reusing it.
 pub(crate) const GENERATIONS_TABLE: &str = "_cf_EXPORT";
+
+/// The [`GENERATIONS_TABLE`] row that holds, as its generation, the schema
+/// cookie the generations were last compared at. No table can have this
+/// name, and a later residency that finds the cookie moved knows the schema
+/// changed while nothing watched it.
+const COOKIE_ROW: &str = "sqlite_schema";
 
 /// How capture behaves on every cell of one isolate.
 #[derive(Clone, Copy, Debug)]
@@ -429,8 +435,7 @@ struct Tracked {
     /// no table has the name.
     sql: Option<String>,
     /// The table's root page, which a rename keeps and a recreate changes.
-    /// Known only for tables seen in `sqlite_schema` during this capture;
-    /// zero otherwise.
+    /// Zero when not known.
     rootpage: i64,
     /// A virtual table, which the export names but does not cover.
     virtual_table: bool,
@@ -568,7 +573,15 @@ impl Capture {
         } else {
             Since::Before
         };
-        capture.pending = capture.compare_schema(connection, since)?;
+        match capture.compare_schema(connection, since) {
+            Ok(pending) => capture.pending = pending,
+            // Nothing is released for the changes until they are stored; the
+            // first pull compares again.
+            Err(error) => {
+                tracing::warn!(scope, %error, "export capture: compare schema at install");
+                capture.filter.mark_dirty();
+            }
+        }
         if !capture.pending.is_empty() {
             capture.filter.mark_dirty();
         }
@@ -998,27 +1011,40 @@ impl Capture {
             return Ok(());
         }
         let mut statement = connection.prepare(&format!(
-            "SELECT name, generation, schema_sql FROM main.{GENERATIONS_TABLE}"
+            "SELECT name, generation, schema_sql, rootpage FROM main.{GENERATIONS_TABLE}"
         ))?;
         let rows = statement.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)?,
                 row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
             ))
         })?;
+        let mut cookie = None;
         for row in rows {
-            let (name, generation, sql) = row?;
+            let (name, generation, sql, rootpage) = row?;
+            if name == COOKIE_ROW {
+                cookie = Some(generation);
+                continue;
+            }
             let virtual_table = sql.as_deref().is_some_and(is_virtual_sql);
             self.generations.insert(
                 name,
                 Tracked {
                     generation: u64::try_from(generation).unwrap_or(FIRST_GENERATION),
                     sql,
-                    rootpage: 0,
+                    rootpage: rootpage.unwrap_or(0),
                     virtual_table,
                 },
             );
+        }
+        // The schema changed since the generations were stored, while no
+        // capture watched: a table may have been dropped and recreated with
+        // the same definition, even on the same root page. Every table is
+        // then taken to be new, which costs a snapshot each.
+        if !self.generations.is_empty() && cookie != Some(schema_cookie(connection)?) {
+            self.hinted.extend(self.generations.keys().cloned());
         }
         Ok(())
     }
@@ -1091,6 +1117,10 @@ impl Capture {
             return Ok(Vec::new());
         }
         let live = self.live_tables(connection)?;
+        // A generation is released only once stored: a later residency must
+        // never reuse one a consumer has seen. If the store fails, this
+        // comparison is undone and the next pull repeats it.
+        let before = (self.generations.clone(), self.hinted.clone());
         let hinted = std::mem::take(&mut self.hinted);
         let vanished: Vec<String> = self
             .generations
@@ -1189,66 +1219,85 @@ impl Capture {
                 tracked.rootpage = table.rootpage;
             }
         }
-        if !moved.is_empty() {
-            if let Err(error) = self.store_generations(connection, &moved) {
-                // Held in memory for this residency. A later one compares
-                // against what was stored and opens a new generation, which
-                // only costs a snapshot.
-                tracing::warn!(scope = %self.filter.scope, %error, "export capture: store generations");
+        match self.store_generations(connection, &moved) {
+            // The store read the cookie after any change of its own.
+            Ok(cookie) => self.compared_version = Some(cookie),
+            Err(error) => {
+                (self.generations, self.hinted) = before;
+                return Err(error.context("store generations"));
             }
         }
-        // Our own write moved the cookie; the next comparison starts after it.
-        self.compared_version = Some(schema_cookie(connection)?);
         Ok(changes)
     }
 
-    /// Write the generations of `names` to [`GENERATIONS_TABLE`] in one
-    /// statement.
+    /// Write the generations of `names` to [`GENERATIONS_TABLE`], with the
+    /// schema cookie they were compared at. Returns that cookie. Nothing is
+    /// written when neither the generations nor the stored cookie would
+    /// change, as for a cell that has never had an exported table.
     fn store_generations(
         &mut self,
         connection: &Connection,
         names: &[String],
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<i64> {
+        use rusqlite::types::Value as Sql;
+        if names.is_empty() && !self.stored {
+            return Ok(schema_cookie(connection)?);
+        }
         self.wal.quiet.set(true);
-        let result = (|| -> anyhow::Result<()> {
+        let result = (|| -> anyhow::Result<i64> {
             if !self.stored {
                 connection.execute_batch(&format!(
                     "CREATE TABLE IF NOT EXISTS main.{GENERATIONS_TABLE} (
                         name TEXT PRIMARY KEY,
                         generation INTEGER NOT NULL,
-                        schema_sql TEXT
+                        schema_sql TEXT,
+                        rootpage INTEGER
                     ) WITHOUT ROWID"
                 ))?;
                 self.stored = true;
             }
-            // SQLITE_LIMIT_VARIABLE_NUMBER on the cell connection is 100.
-            for chunk in names.chunks(30) {
-                let mut params: Vec<rusqlite::types::Value> = Vec::new();
-                let mut tuples = Vec::new();
-                for name in chunk {
+            // Read after the create, which moves it; the inserts do not.
+            let cookie = schema_cookie(connection)?;
+            let mut rows: Vec<[Sql; 4]> = names
+                .iter()
+                .map(|name| {
                     let tracked = &self.generations[name];
-                    let n = params.len();
-                    tuples.push(format!("(?{}, ?{}, ?{})", n + 1, n + 2, n + 3));
-                    params.push(rusqlite::types::Value::Text(name.clone()));
-                    params.push(rusqlite::types::Value::Integer(
-                        i64::try_from(tracked.generation).unwrap_or(i64::MAX),
-                    ));
-                    params.push(match &tracked.sql {
-                        Some(sql) => rusqlite::types::Value::Text(sql.clone()),
-                        None => rusqlite::types::Value::Null,
-                    });
-                }
+                    [
+                        Sql::Text(name.clone()),
+                        Sql::Integer(i64::try_from(tracked.generation).unwrap_or(i64::MAX)),
+                        tracked.sql.clone().map_or(Sql::Null, Sql::Text),
+                        Sql::Integer(tracked.rootpage),
+                    ]
+                })
+                .collect();
+            rows.push([
+                Sql::Text(COOKIE_ROW.to_string()),
+                Sql::Integer(cookie),
+                Sql::Null,
+                Sql::Null,
+            ]);
+            // SQLITE_LIMIT_VARIABLE_NUMBER on the cell connection is 100.
+            // A failure part way leaves some generations stored ahead of
+            // what was released, which only skips numbers.
+            for chunk in rows.chunks(24) {
+                let tuples: Vec<String> = (0..chunk.len())
+                    .map(|i| {
+                        let n = i * 4;
+                        format!("(?{}, ?{}, ?{}, ?{})", n + 1, n + 2, n + 3, n + 4)
+                    })
+                    .collect();
                 connection.execute(
                     &format!(
-                        "INSERT INTO main.{GENERATIONS_TABLE} (name, generation, schema_sql)
+                        "INSERT INTO main.{GENERATIONS_TABLE} (name, generation, schema_sql, rootpage)
                          VALUES {} ON CONFLICT(name) DO UPDATE SET
-                         generation = excluded.generation, schema_sql = excluded.schema_sql",
+                         generation = excluded.generation, schema_sql = excluded.schema_sql,
+                         rootpage = excluded.rootpage",
                         tuples.join(", ")
                     ),
-                    rusqlite::params_from_iter(params),
+                    rusqlite::params_from_iter(chunk.iter().flatten()),
                 )?;
             }
-            Ok(())
+            Ok(cookie)
         })();
         self.wal.quiet.set(false);
         result

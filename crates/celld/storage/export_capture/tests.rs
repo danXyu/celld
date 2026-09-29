@@ -620,7 +620,10 @@ fn snapshotted<'a>(commit: &'a CapturedCommit, name: &str) -> &'a TableRows {
 fn stored(f: &Fixture) -> Vec<(String, i64, Option<String>)> {
     let mut statement = f
         .connection
-        .prepare("SELECT name, generation, schema_sql FROM _cf_EXPORT ORDER BY name")
+        .prepare(
+            "SELECT name, generation, schema_sql FROM _cf_EXPORT
+             WHERE name != 'sqlite_schema' ORDER BY name",
+        )
         .unwrap();
     statement
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
@@ -876,6 +879,8 @@ fn generations_survive_a_new_residency() {
     f.run("DROP TABLE plain;");
     f.pull();
     let mut f = f.reinstall();
+    // Nothing changed while it was away: no new generations.
+    assert_eq!(f.checkpoint(), Checkpoint::Clean);
     f.run("CREATE TABLE plain (v INTEGER, w TEXT);");
     assert_eq!(schema(&f.pull(), "plain").generation, 2);
     // Unobserved: the capture is gone while the table changes.
@@ -896,6 +901,80 @@ fn generations_survive_a_new_residency() {
     assert_eq!(schema(&commit, "later").generation, 1);
     assert_eq!(snapshotted(&commit, "later").rows.len(), 1);
     assert!(commit.tables.is_empty());
+}
+
+/// A table dropped and recreated with the same definition while nothing
+/// captured the cell is a new generation when capture returns: the stored
+/// root page and schema cookie say so, and the old rows are closed.
+#[test]
+fn an_unobserved_recreate_is_a_new_generation() {
+    let mut f = Fixture::new(SHAPES);
+    let mut consumer = Consumer::new();
+    f.run("INSERT INTO keyed VALUES ('one', 1);");
+    ingest(&mut consumer, &f.pull());
+    drop(f.capture);
+    f.connection
+        .execute_batch(
+            "DROP TABLE keyed;
+             CREATE TABLE keyed (id TEXT PRIMARY KEY, v INTEGER);
+             INSERT INTO keyed VALUES ('two', 2);",
+        )
+        .unwrap();
+    let mut f = Fixture::install(f.connection, settings());
+    let commit = f.pull();
+    assert_eq!(schema(&commit, "keyed").generation, 2);
+    ingest(&mut consumer, &commit);
+    f.run("INSERT INTO keyed VALUES ('three', 3);");
+    ingest(&mut consumer, &f.pull());
+    let keys: Vec<_> = consumer
+        .stream(&stream())
+        .unwrap()
+        .table("keyed")
+        .unwrap()
+        .rows
+        .keys()
+        .cloned()
+        .collect();
+    assert_eq!(keys, [vec![text("three")], vec![text("two")]]);
+}
+
+/// A generation is released only once the cell stores it. While the store
+/// fails, a schema change exports the tables as `bulk` under the generations
+/// already stored, and a later residency never reuses a released number.
+#[test]
+fn generations_are_released_only_once_stored() {
+    let mut f = Fixture::new(SHAPES);
+    let mut consumer = Consumer::new();
+    f.run("INSERT INTO plain VALUES (1, 'before');");
+    ingest(&mut consumer, &f.pull());
+    f.run(
+        "CREATE TEMP TRIGGER no_insert BEFORE INSERT ON main._cf_EXPORT
+           BEGIN SELECT RAISE(ABORT, 'store fails'); END;
+         CREATE TEMP TRIGGER no_update BEFORE UPDATE ON main._cf_EXPORT
+           BEGIN SELECT RAISE(ABORT, 'store fails'); END;",
+    );
+    f.run("ALTER TABLE plain ADD COLUMN a INTEGER;");
+    let commit = f.pull();
+    assert!(
+        commit.schemas.iter().all(|s| s.generation == 1),
+        "{commit:?}"
+    );
+    assert!(commit
+        .bulk
+        .iter()
+        .any(|tg| tg.table == "plain" && tg.generation == 1));
+    assert_eq!(stored(&f)[2].1, 1);
+    // Once the store works, the next pull reports the change.
+    f.run("DROP TRIGGER temp.no_insert; DROP TRIGGER temp.no_update;");
+    f.run("INSERT INTO keyed VALUES ('k', 1);");
+    let commit = f.pull();
+    assert_eq!(schema(&commit, "plain").generation, 2);
+    assert_eq!(snapshotted(&commit, "plain").rows.len(), 1);
+    assert_eq!(stored(&f)[2].1, 2);
+    let mut f = f.reinstall();
+    f.run("ALTER TABLE plain ADD COLUMN b INTEGER;");
+    let commit = f.pull();
+    assert_eq!(schema(&commit, "plain").generation, 3);
 }
 
 /// A table too large for the transaction budget is `bulk` under its new
