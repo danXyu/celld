@@ -192,6 +192,18 @@ class Emulator:
             return self.query(dynamic_table_as_view(s))
         return self.query(s)
 
+    def execute_bound(self, sql, bindings):
+        """A statement with `?` binds, as the SQL API takes them: every value
+        text, typed by `type`."""
+        self.log.append(sql)
+        convert = {"TEXT": str, "FIXED": int, "REAL": float, "BOOLEAN": lambda v: v == "true"}
+        params = []
+        for i in range(1, len(bindings) + 1):
+            b = bindings[str(i)]
+            params.append(None if b["value"] is None else convert[b["type"]](b["value"]))
+        assert sql.count("?") == len(params), sql
+        return self.query(sql.replace("?", "%s"), params)
+
     # ------------------------------------------------------------ HTTP
 
     def check_auth(self, headers):
@@ -258,7 +270,10 @@ class Emulator:
         handle = str(uuid.uuid4())
         with self.lock:
             try:
-                columns, rows = self.execute(sql)
+                if "bindings" in body:
+                    columns, rows = self.execute_bound(sql, body["bindings"])
+                else:
+                    columns, rows = self.execute(sql)
             except Exception as e:  # noqa: BLE001 -- relayed to the client as a failed statement
                 return 422, {"code": "002003", "sqlState": "42000", "message": str(e), "statementHandle": handle}
         rows = [[self.text(v) for v in r] for r in rows]

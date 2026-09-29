@@ -15,7 +15,8 @@
 -- statement: cell_streams
 -- Every stream seen, with the position a `deleted` record naming the stream
 -- removed it at, and whether it is gone entirely: named by a facet `deleted`
--- record on its root's stream, or erased.
+-- record on its root's stream, or erased. A facet `deleted` record never
+-- becomes a tombstone.
 CREATE OR REPLACE VIEW CELL_STREAMS AS
 WITH streams AS (
     SELECT DISTINCT script, class, cell, facet, incarnation FROM CELL_META
@@ -27,6 +28,7 @@ deletions AS (
         script, class, cell, facet, incarnation, position_key,
         body:target_facet::STRING AS target_facet,
         body:target_incarnation::NUMBER(20, 0) AS target_incarnation,
+        body:through_incarnation::NUMBER(20, 0) AS through_incarnation,
         COALESCE(body:subtree::BOOLEAN, FALSE) AS subtree
     FROM CELL_META
     WHERE kind = 'deleted'
@@ -44,9 +46,18 @@ facet_deleted AS (
       ON d.script = s.script AND d.class = s.class AND d.cell = s.cell
     WHERE d.target_facet IS NOT NULL
       AND (
-          (s.facet = d.target_facet
-              AND (d.target_incarnation IS NULL OR d.target_incarnation = s.incarnation))
-          OR (d.subtree AND STARTSWITH(s.facet, d.target_facet || '/'))
+          -- Facet incarnations are ordered, so a delete that carries
+          -- THROUGH_INCARNATION removes the facet and, for a subtree, the
+          -- facets under it, only up to that bound: one recreated after the
+          -- delete has a higher incarnation and stays.
+          (d.through_incarnation IS NOT NULL
+              AND (s.facet = d.target_facet
+                   OR (d.subtree AND STARTSWITH(s.facet, d.target_facet || '/')))
+              AND s.incarnation <= d.through_incarnation)
+          OR (d.through_incarnation IS NULL
+              AND ((s.facet = d.target_facet
+                       AND (d.target_incarnation IS NULL OR d.target_incarnation = s.incarnation))
+                   OR (d.subtree AND STARTSWITH(s.facet, d.target_facet || '/'))))
       )
 ),
 erased AS (

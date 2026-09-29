@@ -67,7 +67,18 @@ impl WarehouseError {
 
 /// Somewhere to run one Snowflake statement.
 pub trait Warehouse {
-    fn execute(&mut self, sql: &str) -> Result<Rows, WarehouseError>;
+    fn execute(&mut self, sql: &str) -> Result<Rows, WarehouseError> {
+        self.execute_bound(sql, &[])
+    }
+
+    /// Run `sql` with each `?` bound, in order, to a value of `binds`: a
+    /// string, number, boolean or null. The reconciler's statements
+    /// (`celld export`, C17) take their values this way.
+    fn execute_bound(
+        &mut self,
+        sql: &str,
+        binds: &[serde_json::Value],
+    ) -> Result<Rows, WarehouseError>;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -88,9 +99,6 @@ pub enum LoadError {
 
 /// `schema` records by `(script, class, table)`.
 pub type Schemas = BTreeMap<(String, String, String), Vec<SchemaBody>>;
-
-/// The tasks the deployment creates. Snowflake creates a task suspended.
-pub const TASKS: [&str; 2] = ["EXPORT_ROUTE", "EXPORT_ERASE"];
 
 /// What the loader needs besides a warehouse.
 #[derive(Clone, Debug)]
@@ -164,9 +172,6 @@ impl<W: Warehouse> Loader<W> {
         let statements = self.config.deployment.statements()?;
         for s in &statements {
             self.run(&s.name, &s.sql)?;
-        }
-        for task in TASKS {
-            self.run(task, &format!("ALTER TASK {task} RESUME"))?;
         }
         let pipes = self.run("show pipes", "SHOW PIPES LIKE 'EXPORT_PIPE'")?;
         let notification_channel = pipes.get(0, "notification_channel").map(str::to_string);
@@ -336,6 +341,17 @@ impl<W: Warehouse> Loader<W> {
         Ok(())
     }
 
+    /// Any statement, with `?` binds: the read side for `verify` and the
+    /// reconciler, and anything an operator needs.
+    pub fn query(&mut self, sql: &str, binds: &[serde_json::Value]) -> Result<Rows, LoadError> {
+        self.warehouse
+            .execute_bound(sql, binds)
+            .map_err(|source| LoadError::Warehouse {
+                statement: "query".to_string(),
+                source,
+            })
+    }
+
     /// What the repair driver works from: `EXPORT_GAPS`.
     pub fn gaps(&mut self) -> Result<Rows, LoadError> {
         self.run("gaps", "SELECT * FROM EXPORT_GAPS")
@@ -415,7 +431,11 @@ mod tests {
     }
 
     impl Warehouse for Fake {
-        fn execute(&mut self, sql: &str) -> Result<Rows, WarehouseError> {
+        fn execute_bound(
+            &mut self,
+            sql: &str,
+            _binds: &[serde_json::Value],
+        ) -> Result<Rows, WarehouseError> {
             self.log.push(sql.to_string());
             if let Some(f) = &self.fail_containing {
                 if sql.contains(f.as_str()) {
@@ -497,8 +517,9 @@ mod tests {
         let log = &l.warehouse.log;
         let n = config().deployment.statements().unwrap().len();
         assert_eq!(report.statements, n);
-        assert_eq!(log[n], "ALTER TASK EXPORT_ROUTE RESUME");
-        assert_eq!(log[n + 1], "ALTER TASK EXPORT_ERASE RESUME");
+        assert!(log[..n].contains(&"ALTER TASK EXPORT_ROUTE RESUME".to_string()));
+        assert!(log[..n].contains(&"ALTER TASK EXPORT_ERASE RESUME".to_string()));
+        assert!(log[n].starts_with("SHOW PIPES"));
         assert_eq!(
             report.notification_channel.as_deref(),
             Some("arn:aws:sqs:q")

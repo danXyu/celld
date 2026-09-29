@@ -293,8 +293,36 @@ impl SqlApi {
     }
 }
 
+/// The SQL API's `bindings`: `{"1": {"type": ..., "value": ...}, ...}`, every
+/// value as text.
+pub fn bindings(binds: &[serde_json::Value]) -> Result<serde_json::Value, WarehouseError> {
+    use serde_json::Value as J;
+    let mut out = serde_json::Map::new();
+    for (i, b) in binds.iter().enumerate() {
+        let (ty, value) = match b {
+            J::Null => ("TEXT", J::Null),
+            J::Bool(v) => ("BOOLEAN", json!(v.to_string())),
+            J::Number(n) if n.is_f64() => ("REAL", json!(n.to_string())),
+            J::Number(n) => ("FIXED", json!(n.to_string())),
+            J::String(v) => ("TEXT", json!(v)),
+            other => {
+                return Err(WarehouseError::other(format!(
+                    "bind {} is {other}, not a scalar",
+                    i + 1
+                )))
+            }
+        };
+        out.insert((i + 1).to_string(), json!({"type": ty, "value": value}));
+    }
+    Ok(J::Object(out))
+}
+
 impl Warehouse for SqlApi {
-    fn execute(&mut self, sql: &str) -> Result<Rows, WarehouseError> {
+    fn execute_bound(
+        &mut self,
+        sql: &str,
+        binds: &[serde_json::Value],
+    ) -> Result<Rows, WarehouseError> {
         let base = self.connection.base_url();
         let c = &self.connection;
         let mut body = json!({
@@ -306,6 +334,9 @@ impl Warehouse for SqlApi {
         });
         if let Some(role) = &c.role {
             body["role"] = json!(role);
+        }
+        if !binds.is_empty() {
+            body["bindings"] = bindings(binds)?;
         }
         let mut id = [0u8; 16];
         getrandom::fill(&mut id).map_err(|e| WarehouseError::other(e.to_string()))?;
@@ -422,6 +453,22 @@ mod tests {
         assert_eq!(KeyPair::from_pem(&pkcs8, None).unwrap().fingerprint, fp);
         assert_eq!(KeyPair::from_pem(&pkcs1, None).unwrap().fingerprint, fp);
         assert!(KeyPair::from_pem("nonsense", None).is_err());
+    }
+
+    #[test]
+    fn binds_become_typed_text() {
+        let b = bindings(&[json!("a"), json!(7), json!(1.5), json!(null), json!(true)]).unwrap();
+        assert_eq!(
+            b,
+            json!({
+                "1": {"type": "TEXT", "value": "a"},
+                "2": {"type": "FIXED", "value": "7"},
+                "3": {"type": "REAL", "value": "1.5"},
+                "4": {"type": "TEXT", "value": null},
+                "5": {"type": "BOOLEAN", "value": "true"},
+            })
+        );
+        assert!(bindings(&[json!([1])]).is_err());
     }
 
     #[test]

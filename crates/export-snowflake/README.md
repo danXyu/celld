@@ -57,6 +57,7 @@ renders it, and the loader that deploys and drives it. Without the
 | `run [SECONDS]` | `deploy`, then `sync` every SECONDS |
 | `load PREFIX` | `COPY` the stage files under PREFIX (snapshot, repair, backfill) into `EXPORT_LANDING` and route them by running the route task's body, which returns once they are routed (`EXECUTE TASK` only schedules a run); COPY's load history skips files already loaded |
 | `erase SCRIPT CLASS CELL [--facet P] [--incarnation N] [--reason R]` | add a tombstone, unless an open one matches, and delete the stream's rows by running the erase task's body |
+| `query SQL [BIND...]` | run any statement with each `?` bound to a JSON value, as the reconciler's statements (#49) are, and print the rows |
 | `gaps`, `certified` | print `EXPORT_GAPS` or `CELL_CERTIFIED`: the read side the repair driver, `verify` and the reconciler need |
 
 Settings are environment variables: `SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_USER`,

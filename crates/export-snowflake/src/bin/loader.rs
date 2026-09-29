@@ -19,6 +19,7 @@ usage: celld-export-loader COMMAND
   load PREFIX            COPY the stage files under PREFIX and route them now
   erase SCRIPT CLASS CELL [--facet PATH] [--incarnation N] [--reason TEXT]
                          tombstone a stream and delete its rows
+  query SQL [BIND...]    run SQL with each ? bound to a JSON value, and print the rows
   gaps                   print EXPORT_GAPS
   certified              print CELL_CERTIFIED
 
@@ -190,6 +191,13 @@ fn run(args: &[String]) -> Result<(), Error> {
             }
             loader(false)?.erase(&e)?;
             out("erased")
+        }
+        ["query", sql, binds @ ..] => {
+            let binds = binds
+                .iter()
+                .map(|b| serde_json::from_str(b))
+                .collect::<Result<Vec<serde_json::Value>, _>>()?;
+            print_rows(&loader(false)?.query(sql, &binds)?)
         }
         ["gaps"] => print_rows(&loader(false)?.gaps()?),
         ["certified"] => print_rows(&loader(false)?.certified()?),

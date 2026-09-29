@@ -200,3 +200,24 @@ def test_real_account_files_have_the_sinks_layout(tmp_path):
     assert types["body"] == "String"
     row = pq.read_table(tmp_path / "basic.parquet").to_pylist()[0]
     assert json.loads(row["body"])["kind"] == row["kind"]
+
+
+def test_bound_statements_as_the_reconciler_runs_them(emulator, loader):
+    """Statements shaped like #49's (crates/celld/export_audit/snowflake.rs):
+    `?` binds, NULL among them, through the SQL API's bindings."""
+    loader("deploy")
+    loader(
+        "query",
+        "INSERT INTO EXPORT_TOMBSTONES (script, class, cell, facet, incarnation, erased_at, reason) "
+        "SELECT ?, ?, ?, ?, ?, TO_TIMESTAMP_LTZ(?, 3), ?",
+        '"app"', '"Room"', '"r9"', '""', "null", "1790000000123", '"test"',
+    )
+    loader(
+        "query",
+        "UPDATE EXPORT_TOMBSTONES SET cleared_at = TO_TIMESTAMP_LTZ(?, 3) "
+        "WHERE script = ? AND class = ? AND cell = ? AND facet = ? "
+        "AND EQUAL_NULL(incarnation, ?) AND cleared_at IS NULL",
+        "1790000000999", '"app"', '"Room"', '"r9"', '""', "null",
+    )
+    out = loader("query", "SELECT cell, reason FROM EXPORT_TOMBSTONES WHERE cleared_at IS NOT NULL AND ?", "true").stdout
+    assert out.splitlines() == ["CELL\tREASON", "r9\ttest"]

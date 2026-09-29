@@ -306,3 +306,44 @@ def test_bulk_only_generation_needs_repair(warehouse):
     assert [(g["gap_kind"], g["cell"], g["table_name"], int(g["generation"])) for g in gaps] == [
         ("bulk", "r9", "items", 1)
     ]
+
+
+def meta(w, cell, facet, incarnation, kind, body, txid=1):
+    w.run(
+        "INSERT INTO CELL_META (script, class, cell, facet, incarnation, epoch, txid, commit, "
+        "position_key, committed_at, node, origin, fragment, fragments, kind, body, loaded_at) "
+        "SELECT 'app', 'Room', %s, %s, %s, 1, %s, 0, "
+        "LPAD('1', 20, '0') || '.' || LPAD(%s::STRING, 20, '0') || '.' || LPAD('0', 20, '0'), "
+        "TO_TIMESTAMP_NTZ(0), 'n', 'live', 0, 1, %s, PARSE_JSON(%s), CURRENT_TIMESTAMP()",
+        (cell, facet, incarnation, txid, txid, kind, json.dumps(body)),
+    )
+
+
+def test_facet_delete_bounded_by_through_incarnation(warehouse):
+    """A subtree delete with THROUGH_INCARNATION (#50) removes the facet and
+    the facets under it only up to the bound, so the ones recreated after the
+    delete stay. Without the bound it removes everything under the path."""
+    w = warehouse
+    for sql in VIEWS.values():
+        w.run(sql)
+    for cell, bound in (("bounded", 20), ("unbounded", None)):
+        meta(w, cell, "", 1, "activation", {})
+        for facet, inc in (("facets/a", 10), ("facets/a/facets/b", 11),
+                           ("facets/a", 30), ("facets/a/facets/b", 31),
+                           ("facets/ab", 12), ("facets/c", 13)):
+            meta(w, cell, facet, inc, "activation", {})
+        body = {"target_facet": "facets/a", "subtree": True}
+        if bound is not None:
+            body["through_incarnation"] = bound
+        meta(w, cell, "", 1, "deleted", body, txid=2)
+    removed = {
+        (r["cell"], r["facet"], int(r["incarnation"]))
+        for r in w.rows("SELECT * FROM CELL_STREAMS WHERE removed")
+    }
+    assert removed == {
+        ("bounded", "facets/a", 10), ("bounded", "facets/a/facets/b", 11),
+        ("unbounded", "facets/a", 10), ("unbounded", "facets/a/facets/b", 11),
+        ("unbounded", "facets/a", 30), ("unbounded", "facets/a/facets/b", 31),
+    }
+    # A facet delete is not an erasure.
+    assert not w.rows("SELECT * FROM CELL_STREAMS WHERE erased")
