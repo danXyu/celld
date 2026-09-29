@@ -2,6 +2,10 @@
 
 ARG RUST_VERSION=1.97.1
 ARG CELLD_COMMIT=unknown
+# The stage the image takes its binary from. `test` gates the image on the
+# workspace tests and clippy; a caller whose own CI already runs them (TCK)
+# passes `build` and BuildKit skips the test stage.
+ARG CELLD_BINARY_FROM=test
 
 FROM rust:${RUST_VERSION}-bookworm AS build
 ARG TARGETARCH
@@ -38,6 +42,8 @@ RUN --mount=type=cache,id=celld-cargo-registry,target=/usr/local/cargo/registry,
     cargo test --profile "${CELLD_PROFILE}" --locked && \
     cargo clippy --profile "${CELLD_PROFILE}" --all-targets --locked -- -D warnings
 
+FROM ${CELLD_BINARY_FROM} AS binary
+
 FROM debian:bookworm-slim
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates && \
@@ -47,5 +53,5 @@ ARG CELLD_VERSION=unknown
 LABEL org.opencontainers.image.title="celld" \
       org.opencontainers.image.revision="${CELLD_COMMIT}" \
       org.opencontainers.image.version="${CELLD_VERSION}"
-COPY --from=test /out/celld /usr/local/bin/celld
+COPY --from=binary /out/celld /usr/local/bin/celld
 ENTRYPOINT ["/usr/local/bin/celld"]

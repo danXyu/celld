@@ -56,13 +56,20 @@ jobs:
       # runs) save: a pull request can restore main's entry but not another
       # pull request's. A lockfile or toolchain change starts a fresh entry,
       # which keeps stale dependency builds from piling up in it.
+      - name: Cache key
+        id: cache-key
+        run: |
+          set -euo pipefail
+          rust=$(sed -n 's/^ARG RUST_VERSION=//p' Dockerfile)
+          echo "prefix=tck-cargo-mounts-v1-rust-$rust-${{ hashFiles('Cargo.lock') }}-" >> "$GITHUB_OUTPUT"
+
       - name: Restore cargo cache mounts
         if: github.event_name == 'pull_request'
         uses: actions/cache/restore@v5
         with:
           path: ${{ runner.temp }}/cargo-mounts
-          key: tck-cargo-mounts-v1-${{ hashFiles('Dockerfile', 'Cargo.lock') }}-${{ github.run_id }}
-          restore-keys: tck-cargo-mounts-v1-${{ hashFiles('Dockerfile', 'Cargo.lock') }}-
+          key: ${{ steps.cache-key.outputs.prefix }}${{ github.run_id }}
+          restore-keys: ${{ steps.cache-key.outputs.prefix }}
 
       # Declared before the cache dance so that its post step, which saves,
       # runs after the dance's post step has extracted the mounts.
@@ -71,8 +78,8 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ${{ runner.temp }}/cargo-mounts
-          key: tck-cargo-mounts-v1-${{ hashFiles('Dockerfile', 'Cargo.lock') }}-${{ github.run_id }}
-          restore-keys: tck-cargo-mounts-v1-${{ hashFiles('Dockerfile', 'Cargo.lock') }}-
+          key: ${{ steps.cache-key.outputs.prefix }}${{ github.run_id }}
+          restore-keys: ${{ steps.cache-key.outputs.prefix }}
 
       - name: Inject cargo cache mounts
         uses: reproducible-containers/buildkit-cache-dance@v3.4.0
@@ -87,7 +94,9 @@ jobs:
           skip-extraction: ${{ github.event_name == 'pull_request' }}
 
       # `lab` is `release` without the fat-LTO relink: the same code at a
-      # fraction of the build time.
+      # fraction of the build time. The image skips the Dockerfile's test
+      # stage: CI's Lint and test job already runs the workspace tests and
+      # clippy on every change.
       - name: Build
         run: |
           set -euo pipefail
@@ -95,6 +104,7 @@ jobs:
           docker buildx build \
             --platform linux/amd64 \
             --build-arg CELLD_PROFILE=lab \
+            --build-arg CELLD_BINARY_FROM=build \
             --build-arg "CELLD_COMMIT=$GITHUB_SHA" \
             --build-arg "CELLD_VERSION=$version" \
             --cache-from type=gha,scope=tck-image \
