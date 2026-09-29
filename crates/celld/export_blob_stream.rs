@@ -618,13 +618,18 @@ mod client {
                 }
                 None => {
                     let mut nodes = StaticBrokerDiscoveryConfig::new();
-                    for address in self.brokers.split(',').map(str::trim) {
-                        if address.is_empty() {
+                    for broker in self.brokers.split(',').map(str::trim) {
+                        if broker.is_empty() {
                             continue;
                         }
+                        // The broker's own node ID: the producer assigns
+                        // partition owners by it.
+                        let (node_id, address) = broker.split_once('=').with_context(|| {
+                            format!("CELLD_EXPORT_BROKERS entries must be NODE_ID=host:port, not {broker:?}")
+                        })?;
                         let mut node = ProducerNodeConfig::new();
-                        node.node_id = address.to_string().into();
-                        node.address = address.to_string().into();
+                        node.node_id = node_id.trim().to_string().into();
+                        node.address = address.trim().to_string().into();
                         nodes.nodes.push(node);
                     }
                     discovery.set_static(nodes);

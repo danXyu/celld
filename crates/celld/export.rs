@@ -93,7 +93,7 @@ pub struct Config {
     pub flush_bytes: usize,
     pub retention: Retention,
     pub topic: String,
-    /// `CELLD_EXPORT_BROKERS`: static `host:port` brokers or one
+    /// `CELLD_EXPORT_BROKERS`: static `NODE_ID=host:port` brokers or one
     /// `k8s://NAMESPACE/SERVICE`. Required when the blob-stream sink is on.
     pub brokers: Option<String>,
     /// `CELLD_EXPORT_WRITER_ID`: the zone whose blob-stream writer this
@@ -428,8 +428,13 @@ fn parse_tables(list: &str) -> anyhow::Result<BTreeSet<(String, String)>> {
     Ok(tables)
 }
 
-/// Static `host:port` brokers, comma-separated, or one
+/// Static `NODE_ID=host:port` brokers, comma-separated, or one
 /// `k8s://NAMESPACE/SERVICE`. Returned as written; the sink resolves it.
+///
+/// A static broker needs its node ID as the broker itself is configured
+/// with it: the producer assigns partitions to owners by node ID, so an ID
+/// that differs from the broker's routes writes to a broker that does not
+/// hold the partition's lease.
 fn parse_brokers(value: &str) -> anyhow::Result<String> {
     if let Some(service) = value.strip_prefix("k8s://") {
         let valid = service.split_once('/').is_some_and(|(namespace, name)| {
@@ -440,12 +445,23 @@ fn parse_brokers(value: &str) -> anyhow::Result<String> {
         }
         return Ok(value.to_string());
     }
+    let mut ids = BTreeSet::new();
     for broker in items(value) {
-        let valid = broker.rsplit_once(':').is_some_and(|(host, port)| {
-            !host.is_empty() && port.parse::<u16>().is_ok_and(|port| port > 0)
+        let valid = broker.split_once('=').is_some_and(|(id, address)| {
+            !id.trim().is_empty()
+                && address.trim().rsplit_once(':').is_some_and(|(host, port)| {
+                    !host.is_empty() && port.parse::<u16>().is_ok_and(|port| port > 0)
+                })
         });
         if !valid {
-            bail!("CELLD_EXPORT_BROKERS entries must be host:port, not {broker:?}");
+            bail!("CELLD_EXPORT_BROKERS entries must be NODE_ID=host:port, not {broker:?}");
+        }
+        let id = broker
+            .split_once('=')
+            .map(|(id, _)| id.trim())
+            .unwrap_or_default();
+        if !ids.insert(id) {
+            bail!("CELLD_EXPORT_BROKERS lists node ID {id:?} twice");
         }
     }
     Ok(value.to_string())
@@ -656,6 +672,9 @@ mod tests {
             ("CELLD_EXPORT_BROKERS", "k8s://streams"),
             ("CELLD_EXPORT_BROKERS", "broker-a"),
             ("CELLD_EXPORT_BROKERS", "broker-a:0"),
+            ("CELLD_EXPORT_BROKERS", "a:9092"),
+            ("CELLD_EXPORT_BROKERS", "=a:9092"),
+            ("CELLD_EXPORT_BROKERS", "b0=a:9092,b0=b:9092"),
             ("CELLD_EXPORT_RECONCILE", "24"),
             ("CELLD_EXPORT_RECONCILE", "0h"),
             ("CELLD_EXPORT_RECONCILE", "1w"),
@@ -669,11 +688,17 @@ mod tests {
     fn static_brokers_are_accepted() {
         let config = enabled(&[
             ("CELLD_EXPORT_SINK", "blob-stream"),
-            ("CELLD_EXPORT_BROKERS", "a:9092,b.internal:9092"),
+            (
+                "CELLD_EXPORT_BROKERS",
+                "broker-a=a:9092,broker-b=b.internal:9092",
+            ),
             ("CELLD_EXPORT_PARTITIONS", "16"),
         ]);
         assert!(!config.sinks.bucket);
-        assert_eq!(config.brokers.as_deref(), Some("a:9092,b.internal:9092"));
+        assert_eq!(
+            config.brokers.as_deref(),
+            Some("broker-a=a:9092,broker-b=b.internal:9092")
+        );
     }
 
     #[test]
@@ -687,7 +712,7 @@ mod tests {
         let blob_stream = [
             ("CELLD_EXPORT", "1"),
             ("CELLD_EXPORT_SINK", "blob-stream"),
-            ("CELLD_EXPORT_BROKERS", "a:9092"),
+            ("CELLD_EXPORT_BROKERS", "b0=a:9092"),
         ];
         let message = error(&blob_stream);
         assert!(message.contains("CELLD_EXPORT_PARTITIONS"), "{message}");

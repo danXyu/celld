@@ -51,7 +51,7 @@ relate one variable to another apply only with `CELLD_EXPORT=1`.
 | `CELLD_EXPORT_FLUSH_BYTES` | `8388608` | The buffered bytes that trigger an early bucket sink flush. |
 | `CELLD_EXPORT_RETENTION` | `none` | `<n>d` makes the bucket sink delete its files after `n` days. `none` leaves the lifecycle to the consumer. |
 | `CELLD_EXPORT_TOPIC` | `celld-changes` | The blob-stream topic. |
-| `CELLD_EXPORT_BROKERS` | unset | Comma-separated `host:port` brokers, or `k8s://NAMESPACE/SERVICE`. Required when the blob-stream sink is on. |
+| `CELLD_EXPORT_BROKERS` | unset | Comma-separated `NODE_ID=host:port` brokers, or `k8s://NAMESPACE/SERVICE`. A static broker's `NODE_ID` must be the node ID the broker itself is configured with (its `node_identity`), because the producer assigns partitions by node ID. Required when the blob-stream sink is on. |
 | `CELLD_EXPORT_PARTITIONS` | unset | The topic's partition count, which every producer and consumer of the topic must agree on. Required when the blob-stream sink is on. |
 | `CELLD_EXPORT_ZONES` | unset | The topic's writer zones, comma-separated in the broker deployment's writer order: a zone's writer number is its position, from 0. Every node must list them alike. Unset means a single-writer topic. |
 | `CELLD_EXPORT_WRITER_ID` | the node's zone (`CELLD_ZONE`) | The zone whose writer this node produces as. It must be one of `CELLD_EXPORT_ZONES`. |

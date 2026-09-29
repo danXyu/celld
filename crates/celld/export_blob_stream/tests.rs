@@ -328,7 +328,7 @@ async fn a_build_without_the_feature_refuses_the_sink() {
         Ok(match name {
             "CELLD_EXPORT" => Some("1".into()),
             "CELLD_EXPORT_SINK" => Some("blob-stream".into()),
-            "CELLD_EXPORT_BROKERS" => Some("a:9092".into()),
+            "CELLD_EXPORT_BROKERS" => Some("b0=a:9092".into()),
             "CELLD_EXPORT_PARTITIONS" => Some("16".into()),
             _ => None,
         })
@@ -358,13 +358,18 @@ mod client_config {
 
     #[test]
     fn static_brokers_become_static_discovery() {
-        let runtime = settings("a:9092, b.internal:9092").runtime().unwrap();
+        let runtime = settings("local-broker-1=a:9092, local-broker-2=b.internal:9092")
+            .runtime()
+            .unwrap();
         let producer = runtime.producer.as_ref().unwrap();
         assert_eq!(producer.writer_id, Some(1));
         assert_eq!(producer.retry_deadline.as_ref().unwrap().seconds, 9);
         let nodes = &runtime.discovery.as_ref().unwrap().static_().nodes;
         let addresses: Vec<&str> = nodes.iter().map(|n| &*n.address).collect();
         assert_eq!(addresses, ["a:9092", "b.internal:9092"]);
+        // The brokers' own IDs, not their addresses: routing hashes them.
+        let ids: Vec<&str> = nodes.iter().map(|n| &*n.node_id).collect();
+        assert_eq!(ids, ["local-broker-1", "local-broker-2"]);
         let topic = &runtime.topics[0];
         assert_eq!(&*topic.name, "celld-changes");
         assert_eq!(topic.partition_count, 64);
@@ -393,7 +398,7 @@ async fn the_real_producer_drops_what_it_cannot_deliver() {
         Ok(match name {
             "CELLD_EXPORT" => Some("1".into()),
             "CELLD_EXPORT_SINK" => Some("blob-stream".into()),
-            "CELLD_EXPORT_BROKERS" => Some(address.to_string()),
+            "CELLD_EXPORT_BROKERS" => Some(format!("dead={address}")),
             "CELLD_EXPORT_PARTITIONS" => Some("4".into()),
             "CELLD_EXPORT_RETRY_MS" => Some("500".into()),
             _ => None,
