@@ -32,10 +32,20 @@
 //! `watermark` per stream whose delivered position moved, carrying the
 //! commits and records it certifies.
 //!
+//! A facet delete (`crate::facet_streams`) runs on the host loop, not the
+//! root's cell thread, and can fail after the op returned, so only a delete
+//! that succeeded reaches the root's FIFO ([`Exporter::facet_deleted`]).
+//! The stream gives it a position after every commit that arrived before
+//! it and releases it once a ticket asked after it settles, so the
+//! `deleted` record passes the same authority check as the root's commits
+//! and no commit that arrived after it goes out first ([`Sequencer`]).
+//!
 //! Scope of this first wiring:
 //!
 //! - root cells only. A facet's stream has its own replication and no gate
-//!   residency of its own, so facets are not exported yet;
+//!   residency of its own, so facets are not exported yet; their `deleted`
+//!   records are, on the root's stream, naming the facet by
+//!   [`facet_path`];
 //! - the shared queue budget is applied to the pending lists. The sink's
 //!   buffer counts against it but is bounded by its own early flush, so the
 //!   pending commits are what is shed;
@@ -64,16 +74,17 @@ use crate::export_sink::{
     BucketSink, BucketSinkConfig, Delivery as SinkDelivery, ExportSink, Outcome, Retention,
     SinkRecord,
 };
+use crate::facet_streams::FacetDeleted;
 use crate::replication::{ActivationLink, ActivationMode};
 use crate::storage::export_capture::{CapturedCommit, WalStamp};
 use celld_export_format::{
-    split, Body, BulkBody, Envelope, GapBody, LinkBody, LinkMode, Origin, Position, Record,
-    RecoveredBody, RowsBody, SchemaBody, SnapshotBody, SnapshotEndBody, SnapshotScope, Split,
-    StreamId, TableGen, WatermarkBody,
+    split, Body, BulkBody, DeletedBody, Envelope, GapBody, LinkBody, LinkMode, Origin, Position,
+    Record, RecoveredBody, RowsBody, SchemaBody, SnapshotBody, SnapshotEndBody, SnapshotScope,
+    Split, StreamId, TableGen, WatermarkBody,
 };
 use celld_logic::export::{Attribution, Capture, CapturedWal, Released, WalGeneration, WalPoint};
 use celld_logic::RequestError;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -136,6 +147,23 @@ enum Input {
         ticket: u64,
         result: Result<u64, RequestError>,
     },
+    /// A facet delete that succeeded on the host loop.
+    FacetDeleted {
+        body: DeletedBody,
+        at_ms: i64,
+    },
+}
+
+/// The `facet` of a facet stream's records and of the `deleted` records
+/// naming it: the facet's stream name below its root
+/// (`facets/<h>[/facets/<h>...]`, see `engine_api::facet_cell`). Hashed
+/// names never contain `/`, so a path's subtree is exactly the paths that
+/// extend it by `/`.
+pub(crate) fn facet_path<'a>(root: &str, stream: &'a str) -> Option<&'a str> {
+    stream
+        .strip_prefix(root)?
+        .strip_prefix('/')
+        .filter(|path| !path.is_empty())
 }
 
 /// The stream identity the cell thread reads from the cell itself.
@@ -281,7 +309,7 @@ pub struct Exporter {
 }
 
 impl Exporter {
-    /// Start the bucket sink and the delivery task, and install the
+    /// Start the configured sink and the delivery task, and install the
     /// exporter for the node. `ask` hands a ticket to the actor. Must run
     /// inside the node's runtime, before any cell activates.
     pub fn start(
@@ -290,27 +318,33 @@ impl Exporter {
         node: String,
         ask: impl Fn(TicketAsk) + Send + Sync + 'static,
     ) -> anyhow::Result<Arc<Exporter>> {
+        // Delivered positions are tracked for one sink; running both at once
+        // needs a position per sink.
         anyhow::ensure!(
-            !config.sinks.blob_stream,
-            "CELLD_EXPORT_SINK=blob-stream is not available in this build yet; use bucket"
+            !(config.sinks.bucket && config.sinks.blob_stream),
+            "CELLD_EXPORT_SINK=bucket,blob-stream is not supported yet; choose one sink"
         );
         let (outcomes_tx, outcomes_rx) = mpsc::unbounded_channel();
         let wake = outcomes_tx.clone();
-        let sink = BucketSink::start(
-            bucket,
-            node.clone(),
-            BucketSinkConfig {
-                flush: config.flush,
-                flush_bytes: config.flush_bytes as u64,
-                retention: match config.retention {
-                    crate::telemetry::Retention::None => Retention::None,
-                    crate::telemetry::Retention::Days(days) => Retention::Days(days),
+        let sink: Arc<dyn ExportSink> = if config.sinks.blob_stream {
+            crate::export_blob_stream::start(&config, outcomes_tx)?
+        } else {
+            Arc::new(BucketSink::start(
+                bucket,
+                node.clone(),
+                BucketSinkConfig {
+                    flush: config.flush,
+                    flush_bytes: config.flush_bytes as u64,
+                    retention: match config.retention {
+                        crate::telemetry::Retention::None => Retention::None,
+                        crate::telemetry::Retention::Days(days) => Retention::Days(days),
+                    },
+                    ..BucketSinkConfig::default()
                 },
-                ..BucketSinkConfig::default()
-            },
-            outcomes_tx,
-        );
-        let exporter = Exporter::new(config, node, Arc::new(sink), Box::new(ask), wake);
+                outcomes_tx,
+            ))
+        };
+        let exporter = Exporter::new(config, node, sink, Box::new(ask), wake);
         EXPORTER
             .set(exporter.clone())
             .map_err(|_| anyhow::anyhow!("the change exporter is already installed"))?;
@@ -433,6 +467,34 @@ impl Exporter {
         if let Some(tx) = tx {
             let _ = tx.send(Input::Proven { ticket, result });
         }
+    }
+
+    /// A facet delete that succeeded, for the root's stream at `epoch`.
+    /// Nothing is recorded when the root is not exported or its stream is
+    /// gone; the reconciler reports a consumer stream with no bucket prefix.
+    pub(crate) fn facet_deleted(&self, root: &str, epoch: u64, deleted: &FacetDeleted) {
+        let Some(path) = facet_path(root, &deleted.stream) else {
+            tracing::warn!(root, stream = %deleted.stream, "export: a facet delete names no facet of its root");
+            return;
+        };
+        let tx = self
+            .streams
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(root.to_string(), epoch))
+            .and_then(mpsc::WeakUnboundedSender::upgrade);
+        let Some(tx) = tx else {
+            return;
+        };
+        let _ = tx.send(Input::FacetDeleted {
+            body: DeletedBody {
+                facet: Some(path.to_string()),
+                incarnation: None,
+                subtree: true,
+                through_incarnation: Some(deleted.through),
+            },
+            at_ms: crate::asyncrt::wall_ms(),
+        });
     }
 
     /// Emit a `recovered` record for every exported cell epoch `recovery`
@@ -728,7 +790,7 @@ struct Stream {
     /// before a commit released ahead of it (or before an advance).
     last_txid: u64,
     /// The newest position this stream has submitted or advanced to.
-    last_position: Position,
+    delivered: Position,
     next_ticket: u64,
     /// The ticket in flight and the position it asked for.
     outstanding: Option<(u64, u64)>,
@@ -742,6 +804,118 @@ struct Stream {
     this: mpsc::WeakUnboundedSender<Input>,
     counted_bytes: u64,
     counted_commits: u64,
+    /// The newest committed-write position a commit carried, which a
+    /// ticket for a facet delete asks for.
+    last_position: u64,
+    sequencer: Sequencer<Option<CapturedCommit>>,
+}
+
+/// A facet delete waiting on its root's stream.
+#[derive(Debug, PartialEq)]
+struct PendingDelete {
+    /// Commits that arrived before it.
+    after: u64,
+    /// The first ticket asked after it arrived.
+    ticket: u64,
+    body: DeletedBody,
+    at_ms: i64,
+}
+
+/// What a stream turns into records, in stream order.
+#[derive(Debug, PartialEq)]
+enum Out<T> {
+    Released(Released<T>),
+    Deleted(PendingDelete),
+}
+
+/// Orders a root stream's facet deletes among its released commits: a
+/// delete goes out after every commit that arrived before it, and once a
+/// ticket asked after it has settled. Released commits behind a waiting
+/// delete wait with it.
+#[derive(Debug)]
+struct Sequencer<T> {
+    received: u64,
+    emitted: u64,
+    proven_ticket: u64,
+    held: VecDeque<Released<T>>,
+    deletes: VecDeque<PendingDelete>,
+}
+
+impl<T> Default for Sequencer<T> {
+    fn default() -> Self {
+        Self {
+            received: 0,
+            emitted: 0,
+            proven_ticket: 0,
+            held: VecDeque::new(),
+            deletes: VecDeque::new(),
+        }
+    }
+}
+
+impl<T> Sequencer<T> {
+    /// A commit arrived from the cell thread.
+    fn commit(&mut self) {
+        self.received += 1;
+    }
+
+    /// A facet delete arrived. `next_ticket` is the number of the next
+    /// ticket the stream asks for.
+    fn delete(&mut self, next_ticket: u64, body: DeletedBody, at_ms: i64) {
+        self.deletes.push_back(PendingDelete {
+            after: self.received,
+            ticket: next_ticket,
+            body,
+            at_ms,
+        });
+    }
+
+    /// A ticket settled with a proof.
+    fn proven(&mut self, ticket: u64) {
+        self.proven_ticket = self.proven_ticket.max(ticket);
+    }
+
+    fn waiting(&self) -> usize {
+        self.deletes.len()
+    }
+
+    /// Nothing is held back: every released commit has gone out.
+    fn idle(&self) -> bool {
+        self.held.is_empty() && self.deletes.is_empty()
+    }
+
+    /// Take what may go out now. `drained` says the attribution holds no
+    /// commit, so every commit that arrived has been released.
+    fn take(&mut self, released: Vec<Released<T>>, drained: bool) -> Vec<Out<T>> {
+        self.held.extend(released);
+        let mut out = Vec::new();
+        loop {
+            if let Some(delete) = self.deletes.front() {
+                let ahead_done = self.emitted >= delete.after || (drained && self.held.is_empty());
+                if ahead_done {
+                    if self.proven_ticket < delete.ticket {
+                        break;
+                    }
+                    let delete = self.deletes.pop_front().expect("front");
+                    out.push(Out::Deleted(delete));
+                    continue;
+                }
+            }
+            let Some(entry) = self.held.pop_front() else {
+                break;
+            };
+            self.emitted += match &entry {
+                Released::Commit { .. } => 1,
+                Released::Gap {
+                    unmatched,
+                    overflowed,
+                    ..
+                } => unmatched + overflowed,
+            };
+            out.push(Out::Released(entry));
+        }
+        out
+    }
 }
 
 impl Stream {
@@ -772,7 +946,7 @@ impl Stream {
             attribution: Attribution::new(),
             next_commit: 1,
             last_txid: 0,
-            last_position: Position::new(epoch, 0, 0),
+            delivered: Position::new(epoch, 0, 0),
             next_ticket: 1,
             outstanding: None,
             wanted: None,
@@ -782,6 +956,8 @@ impl Stream {
             this,
             counted_bytes: 0,
             counted_commits: 0,
+            last_position: 0,
+            sequencer: Sequencer::default(),
         }
     }
 
@@ -807,6 +983,14 @@ impl Stream {
             }
         }
         self.account(0, 0);
+        if self.sequencer.waiting() > 0 {
+            tracing::warn!(
+                cell = %self.key.0,
+                epoch = self.key.1,
+                deletes = self.sequencer.waiting(),
+                "export: the stream ended before its facet deletes were proven; the reconciler reports them"
+            );
+        }
         let mut streams = self
             .exporter
             .streams
@@ -847,6 +1031,8 @@ impl Stream {
                 if !commit.bulk.is_empty() {
                     counters.bulk_commits.fetch_add(1, Ordering::Relaxed);
                 }
+                self.sequencer.commit();
+                self.last_position = self.last_position.max(position);
                 match stamp {
                     WalStamp::At {
                         salt1,
@@ -865,6 +1051,10 @@ impl Stream {
                 self.wanted = Some(self.wanted.map_or(position, |wanted| wanted.max(position)));
             }
             Some(Input::Shed { stamp, position }) => {
+                // A shed commit still takes its place in the stream, as a
+                // gap that counts it.
+                self.sequencer.commit();
+                self.last_position = self.last_position.max(position);
                 match stamp {
                     WalStamp::At {
                         salt1,
@@ -887,6 +1077,8 @@ impl Stream {
                     },
                 position,
             }) => {
+                self.sequencer.commit();
+                self.last_position = self.last_position.max(position);
                 self.attribution.commit(
                     WalPoint {
                         generation: WalGeneration { salt1, salt2 },
@@ -901,6 +1093,14 @@ impl Stream {
             // capture was already reported, and the next commit settles it.
             Some(Input::Wrote { .. }) => {}
             Some(Input::CaughtUp) => self.attribution.caught_up(),
+            Some(Input::FacetDeleted { body, at_ms }) => {
+                self.sequencer.delete(self.next_ticket, body, at_ms);
+                // The delete needs a ticket of its own, asked after it.
+                self.wanted = Some(
+                    self.wanted
+                        .map_or(self.last_position, |wanted| wanted.max(self.last_position)),
+                );
+            }
             Some(Input::Captured(capture)) => self.attribution.captured(&capture),
             Some(Input::Proven { ticket, result }) => {
                 let Some((asked, position)) = self.outstanding else {
@@ -914,6 +1114,7 @@ impl Stream {
                 match result {
                     Ok(txid) => {
                         self.retry = TICKET_RETRY;
+                        self.sequencer.proven(ticket);
                         self.attribution.proven(txid);
                     }
                     Err(RequestError::NodeFenced) => {
@@ -938,8 +1139,15 @@ impl Stream {
         counters
             .attribution_mismatches
             .fetch_add(mismatched, Ordering::Relaxed);
-        self.release(released);
-        self.advance();
+        let out = self
+            .sequencer
+            .take(released, self.attribution.pending_len() == 0);
+        self.release(out);
+        // Commits held behind a facet delete are submitted later, so the
+        // delivered position may not pass them yet.
+        if self.sequencer.idle() {
+            self.advance();
+        }
         self.account(
             self.attribution.pending_bytes(),
             self.attribution.pending_len() as u64,
@@ -1013,10 +1221,10 @@ impl Stream {
     fn advance(&mut self) {
         let released = self.attribution.released_position();
         let position = Position::new(self.key.1, released, self.next_commit - 1);
-        if position <= self.last_position {
+        if position <= self.delivered {
             return;
         }
-        self.last_position = position;
+        self.delivered = position;
         self.last_txid = self.last_txid.max(released);
         self.exporter.advance(Submitted {
             key: self.key.clone(),
@@ -1033,7 +1241,7 @@ impl Stream {
     /// Submit the residency's `link`, ahead of every commit.
     fn submit_link(&mut self, link: ActivationLink) {
         let position = link_position(self.key.1, &link);
-        self.last_position = self.last_position.max(position);
+        self.delivered = self.delivered.max(position);
         let envelope = self.exporter.envelope(
             &self.identity,
             &self.cell_name,
@@ -1076,8 +1284,9 @@ impl Stream {
         self.exporter.submit(out);
     }
 
-    /// Turn released commits and gaps into records and submit them.
-    fn release(&mut self, released: Vec<Released<Option<CapturedCommit>>>) {
+    /// Turn released commits, gaps, and facet deletes into records and
+    /// submit them.
+    fn release(&mut self, released: Vec<Out<Option<CapturedCommit>>>) {
         let epoch = self.key.1;
         let max_record = self.exporter.config.max_record_bytes;
         let mut out: Vec<(Record, Submitted)> = Vec::new();
@@ -1085,34 +1294,47 @@ impl Stream {
             let entry = match entry {
                 // A commit with no exported row takes no position; the
                 // released position covers its TXID.
-                Released::Commit {
+                Out::Released(Released::Commit {
                     label,
                     payload: None,
-                } => {
+                }) => {
                     self.last_txid = self.last_txid.max(label);
                     continue;
                 }
-                Released::Commit {
+                Out::Released(Released::Commit {
                     label,
                     payload: Some(payload),
-                } => Released::Commit { label, payload },
-                Released::Gap {
+                }) => Out::Released(Released::Commit { label, payload }),
+                Out::Released(Released::Gap {
                     after,
                     through,
                     unmatched,
                     overflowed,
-                } => Released::Gap {
+                }) => Out::Released(Released::Gap {
                     after,
                     through,
                     unmatched,
                     overflowed,
-                },
+                }),
+                Out::Deleted(delete) => Out::Deleted(delete),
             };
             let number = self.next_commit;
             self.next_commit += 1;
             let mut records = Vec::new();
             match entry {
-                Released::Commit { label, payload } => {
+                Out::Deleted(delete) => {
+                    let position = Position::new(epoch, self.last_txid, number);
+                    records.push(Record {
+                        envelope: self.exporter.envelope(
+                            &self.identity,
+                            &self.cell_name,
+                            position,
+                            delete.at_ms,
+                        ),
+                        body: Body::Deleted(delete.body),
+                    });
+                }
+                Out::Released(Released::Commit { label, payload }) => {
                     self.last_txid = self.last_txid.max(label);
                     let position = Position::new(epoch, label, number);
                     let envelope = self.exporter.envelope(
@@ -1198,12 +1420,12 @@ impl Stream {
                         });
                     }
                 }
-                Released::Gap {
+                Out::Released(Released::Gap {
                     after,
                     through,
                     unmatched,
                     overflowed,
-                } => {
+                }) => {
                     self.exporter.counters.gaps.fetch_add(1, Ordering::Relaxed);
                     let position = Position::new(epoch, self.last_txid.max(after), number);
                     records.push(Record {
@@ -1225,7 +1447,7 @@ impl Stream {
             }
             let last = records.len().saturating_sub(1);
             if let Some(record) = records.last() {
-                self.last_position = self.last_position.max(record.envelope.position);
+                self.delivered = self.delivered.max(record.envelope.position);
             }
             for (index, record) in records.into_iter().enumerate() {
                 let meta = Submitted {
@@ -1648,6 +1870,140 @@ mod tests {
             assert_eq!(*sink.log.lock().unwrap(), ["rows", "watermark", "close"]);
             assert_eq!(exporter.state()["watermarks"], 1);
         });
+    }
+
+    fn delete_body(through: u64) -> DeletedBody {
+        DeletedBody {
+            facet: Some("facets/aa".into()),
+            incarnation: None,
+            subtree: true,
+            through_incarnation: Some(through),
+        }
+    }
+
+    fn commit(label: u64) -> Released<u64> {
+        Released::Commit {
+            label,
+            payload: label,
+        }
+    }
+
+    /// The stream order `take` produced: a commit's payload, or `D` and the
+    /// delete's bound.
+    fn order(out: Vec<Out<u64>>) -> Vec<String> {
+        out.into_iter()
+            .map(|out| match out {
+                Out::Released(Released::Commit { payload, .. }) => payload.to_string(),
+                Out::Released(Released::Gap { through, .. }) => format!("gap..{through}"),
+                Out::Deleted(delete) => {
+                    format!("D{}", delete.body.through_incarnation.unwrap())
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_facet_delete_follows_the_commits_before_it_and_leads_the_rest() {
+        let mut seq = Sequencer::default();
+        seq.commit();
+        seq.commit();
+        seq.delete(5, delete_body(9), 0);
+        seq.commit();
+        // The first commit is out; the delete waits for the second.
+        assert_eq!(order(seq.take(vec![commit(1)], false)), ["1"]);
+        seq.proven(5);
+        assert_eq!(order(seq.take(vec![], false)), Vec::<String>::new());
+        // The commit after the delete, released with the one before it,
+        // goes out after the delete.
+        assert_eq!(
+            order(seq.take(vec![commit(2), commit(3)], true)),
+            ["2", "D9", "3"]
+        );
+        assert_eq!(seq.waiting(), 0);
+    }
+
+    #[test]
+    fn a_facet_delete_waits_for_a_ticket_asked_after_it() {
+        let mut seq = Sequencer::default();
+        seq.commit();
+        // Ticket 3 was in flight when the delete arrived; 4 is asked next.
+        seq.delete(4, delete_body(7), 0);
+        seq.commit();
+        seq.proven(3);
+        // Released commits behind the waiting delete wait with it.
+        assert_eq!(order(seq.take(vec![commit(1), commit(2)], true)), ["1"]);
+        seq.proven(4);
+        assert_eq!(order(seq.take(vec![], true)), ["D7", "2"]);
+    }
+
+    #[test]
+    fn a_gap_counts_the_commits_it_dropped() {
+        let mut seq = Sequencer::default();
+        for _ in 0..3 {
+            seq.commit();
+        }
+        seq.delete(1, delete_body(2), 0);
+        seq.proven(1);
+        let gap = Released::Gap {
+            after: 0,
+            through: 4,
+            unmatched: 1,
+            overflowed: 1,
+        };
+        assert_eq!(order(seq.take(vec![gap], false)), ["gap..4"]);
+        assert_eq!(order(seq.take(vec![commit(5)], false)), ["5", "D2"]);
+    }
+
+    #[test]
+    fn a_facet_delete_on_an_idle_stream_needs_only_its_ticket() {
+        let mut seq = Sequencer::<u64>::default();
+        seq.delete(1, delete_body(1), 0);
+        seq.delete(1, delete_body(2), 0);
+        assert!(seq.take(vec![], true).is_empty());
+        seq.proven(1);
+        assert_eq!(order(seq.take(vec![], true)), ["D1", "D2"]);
+    }
+
+    #[test]
+    fn facet_paths_are_the_stream_below_the_root() {
+        let names = |path: &[&str]| path.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        let root = "Room:1";
+        let child = crate::engine_api::facet_cell(root, &names(&["a", "b"]));
+        let path = facet_path(root, &child).unwrap();
+        assert!(path.starts_with("facets/"));
+        assert_eq!(path.matches("/facets/").count(), 1);
+        assert_eq!(facet_path(root, root), None);
+        assert_eq!(facet_path(root, "Room:10/facets/x"), None);
+    }
+
+    #[test]
+    fn a_facet_deleted_record_carries_its_bound() {
+        let record = Record {
+            envelope: Envelope {
+                stream: StreamId {
+                    script: "s".into(),
+                    class: "Room".into(),
+                    cell: "Room:1".into(),
+                    facet: None,
+                    incarnation: 0,
+                },
+                cell_name: None,
+                position: Position::new(2, 7, 3),
+                committed_at: 0,
+                node: "n".into(),
+                origin: Origin::Live,
+                fragment: 1,
+                fragments: 1,
+            },
+            body: Body::Deleted(delete_body(42)),
+        };
+        let json: serde_json::Value = serde_json::from_slice(&record.to_json()).unwrap();
+        assert_eq!(json["kind"], "deleted");
+        assert_eq!(json["target_facet"], "facets/aa");
+        assert_eq!(json["subtree"], true);
+        assert_eq!(json["through_incarnation"], 42);
+        assert!(json.get("target_incarnation").is_none());
+        assert_eq!(Record::from_json(&record.to_json()).unwrap(), record);
     }
 
     #[test]

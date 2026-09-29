@@ -222,7 +222,7 @@ impl CellRuntime {
         root: &str,
         epoch: u64,
         names: &[String],
-    ) -> anyhow::Result<(PathBuf, bool)> {
+    ) -> anyhow::Result<crate::host_channels::FacetFile> {
         self.facets
             .open(
                 self.replication.as_ref(),
@@ -234,14 +234,16 @@ impl CellRuntime {
             .await
     }
 
-    /// Delete a facet's stream and every stream below it.
+    /// Delete a facet's stream and every stream below it. Once the delete
+    /// succeeded, change export records it on the root's stream.
     pub async fn delete_facet(
         &self,
         root: &str,
         epoch: u64,
         names: &[String],
     ) -> anyhow::Result<()> {
-        self.facets
+        let deleted = self
+            .facets
             .delete(
                 self.replication.as_ref(),
                 |cell| self.data_dir.join(cell),
@@ -249,7 +251,11 @@ impl CellRuntime {
                 epoch,
                 names,
             )
-            .await
+            .await?;
+        if let Some(exporter) = crate::export_live::installed() {
+            exporter.facet_deleted(root, epoch, &deleted);
+        }
+        Ok(())
     }
 
     /// Prove every committed write of a facet's stream durable.

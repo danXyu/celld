@@ -1049,7 +1049,11 @@ impl RuntimeManager {
         spec: &celld_logic::RestoreSpec,
     ) -> anyhow::Result<celld_logic::RestoreOutcome> {
         let path = self.db_path(cell, spec.epoch);
-        self.facets.register(cell, spec);
+        self.facets.register(
+            cell,
+            spec,
+            Some(path.with_file_name(crate::facet_streams::INCARNATION_MARK_FILE)),
+        );
         if let Some(replication) = &self.replication {
             let (restored_path, restored, vfs) = replication.restore(cell, spec, true).await?;
             if restored_path != path {
