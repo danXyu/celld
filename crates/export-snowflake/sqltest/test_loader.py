@@ -152,6 +152,8 @@ def test_erase(emulator, loader, scenarios):
     loader("erase", "app", "Room", victim, "--reason", "test")
     loader("erase", "app", "Room", victim)  # a second erase adds no tombstone
     assert len(w.rows("SELECT * FROM EXPORT_TOMBSTONES")) == 1
+    # The rows are gone when erase returns, not when a scheduled run gets to it.
+    assert emulator.scheduled == []
     assert not w.rows(f"SELECT * FROM CELL_CHANGES WHERE cell = '{victim}'")
     assert not w.rows(f"SELECT * FROM CELL_META WHERE cell = '{victim}'")
     assert not w.rows(f"SELECT * FROM CELL_STREAMS WHERE cell = '{victim}' AND NOT removed")

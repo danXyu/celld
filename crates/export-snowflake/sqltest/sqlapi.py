@@ -24,9 +24,12 @@ makes:
   bucket notification;
 - the stream EXPORT_LANDING_NEW is a view over EXPORT_LANDING's rows past an
   offset, advanced when a task that read it commits;
-- a task is its EXECUTE IMMEDIATE body, run statement by statement by
-  EXECUTE TASK or `run_task()`, standing in for the schedule; ALTER TASK
-  RESUME and SUSPEND set its state;
+- an EXECUTE IMMEDIATE block runs its statements one by one, a transaction's
+  BEGIN and COMMIT dropped;
+- a task is its EXECUTE IMMEDIATE block, run by `run_task()`, standing in
+  for the schedule. EXECUTE TASK only records that a run was asked for,
+  since in Snowflake it only schedules one, so nothing may rely on it having
+  run. ALTER TASK RESUME and SUSPEND set a task's state;
 - SHOW PIPES answers one row with a made-up notification channel.
 """
 
@@ -60,6 +63,7 @@ class Emulator:
         self.stream_offset = None
         self.loaded_files = set()
         self.tasks = {}  # name -> {"statements": [...], "state": ...}
+        self.scheduled = []  # tasks EXECUTE TASK asked to run
         self.log = []  # every statement received, in order
 
     # ------------------------------------------------------------ SQL
@@ -111,20 +115,27 @@ class Emulator:
         return columns, out
 
     def run_task(self, name):
-        task = self.tasks[name]
-        reads_stream = any("EXPORT_LANDING_NEW" in s for s in task["statements"])
+        self.run_block(self.tasks[name]["statements"])
+        return ["status"], [[f"Task {name} executed."]]
+
+    @staticmethod
+    def block_statements(body):
+        statements = [b.strip() for b in re.split(r";\s*\n", body) if b.strip()]
+        return [b.rstrip(";") for b in statements if b not in ("BEGIN TRANSACTION", "COMMIT")]
+
+    def run_block(self, statements):
+        reads_stream = any("EXPORT_LANDING_NEW" in s for s in statements)
         upper = None
         if reads_stream:
             upper = self.cur.execute("SELECT COALESCE(MAX(rowid), -1) FROM EXPORT_LANDING").fetchall()[0][0]
             self.stream_view(upper)
         try:
-            for s in task["statements"]:
+            for s in statements:
                 self.query(s)
         finally:
             if reads_stream:
                 self.stream_offset = upper
                 self.stream_view()
-        return ["status"], [[f"Task {name} executed."]]
 
     def ingest(self):
         """The pipe's COPY, as a bucket notification would run it."""
@@ -152,9 +163,7 @@ class Emulator:
         if m := re.match(r"CREATE TASK IF NOT EXISTS (\w+)\s.*?\bAS\s+EXECUTE IMMEDIATE \$\$\s*BEGIN\s*(.*)END;\s*\$\$$", s, re.S):
             name, body = m.groups()
             if name not in self.tasks:
-                statements = [b.strip() for b in re.split(r";\s*\n", body) if b.strip()]
-                statements = [b.rstrip(";") for b in statements if b not in ("BEGIN TRANSACTION", "COMMIT")]
-                self.tasks[name] = {"statements": statements, "state": "suspended", "sql": s}
+                self.tasks[name] = {"statements": self.block_statements(body), "state": "suspended", "sql": s}
             return ["status"], [[f"Task {name} created."]]
         if m := re.match(r"ALTER TASK (\w+) (RESUME|SUSPEND)$", s):
             name, action = m.groups()
@@ -163,7 +172,13 @@ class Emulator:
             self.tasks[name]["state"] = "started" if action == "RESUME" else "suspended"
             return ["status"], [["Statement executed successfully."]]
         if m := re.match(r"EXECUTE TASK (\w+)$", s):
-            return self.run_task(m.group(1))
+            if m.group(1) not in self.tasks:
+                raise RuntimeError(f"Task '{m.group(1)}' does not exist or not authorized.")
+            self.scheduled.append(m.group(1))
+            return ["status"], [[f"Task {m.group(1)} is scheduled to run immediately."]]
+        if m := re.match(r"EXECUTE IMMEDIATE \$\$\s*BEGIN\s*(.*)END;\s*\$\$$", s, re.S):
+            self.run_block(self.block_statements(m.group(1)))
+            return ["anonymous block"], [[None]]
         if re.match(r"SHOW PIPES LIKE 'EXPORT_PIPE'$", s):
             columns = ["created_on", "name", "database_name", "schema_name", "definition", "owner",
                        "notification_channel", "comment"]

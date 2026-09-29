@@ -151,6 +151,23 @@ impl Deployment {
     }
 }
 
+/// A task's body: the `EXECUTE IMMEDIATE` block the task named by
+/// `statement` in `load.sql` runs, with the statements it inlines filled
+/// in. Run on its own, it does the task's work synchronously, since
+/// `EXECUTE TASK` only schedules a run.
+pub fn task_body(statement_name: &str) -> Result<String, RenderError> {
+    let task = statement(LOAD_SQL, statement_name)?;
+    let start = task
+        .sql
+        .find("EXECUTE IMMEDIATE")
+        .ok_or_else(|| RenderError::NoStatement(format!("{statement_name} body")))?;
+    let vars: Vec<(String, String)> = statements(LOAD_SQL)
+        .into_iter()
+        .map(|s| (s.name.to_ascii_uppercase(), s.sql))
+        .collect();
+    fill(statement_name, &task.sql[start..], &vars)
+}
+
 /// The statement named `name` in `file`.
 pub fn statement(file: &str, name: &str) -> Result<Statement, RenderError> {
     statements(file)
@@ -310,6 +327,26 @@ mod tests {
         // Tables first, then loading, then views that read both.
         assert!(pos("cell_changes") < pos("export_route_task"));
         assert!(pos("export_route_task") < pos("cell_streams"));
+    }
+
+    #[test]
+    fn task_bodies_are_the_deployed_tasks_bodies() {
+        let d = Deployment {
+            stage_url: "s3://b/".into(),
+            storage_integration: "I".into(),
+            warehouse: "W".into(),
+        };
+        let all = d.statements().unwrap();
+        for (task, inlined) in [
+            ("export_route_task", "route_changes"),
+            ("export_erase_task", "erase_tombstoned"),
+        ] {
+            let body = task_body(task).unwrap();
+            assert!(body.starts_with("EXECUTE IMMEDIATE $$"), "{body}");
+            assert!(body.contains(&statement(LOAD_SQL, inlined).unwrap().sql));
+            let deployed = all.iter().find(|s| s.name == task).unwrap();
+            assert!(deployed.sql.ends_with(&body));
+        }
     }
 
     #[test]

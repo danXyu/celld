@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 
 use celld_export_format::SchemaBody;
 
-use crate::{literal, statement, Deployment, DynamicTable, RenderError, LOAD_SQL};
+use crate::{literal, statement, task_body, Deployment, DynamicTable, RenderError, LOAD_SQL};
 
 /// A statement's result as the SQL API returns it: every value as text,
 /// NULL as `None`.
@@ -203,6 +203,17 @@ impl<W: Warehouse> Loader<W> {
                 bodies.push(body);
             }
         }
+        // Rows arrive in no particular order, and the projection keeps
+        // input order among equal generations, so sort to render the same
+        // statement from the same union every time.
+        for bodies in out.values_mut() {
+            bodies.sort_by_cached_key(|b| {
+                (
+                    b.generation,
+                    serde_json::to_string(b).expect("a schema body encodes"),
+                )
+            });
+        }
         Ok(out)
     }
 
@@ -283,20 +294,22 @@ impl<W: Warehouse> Loader<W> {
     }
 
     /// Copy the stage files under `prefix` (relative to the stage URL) into
-    /// `EXPORT_LANDING`, then run the route task so they reach the tables
-    /// without waiting for its schedule. This is how snapshot, repair and
+    /// `EXPORT_LANDING`, then route them into the tables by running the
+    /// route task's body, which returns once they are routed. This is how snapshot, repair and
     /// backfill files load when the pipe does not see them. Files COPY has
     /// already loaded are skipped. Returns COPY's per-file result.
     pub fn load_prefix(&mut self, prefix: &str) -> Result<Rows, LoadError> {
         let copy = copy_from_prefix(prefix)?;
         let loaded = self.run("copy_into_landing", &copy)?;
-        self.run("route", "EXECUTE TASK EXPORT_ROUTE")?;
+        self.run("route", &task_body("export_route_task")?)?;
         Ok(loaded)
     }
 
     /// Tombstone a stream, unless it already has an open tombstone for the
-    /// same incarnations, and run the erase task now. Routing stops taking
-    /// its records at once; the views hide it at once.
+    /// same incarnations, and delete its rows by running the erase task's
+    /// body, which returns once they are deleted. Routing stops taking its
+    /// records at once; the views hide it at once. The rows stay in time
+    /// travel for a day.
     pub fn erase(&mut self, e: &Erasure) -> Result<(), LoadError> {
         let incarnation = e
             .incarnation
@@ -319,7 +332,7 @@ impl<W: Warehouse> Loader<W> {
                  AND t.incarnation IS NOT DISTINCT FROM {incarnation})"
             ),
         )?;
-        self.run("erase", "EXECUTE TASK EXPORT_ERASE")?;
+        self.run("erase", &task_body("export_erase_task")?)?;
         Ok(())
     }
 
@@ -553,6 +566,37 @@ mod tests {
     }
 
     #[test]
+    fn the_order_schemas_arrive_in_does_not_replace_a_table() {
+        let a = (
+            "app".to_string(),
+            "Room".to_string(),
+            schema("items", 1, &[("id", "INTEGER"), ("a", "TEXT")]),
+        );
+        let b = (
+            "app".to_string(),
+            "Room".to_string(),
+            schema("items", 1, &[("id", "INTEGER"), ("b", "REAL")]),
+        );
+        let fake = Fake {
+            schemas: vec![a.clone(), b.clone()],
+            ..Fake::default()
+        };
+        let mut l = Loader::new(fake, config());
+        assert_eq!(l.sync_dynamic_tables().unwrap().created.len(), 1);
+        let name = dynamic_table_name("CF", "app", "Room", "items");
+        let created = l
+            .warehouse
+            .log
+            .iter()
+            .find(|s| s.starts_with("CREATE OR REPLACE DYNAMIC TABLE"))
+            .unwrap()
+            .clone();
+        l.warehouse.dynamic_tables = vec![(name.clone(), created)];
+        l.warehouse.schemas = vec![b, a];
+        assert_eq!(l.sync_dynamic_tables().unwrap().unchanged, vec![name]);
+    }
+
+    #[test]
     fn a_failed_dynamic_table_is_reported_and_not_recorded() {
         let fake = Fake {
             schemas: vec![(
@@ -578,7 +622,7 @@ mod tests {
         let mut l = Loader::new(Fake::default(), config());
         l.load_prefix("repair/2026/09/29").unwrap();
         assert!(l.warehouse.log[0].contains("FROM @EXPORT_STAGE/repair/2026/09/29\n"));
-        assert_eq!(l.warehouse.log[1], "EXECUTE TASK EXPORT_ROUTE");
+        assert_eq!(l.warehouse.log[1], task_body("export_route_task").unwrap());
         for bad in ["", "/abs", "a/../b", "a b", "x'; DROP", "a\\b"] {
             assert!(
                 matches!(copy_from_prefix(bad), Err(LoadError::StagePath(_))),
@@ -603,7 +647,7 @@ mod tests {
         assert!(sql.contains("'it''s'"));
         assert!(sql.contains("t.facet = ''"));
         assert!(sql.contains("IS NOT DISTINCT FROM NULL"));
-        assert_eq!(l.warehouse.log[1], "EXECUTE TASK EXPORT_ERASE");
+        assert_eq!(l.warehouse.log[1], task_body("export_erase_task").unwrap());
     }
 
     #[test]

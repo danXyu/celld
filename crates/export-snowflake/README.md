@@ -55,8 +55,8 @@ renders it, and the loader that deploys and drives it. Without the
 | `deploy` | create every object that is missing, resume the two tasks (Snowflake creates a task suspended), print the pipe's notification channel, and sync the Dynamic Tables |
 | `sync` | render each table's Dynamic Table from the union of its `schema` records in `CELL_META`, and create or replace only those whose statement changed (`EXPORT_DYNAMIC_TABLES` holds what was deployed; replacing one restarts it with a full refresh) |
 | `run [SECONDS]` | `deploy`, then `sync` every SECONDS |
-| `load PREFIX` | `COPY` the stage files under PREFIX (snapshot, repair, backfill) into `EXPORT_LANDING` and run the route task now; COPY's load history skips files already loaded |
-| `erase SCRIPT CLASS CELL [--facet P] [--incarnation N] [--reason R]` | add a tombstone, unless an open one matches, and run the erase task now |
+| `load PREFIX` | `COPY` the stage files under PREFIX (snapshot, repair, backfill) into `EXPORT_LANDING` and route them by running the route task's body, which returns once they are routed (`EXECUTE TASK` only schedules a run); COPY's load history skips files already loaded |
+| `erase SCRIPT CLASS CELL [--facet P] [--incarnation N] [--reason R]` | add a tombstone, unless an open one matches, and delete the stream's rows by running the erase task's body |
 | `gaps`, `certified` | print `EXPORT_GAPS` or `CELL_CERTIFIED`: the read side the repair driver, `verify` and the reconciler need |
 
 Settings are environment variables: `SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_USER`,
