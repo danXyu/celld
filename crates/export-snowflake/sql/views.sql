@@ -82,7 +82,22 @@ LEFT JOIN facet_deleted f
  AND f.facet = s.facet AND f.incarnation = s.incarnation
 LEFT JOIN erased e
   ON e.script = s.script AND e.class = s.class AND e.cell = s.cell
- AND e.facet = s.facet AND e.incarnation = s.incarnation;
+ AND e.facet = s.facet AND e.incarnation = s.incarnation
+-- Drop a recovery placeholder only once every record it holds has a
+-- matching named stream, as Consumer::fully_adopted does.
+WHERE NOT (s.script = ''
+    AND NOT EXISTS (SELECT 1 FROM CELL_CHANGES c
+        WHERE c.script = s.script AND c.class = s.class AND c.cell = s.cell
+          AND c.facet = s.facet AND c.incarnation = s.incarnation)
+    AND NOT EXISTS (SELECT 1 FROM CELL_META m
+        WHERE m.script = s.script AND m.class = s.class AND m.cell = s.cell
+          AND m.facet = s.facet AND m.incarnation = s.incarnation
+          AND (m.kind <> 'recovered' OR NOT EXISTS (
+              SELECT 1 FROM streams target
+              WHERE target.script <> '' AND target.class = s.class
+                AND target.cell = s.cell AND target.facet = s.facet
+                AND (s.facet <> '' OR target.incarnation <= m.body:head:epoch::NUMBER(20, 0))
+          ))));
 
 -- statement: cell_changes_current
 -- Whole `rows` and `snapshot` records, one row per fragment, each fragment
@@ -133,9 +148,31 @@ WITH records AS (
             TO_JSON(m.body:tables)
         ORDER BY m.loaded_at, m.file_name
     ) = 1
+),
+adoptions AS (
+    SELECT r.*, s.script AS adopted_script, s.incarnation AS adopted_incarnation
+    FROM records r
+    JOIN CELL_STREAMS s
+      ON s.class = r.class AND s.cell = r.cell AND s.facet = r.facet
+     AND s.script <> ''
+     AND (s.facet <> '' OR s.incarnation <= r.body:head:epoch::NUMBER(20, 0))
+    WHERE r.kind = 'recovered' AND r.script = ''
+    QUALIFY s.facet <> '' OR s.incarnation = MAX(s.incarnation) OVER (
+        PARTITION BY r.class, r.cell, r.facet, r.position_key, r.origin, s.script)
+),
+resolved AS (
+    SELECT r.* FROM records r
+    WHERE NOT (r.kind = 'recovered' AND r.script = '' AND EXISTS (
+        SELECT 1 FROM adoptions a WHERE a.class = r.class AND a.cell = r.cell
+          AND a.facet = r.facet AND a.position_key = r.position_key AND a.origin = r.origin
+    ))
+    UNION ALL
+    SELECT a.* EXCLUDE (adopted_script, adopted_incarnation)
+        REPLACE (a.adopted_script AS script, a.adopted_incarnation AS incarnation)
+    FROM adoptions a
 )
 SELECT r.*
-FROM records r
+FROM resolved r
 JOIN CELL_STREAMS s
   ON s.script = r.script AND s.class = r.class AND s.cell = r.cell
  AND s.facet = r.facet AND s.incarnation = r.incarnation
@@ -425,7 +462,9 @@ bounded AS (
 ),
 found AS (
     SELECT
-        b.*,
+        b.* REPLACE (
+            CASE WHEN b.gap_kind = 'recovered' AND COALESCE(b.detail:loss::BOOLEAN, FALSE)
+                THEN GREATEST(b.bound_txid, COALESCE(cc.txid, 0)) ELSE b.bound_txid END AS bound_txid),
         cc.txid AS certified_txid
     FROM bounded b
     LEFT JOIN CELL_CERTIFIED cc
@@ -438,8 +477,11 @@ found AS (
     WHERE b.bound_epoch IS NOT NULL AND b.bound_txid IS NOT NULL
       AND (sc.cut_key IS NULL
            OR sc.cut_key < LPAD(b.bound_epoch::STRING, 20, '0') || '.'
-                           || LPAD(b.bound_txid::STRING, 20, '0'))
-      AND (b.gap_kind = 'gap' OR b.bound_txid > COALESCE(cc.txid, 0))
+                           || LPAD((CASE WHEN b.gap_kind = 'recovered' AND COALESCE(b.detail:loss::BOOLEAN, FALSE)
+                               THEN GREATEST(b.bound_txid, COALESCE(cc.txid, 0)) ELSE b.bound_txid END)::STRING, 20, '0'))
+      AND (b.gap_kind = 'gap' OR b.bound_txid > COALESCE(cc.txid, 0)
+           OR (b.gap_kind = 'recovered' AND COALESCE(b.detail:loss::BOOLEAN, FALSE)
+               AND cc.txid > b.bound_txid))
 )
 SELECT
     script, class, cell, facet, incarnation, gap_kind,
