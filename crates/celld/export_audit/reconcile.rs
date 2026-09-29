@@ -451,6 +451,7 @@ fn deleted_record(facet: &StreamSummary, root: Option<&StreamSummary>) -> Record
             facet: facet.id.facet.clone(),
             incarnation: Some(facet.id.incarnation),
             subtree: false,
+            through_incarnation: None,
         }),
     }
 }
