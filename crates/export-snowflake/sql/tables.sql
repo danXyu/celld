@@ -126,3 +126,17 @@ CREATE TABLE IF NOT EXISTS EXPORT_RECONCILER_FINDINGS (
     found_at TIMESTAMP_LTZ NOT NULL,
     resolved_at TIMESTAMP_LTZ
 );
+
+-- statement: export_dynamic_tables
+-- The Dynamic Tables the loader has created, one per (script, class, table),
+-- with the statement that created each. The loader re-creates one only when
+-- the table's schema union renders a different statement, since replacing a
+-- Dynamic Table starts it over with a full refresh.
+CREATE TABLE IF NOT EXISTS EXPORT_DYNAMIC_TABLES (
+    name STRING NOT NULL,
+    script STRING NOT NULL,
+    class STRING NOT NULL,
+    table_name STRING NOT NULL,
+    sql STRING NOT NULL,
+    created_at TIMESTAMP_LTZ NOT NULL
+);

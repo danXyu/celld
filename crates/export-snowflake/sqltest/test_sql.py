@@ -24,7 +24,6 @@ What fakesnow cannot run is replaced, and nothing else:
 import json
 import os
 import re
-import subprocess
 from pathlib import Path
 
 import fakesnow
@@ -93,17 +92,6 @@ def copy_as_insert(sql):
     return f"INSERT INTO {table} ({columns}) {select}"
 
 
-@pytest.fixture(scope="session")
-def scenarios():
-    out = subprocess.run(
-        ["cargo", "run", "-q", "-p", "celld-export-snowflake", "--example", "scenarios", RANDOM_COUNT],
-        check=True,
-        capture_output=True,
-        cwd=CRATE,
-    ).stdout
-    return {s["name"]: s for s in json.loads(out)["scenarios"]}
-
-
 class Warehouse:
     def __init__(self, cur):
         self.cur = cur
@@ -118,23 +106,30 @@ class Warehouse:
         return [dict(zip(names, r)) for r in self.cur.fetchall()]
 
 
+def connect():
+    """A fakesnow connection with the macros `emulate` calls. Call it inside
+    `fakesnow.patch()`."""
+    conn = snowflake.connector.connect(database="export", schema="cells")
+    duck = conn._duck_conn
+    duck.execute(
+        "CREATE OR REPLACE TEMP MACRO export_test_array_position(v, arr) AS "
+        "list_position(from_json(arr::JSON, '[\"VARCHAR\"]'), v) - 1"
+    )
+    duck.execute(
+        "CREATE OR REPLACE TEMP MACRO export_test_to_varchar(v) AS "
+        "CASE WHEN json_type(v::JSON) = 'VARCHAR' THEN json_extract_string(v::JSON, '$') "
+        "ELSE v::VARCHAR END"
+    )
+    duck.execute(
+        "CREATE OR REPLACE TEMP MACRO export_test_base64(s) AS from_base64(s)"
+    )
+    return conn
+
+
 @pytest.fixture
 def warehouse():
     with fakesnow.patch():
-        conn = snowflake.connector.connect(database="export", schema="cells")
-        duck = conn._duck_conn
-        duck.execute(
-            "CREATE OR REPLACE TEMP MACRO export_test_array_position(v, arr) AS "
-            "list_position(from_json(arr::JSON, '[\"VARCHAR\"]'), v) - 1"
-        )
-        duck.execute(
-            "CREATE OR REPLACE TEMP MACRO export_test_to_varchar(v) AS "
-            "CASE WHEN json_type(v::JSON) = 'VARCHAR' THEN json_extract_string(v::JSON, '$') "
-            "ELSE v::VARCHAR END"
-        )
-        duck.execute(
-            "CREATE OR REPLACE TEMP MACRO export_test_base64(s) AS from_base64(s)"
-        )
+        conn = connect()
         w = Warehouse(conn.cursor())
         for sql in TABLES.values():
             w.run(sql)

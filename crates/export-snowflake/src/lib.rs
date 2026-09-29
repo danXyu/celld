@@ -6,7 +6,8 @@
 //! header per statement, so it can be read and run by hand:
 //!
 //! - `tables.sql`: `EXPORT_LANDING`, `CELL_CHANGES`, `CELL_META`,
-//!   `EXPORT_TOMBSTONES`, `EXPORT_RECONCILER_FINDINGS`;
+//!   `EXPORT_TOMBSTONES`, `EXPORT_RECONCILER_FINDINGS`, and the loader's
+//!   `EXPORT_DYNAMIC_TABLES`;
 //! - `load.sql`: the stage, `COPY INTO EXPORT_LANDING` from the files the
 //!   bucket sink writes ([`StageRow`] is their layout), the pipe, and the
 //!   tasks that route landed records past the tombstones into the two tables
@@ -18,12 +19,19 @@
 //!   which [`DynamicTable::render`] fills in from the table's `schema`
 //!   records.
 //!
-//! Pure: this crate renders SQL and runs nothing.
+//! [`loader`] deploys and drives these objects through a [`Warehouse`]: one
+//! statement at a time, so it runs the same against Snowflake and against the
+//! emulator. The `sql-api` feature adds [`sql_api::SqlApi`], a Warehouse on
+//! Snowflake's SQL API, and the `celld-export-loader` binary.
 
 mod dynamic_table;
+pub mod loader;
+#[cfg(feature = "sql-api")]
+pub mod sql_api;
 mod stage;
 
 pub use dynamic_table::{affinity, ColumnType, DynamicTable, ProjectedColumn};
+pub use loader::{Loader, LoaderConfig, Rows, Warehouse, WarehouseError};
 pub use stage::{StageRow, STAGE_COLUMNS};
 
 pub const TABLES_SQL: &str = include_str!("../sql/tables.sql");
@@ -143,6 +151,23 @@ impl Deployment {
     }
 }
 
+/// A task's body: the `EXECUTE IMMEDIATE` block the task named by
+/// `statement` in `load.sql` runs, with the statements it inlines filled
+/// in. Run on its own, it does the task's work synchronously, since
+/// `EXECUTE TASK` only schedules a run.
+pub fn task_body(statement_name: &str) -> Result<String, RenderError> {
+    let task = statement(LOAD_SQL, statement_name)?;
+    let start = task
+        .sql
+        .find("EXECUTE IMMEDIATE")
+        .ok_or_else(|| RenderError::NoStatement(format!("{statement_name} body")))?;
+    let vars: Vec<(String, String)> = statements(LOAD_SQL)
+        .into_iter()
+        .map(|s| (s.name.to_ascii_uppercase(), s.sql))
+        .collect();
+    fill(statement_name, &task.sql[start..], &vars)
+}
+
 /// The statement named `name` in `file`.
 pub fn statement(file: &str, name: &str) -> Result<Statement, RenderError> {
     statements(file)
@@ -235,7 +260,8 @@ mod tests {
                 "cell_changes",
                 "cell_meta",
                 "export_tombstones",
-                "export_reconciler_findings"
+                "export_reconciler_findings",
+                "export_dynamic_tables"
             ]
         );
         assert_eq!(
@@ -301,6 +327,26 @@ mod tests {
         // Tables first, then loading, then views that read both.
         assert!(pos("cell_changes") < pos("export_route_task"));
         assert!(pos("export_route_task") < pos("cell_streams"));
+    }
+
+    #[test]
+    fn task_bodies_are_the_deployed_tasks_bodies() {
+        let d = Deployment {
+            stage_url: "s3://b/".into(),
+            storage_integration: "I".into(),
+            warehouse: "W".into(),
+        };
+        let all = d.statements().unwrap();
+        for (task, inlined) in [
+            ("export_route_task", "route_changes"),
+            ("export_erase_task", "erase_tombstoned"),
+        ] {
+            let body = task_body(task).unwrap();
+            assert!(body.starts_with("EXECUTE IMMEDIATE $$"), "{body}");
+            assert!(body.contains(&statement(LOAD_SQL, inlined).unwrap().sql));
+            let deployed = all.iter().find(|s| s.name == task).unwrap();
+            assert!(deployed.sql.ends_with(&body));
+        }
     }
 
     #[test]
