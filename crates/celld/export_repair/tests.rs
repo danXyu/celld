@@ -810,3 +810,56 @@ async fn a_pace_spaces_bucket_reads_across_jobs() {
     .await;
     assert_eq!(reports[0].status, Status::Written);
 }
+
+#[tokio::test]
+async fn the_key_value_table_is_snapshotted_as_capture_exports_it() {
+    let v8 = crate::export_kv::encode_for_test("({a: 1, when: new Date(0)})");
+    let hex: String = v8.iter().map(|b| format!("{b:02x}")).collect();
+    let sql = format!(
+        "{SCHEMA}
+        CREATE TABLE _cf_KV (scope TEXT NOT NULL, k TEXT NOT NULL, v BLOB, PRIMARY KEY (scope, k));
+        INSERT INTO _cf_KV VALUES ('Cart:one', 'obj', x'{hex}'),
+                                  ('Cart:one', 'legacy', '[1, 2]'),
+                                  ('Cart:other', 'stray', '3');"
+    );
+    let source = bucket("fleet");
+    put(&source, SCOPE, 1, 1, 1, &sql).await;
+    let (reports, records) = snapshot(&source, vec![job(Target::Head)], &settings(1 << 20)).await;
+    assert_eq!(reports[0].status, Status::Written, "{:?}", reports[0]);
+    let Some(Body::Schema(schema)) = records
+        .iter()
+        .map(|r| &r.body)
+        .find(|b| matches!(b, Body::Schema(s) if s.table == "kv"))
+    else {
+        panic!("no kv schema")
+    };
+    let names: Vec<_> = schema
+        .columns
+        .iter()
+        .map(|c| (c.name.as_str(), c.pk))
+        .collect();
+    assert_eq!(names, [("key", 1), ("value", 0)]);
+    assert!(!records
+        .iter()
+        .any(|r| matches!(&r.body, Body::Schema(s) if s.table == "_cf_KV")));
+
+    let mut consumer = Consumer::new();
+    consumer.ingest_all(records).unwrap();
+    let state = consumer
+        .stream(&root_stream(SCRIPT, SCOPE).unwrap())
+        .unwrap();
+    let kv = state.table("kv").unwrap();
+    assert_eq!(kv.key_columns, ["key"]);
+    // Only the cell's own rows, with values as JSON text.
+    assert_eq!(kv.rows.len(), 2);
+    assert_eq!(
+        kv.rows[&vec![text("legacy")]],
+        vec![text("legacy"), text("[1,2]")]
+    );
+    let Value::Text(obj) = &kv.rows[&vec![text("obj")]][1] else {
+        panic!("{:?}", kv.rows)
+    };
+    let obj: serde_json::Value = serde_json::from_str(obj).unwrap();
+    assert_eq!(obj["a"], 1);
+    assert_eq!(obj["when"]["$date"], "1970-01-01T00:00:00.000Z");
+}

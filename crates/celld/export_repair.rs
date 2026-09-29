@@ -32,8 +32,7 @@
 //! and is skipped.
 //!
 //! **Not yet.** Table generations are the capture's first generation until
-//! piece 11 records real ones, `_cf_KV` is snapshotted raw as the live path
-//! exports it until piece 12, facets are refused because they are not
+//! piece 11 records real ones, facets are refused because they are not
 //! exported yet, and tombstoned streams (piece 16) are not checked.
 #![allow(clippy::disallowed_methods)] // Offline operator path, outside Actor execution.
 
@@ -53,7 +52,8 @@ use tokio::sync::{mpsc, Notify};
 use crate::bucket::Bucket;
 use crate::export_restore::{self, Pace, Restored, Stream, Target};
 use crate::export_sink::{Delivery, ExportSink, Outcome, SinkRecord};
-use crate::storage::export_capture::{exported_table, table_scan, FIRST_GENERATION};
+use crate::storage::export_capture::kv;
+use crate::storage::export_capture::{exported_table, table_scan, TableScan, FIRST_GENERATION};
 
 /// The `commit` of every repair record: after each commit of its txid.
 pub const REPAIR_COMMIT: u64 = u64::MAX;
@@ -423,26 +423,29 @@ impl Snapshot<'_> {
     ) -> anyhow::Result<Counts> {
         let mut counts = Counts::default();
         let tables = self.tables(db)?;
+        let mut scans = Vec::with_capacity(tables.len());
         for table in &tables {
-            let schema = schema_of(db, table)?;
+            let scan = ExportedScan::new(db, table, &self.stream.cell)?;
+            let schema = schema_of(db, &scan)?;
             emit(self.record(Body::Schema(schema), 1, 1))?;
             counts.records += 1;
+            scans.push(scan);
         }
-        for table in &tables {
-            self.emit_table(db, table, emit, &mut counts)?;
+        for scan in &scans {
+            self.emit_table(db, scan, emit, &mut counts)?;
             counts.tables += 1;
         }
         let end = SnapshotEndBody {
             snapshot_id: self.snapshot_id.clone(),
             scope: SnapshotScope::Stream,
-            tables: tables
+            tables: scans
                 .iter()
-                .map(|table| TableGen {
-                    table: table.clone(),
+                .map(|scan| TableGen {
+                    table: scan.name.clone(),
                     generation: FIRST_GENERATION,
                 })
                 .collect(),
-            records: tables.len() as u64,
+            records: scans.len() as u64,
         };
         emit(self.record(Body::SnapshotEnd(end), 1, 1))?;
         counts.records += 1;
@@ -450,7 +453,8 @@ impl Snapshot<'_> {
     }
 
     /// The exported tables of the image, as capture chooses them: ordinary
-    /// tables of `main`, not virtual or shadow, not internal, not denied.
+    /// tables of `main`, not virtual or shadow, not internal, not denied
+    /// under their own or their exported name.
     fn tables(&self, db: &Connection) -> anyhow::Result<Vec<String>> {
         let mut statement = db.prepare("PRAGMA table_list")?;
         let mut rows = statement.query([])?;
@@ -461,10 +465,13 @@ impl Snapshot<'_> {
             if schema == "main"
                 && kind == "table"
                 && exported_table(&name)
-                && !self
-                    .settings
-                    .denied_tables
-                    .contains(&(self.stream.class.clone(), name.clone()))
+                && ![name.as_str(), kv::exported_name(&name)]
+                    .iter()
+                    .any(|table| {
+                        self.settings
+                            .denied_tables
+                            .contains(&(self.stream.class.clone(), table.to_string()))
+                    })
             {
                 tables.push(name);
             }
@@ -480,11 +487,11 @@ impl Snapshot<'_> {
     fn emit_table(
         &self,
         db: &Connection,
-        table: &str,
+        scan: &ExportedScan,
         emit: &mut dyn FnMut(Record) -> anyhow::Result<()>,
         counts: &mut Counts,
     ) -> anyhow::Result<()> {
-        let scan = table_scan(db, table)?;
+        let table = scan.name.as_str();
         let data = |rows: Vec<RowChange>| TableRows {
             table: table.to_string(),
             generation: FIRST_GENERATION,
@@ -554,8 +561,99 @@ impl Snapshot<'_> {
     }
 }
 
-/// The `schema` record of a table at the capture's generation.
-fn schema_of(db: &Connection, table: &str) -> anyhow::Result<SchemaBody> {
+/// A table as the export carries it: the key-value tables reshaped the way
+/// capture reshapes their `rows` (`export_capture::kv`), every other table
+/// as it is.
+struct ExportedScan {
+    /// The table in SQLite.
+    source: String,
+    /// The table's exported name.
+    name: String,
+    columns: Vec<String>,
+    key_columns: Vec<String>,
+    scan: TableScan,
+    /// The cell whose `_cf_KV` rows are its own.
+    scope: String,
+}
+
+/// Rows reshaped at once, so V8 values decode in batches.
+const RESHAPE_BATCH: usize = 256;
+
+impl ExportedScan {
+    fn new(db: &Connection, table: &str, scope: &str) -> anyhow::Result<Self> {
+        let scan = table_scan(db, table)?;
+        let (name, columns, key_columns) = if table == kv::KV_SOURCE {
+            (
+                kv::KV_TABLE.to_string(),
+                vec!["key".to_string(), "value".to_string()],
+                vec!["key".to_string()],
+            )
+        } else {
+            let empty = TableRows {
+                table: table.to_string(),
+                generation: FIRST_GENERATION,
+                columns: scan.columns.clone(),
+                key_columns: scan.key_columns.clone(),
+                rows: Vec::new(),
+            };
+            let shaped = kv::reshape(empty, scope, crate::export_kv::decode)?
+                .context("an empty table reshapes to itself")?;
+            (shaped.table, shaped.columns, shaped.key_columns)
+        };
+        Ok(ExportedScan {
+            source: table.to_string(),
+            name,
+            columns,
+            key_columns,
+            scan,
+            scope: scope.to_string(),
+        })
+    }
+
+    /// Hand every exported row to `each`, in the same order on every call,
+    /// and return how many there were.
+    fn for_each(
+        &self,
+        db: &Connection,
+        mut each: impl FnMut(RowChange) -> anyhow::Result<()>,
+    ) -> anyhow::Result<u64> {
+        let mut count = 0u64;
+        let mut batch = Vec::with_capacity(RESHAPE_BATCH);
+        let mut flush = |batch: &mut Vec<RowChange>, count: &mut u64| -> anyhow::Result<()> {
+            if batch.is_empty() {
+                return Ok(());
+            }
+            let rows = TableRows {
+                table: self.source.clone(),
+                generation: FIRST_GENERATION,
+                columns: self.scan.columns.clone(),
+                key_columns: self.scan.key_columns.clone(),
+                rows: std::mem::take(batch),
+            };
+            if let Some(shaped) = kv::reshape(rows, &self.scope, crate::export_kv::decode)? {
+                for row in shaped.rows {
+                    *count += 1;
+                    each(row)?;
+                }
+            }
+            Ok(())
+        };
+        self.scan.for_each(db, |row| {
+            batch.push(row);
+            if batch.len() == RESHAPE_BATCH {
+                flush(&mut batch, &mut count)?;
+            }
+            Ok(())
+        })?;
+        flush(&mut batch, &mut count)?;
+        Ok(count)
+    }
+}
+
+/// The `schema` record of a table at the capture's generation, under its
+/// exported name and columns.
+fn schema_of(db: &Connection, scan: &ExportedScan) -> anyhow::Result<SchemaBody> {
+    let table = scan.source.as_str();
     let sql: String = db.query_row(
         "SELECT sql FROM main.sqlite_schema WHERE type = 'table' AND name = ?1",
         [table],
@@ -584,9 +682,36 @@ fn schema_of(db: &Connection, table: &str) -> anyhow::Result<SchemaBody> {
             Ok((_, column)) => Some(Ok(column)),
             Err(error) => Some(Err(error)),
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<ColumnDef>, _>>()?;
+    // A reshaped table's columns are its exported ones; the declared type
+    // stays where a column kept its name.
+    let columns = if scan
+        .columns
+        .iter()
+        .eq(columns.iter().filter(|c| !c.generated).map(|c| &c.name))
+    {
+        columns
+    } else {
+        scan.columns
+            .iter()
+            .map(|name| {
+                let declared = columns.iter().find(|c| &c.name == name);
+                ColumnDef {
+                    name: name.clone(),
+                    decl_type: declared.map_or_else(String::new, |c| c.decl_type.clone()),
+                    pk: scan
+                        .key_columns
+                        .iter()
+                        .position(|k| k == name)
+                        .map_or(0, |i| i as u32 + 1),
+                    not_null: declared.is_some_and(|c| c.not_null),
+                    generated: false,
+                }
+            })
+            .collect()
+    };
     Ok(SchemaBody {
-        table: table.to_string(),
+        table: scan.name.clone(),
         generation: FIRST_GENERATION,
         sql,
         columns,
