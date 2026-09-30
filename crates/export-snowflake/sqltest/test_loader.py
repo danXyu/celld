@@ -85,9 +85,9 @@ def loader(binary, key, emulator):
         "EXPORT_BATCH_RECORDS": "7",
     }
 
-    def run(*args, ok=True, stdin=None):
-        p = subprocess.run([str(binary), *args], env=env, capture_output=True, text=True, timeout=120,
-                           input=stdin)
+    def run(*args, ok=True, stdin=None, extra=None):
+        p = subprocess.run([str(binary), *args], env=dict(env, **(extra or {})), capture_output=True,
+                           text=True, timeout=120, input=stdin)
         if ok:
             assert p.returncode == 0, p.stderr
         return p
@@ -126,7 +126,10 @@ def test_loader_end_to_end(emulator, loader, scenarios, tmp_path, name):
     landed = w.rows("SELECT source FROM EXPORT_LANDING")
     assert len(landed) == len(records) + half
     if half:
-        assert {"export/changes/node-b/0.parquet", f"{first}:1"} <= {r["source"] for r in landed}
+        sources = [r["source"] for r in landed]
+        # Each run tags its rows' sources, to count them once queries see them.
+        assert any(x.startswith("export/changes/node-b/0.parquet (ingest ") for x in sources)
+        assert any(x.startswith(f"{first}:1 (ingest ") for x in sources)
     # Every append carried at most one batch, and the one that failed was
     # sent again under its request id.
     ok = [a for a in emulator.appends if a[4] == 200]
@@ -198,6 +201,10 @@ def test_read_side_and_errors(emulator, loader, scenarios):
     p = loader("ingest", "-", stdin=f"{good}\nnot json\n{good}\n", ok=False)
     assert p.returncode != 0 and "-:2: not a record" in p.stderr
     assert "landed and routed 2 records" in p.stdout
+    # Rows Snowpipe Streaming acknowledged but queries do not see yet are
+    # waited for; past EXPORT_VISIBLE_SECONDS the command says so and fails.
+    p = loader("ingest", "-", stdin=good + "\n", ok=False, extra={"EXPORT_VISIBLE_SECONDS": "0"})
+    assert p.returncode != 0 and "only 0 were visible" in p.stderr
     # This binary has no blob-stream consumer, and says how to get one.
     p = loader("run", ok=False)
     assert p.returncode != 0 and "blob-stream feature" in p.stderr

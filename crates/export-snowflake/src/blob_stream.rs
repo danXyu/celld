@@ -16,7 +16,10 @@
 //! step with the schemas it has seen.
 //!
 //! A batch that fails to land is retried, the same batch, with backoff, and
-//! nothing is read meanwhile. When the group revokes partitions, the loader
+//! nothing is read meanwhile. A message that is not a record stops the loop
+//! with an error, once what came before it has landed and been committed,
+//! so it is read again when the loader restarts: a newer loader may decode
+//! it, and an operator can list it in `skip` to drop it. When the group revokes partitions, the loader
 //! lands what it holds before letting them go, so the next owner starts
 //! where it stopped.
 //!
@@ -25,18 +28,18 @@
 //! [`bootstrap_config`] from a YAML or JSON file in the same form as the
 //! brokers' config.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{bail, Context as _};
+use anyhow::{anyhow, bail, Context as _};
 use blob_stream_consumer::iterator::{ConsumerIterator, NextResult};
 use blob_stream_consumer::ConsumerConfigFactory;
 use blob_stream_proto::protos::blobstream::v1::config::ConsumerIteratorBootstrapConfig;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::consume::{Batch, Land, Limits, Undecodable};
+use crate::consume::{message_source, Batch, Land, Limits, Undecodable};
 use crate::loader::{LoadError, Loader, SyncReport, Warehouse};
 
 /// The consumer group the loader joins unless told otherwise.
@@ -54,6 +57,9 @@ pub struct Settings {
     /// failure after, up to `retry_max`.
     pub retry: Duration,
     pub retry_max: Duration,
+    /// Messages to drop, by source (`blob-stream/<partition>/<offset>`):
+    /// ones an operator has looked at and decided are not records.
+    pub skip: BTreeSet<String>,
 }
 
 impl Default for Settings {
@@ -64,6 +70,7 @@ impl Default for Settings {
             sync_every: Duration::from_secs(60),
             retry: Duration::from_secs(1),
             retry_max: Duration::from_secs(60),
+            skip: BTreeSet::new(),
         }
     }
 }
@@ -76,9 +83,9 @@ pub enum Event<'a> {
         records: usize,
         offsets: &'a BTreeMap<u32, u64>,
     },
-    /// A message that is not a record; its offset is committed with the
+    /// A message listed in `skip`; its offset is committed with the
     /// batch's.
-    Skipped(&'a Undecodable),
+    Skipped(&'a str),
     /// A batch failed to land; the same batch is tried again after `retry`.
     LandFailed {
         error: &'a LoadError,
@@ -211,8 +218,17 @@ pub async fn run<W: Warehouse, L: Land>(
                     if due.is_none() {
                         due = Some(Instant::now() + settings.linger);
                     }
-                    if let Err(u) = batch.push_message(r.virtual_partition_id, r.offset, &r.record.payload) {
-                        report(Event::Skipped(&u));
+                    let (partition, offset) = (r.virtual_partition_id, r.offset);
+                    let source = message_source(partition, offset);
+                    if settings.skip.contains(&source) {
+                        batch.skip(partition, offset);
+                        report(Event::Skipped(&source));
+                    } else if let Err(u) = batch.push_message(partition, offset, &r.record.payload) {
+                        // Commit up to it, never past it.
+                        if !flush(&mut *iterator, &mut batch, lander, settings, &stop, &mut report).await {
+                            break Ok(());
+                        }
+                        break Err(not_a_record(&u));
                     }
                     if batch.is_full(&settings.limits) {
                         if !flush(&mut *iterator, &mut batch, lander, settings, &stop, &mut report).await {
@@ -247,6 +263,16 @@ pub async fn run<W: Warehouse, L: Land>(
     }
     let shutdown = iterator.shutdown().await;
     result.and(shutdown.context("shut the blob-stream consumer down"))
+}
+
+fn not_a_record(u: &Undecodable) -> anyhow::Error {
+    anyhow!(
+        "{} is not a record ({}). Nothing past it in its partition is committed. \
+         If it comes from a newer celld, upgrade the loader; to drop it, add {} to EXPORT_SKIP",
+        u.source,
+        u.error,
+        u.source
+    )
 }
 
 /// Land `batch`, retrying until it lands, and commit its offsets. Returns

@@ -10,11 +10,13 @@
 //! order means nothing to the tables: completeness comes from positions and
 //! watermarks.
 //!
-//! A message that is not a record is skipped, and its offset is committed
-//! with the batch's so it cannot stall its partition. The caller reports
-//! it. Skipping it loses nothing silently: the record it should have been
-//! is missing from its stream's watermark counts, so the stream is not
-//! certified past it and `EXPORT_GAPS` lists it for repair.
+//! A message that is not a record is never committed past on its own: the
+//! caller stops there, after landing what came before it, so the message is
+//! read again once the loader can decode it (a record from a newer celld
+//! needs a newer loader). Nothing downstream would notice the record
+//! missing: `EXPORT_GAPS` lists explicit gaps, not watermark counts that fall
+//! short. An operator who has looked at a message and decided to drop it
+//! names it with [`Batch::skip`].
 
 use std::collections::BTreeMap;
 
@@ -47,6 +49,12 @@ impl Default for Limits {
     }
 }
 
+/// Where a message was read, as a landed row's `source` says:
+/// `blob-stream/<partition>/<offset>`.
+pub fn message_source(partition: u32, offset: u64) -> String {
+    format!("blob-stream/{partition}/{offset}")
+}
+
 /// A message that did not decode as a record.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Undecodable {
@@ -62,30 +70,48 @@ pub struct Batch {
     rows: Vec<LandingRow>,
     bytes: usize,
     offsets: BTreeMap<u32, u64>,
+    /// Appended to every row's source.
+    tag: String,
 }
 
 impl Batch {
-    /// Add the message at `offset` in virtual partition `partition`. The
-    /// offset is covered even when the message is not a record.
+    /// A batch whose rows' sources all end with `tag`, so the rows one run
+    /// landed can be counted in `EXPORT_LANDING`.
+    pub fn tagged(tag: impl Into<String>) -> Batch {
+        Batch {
+            tag: tag.into(),
+            ..Batch::default()
+        }
+    }
+
+    /// Add the message at `offset` in virtual partition `partition`. A
+    /// message that is not a record is not added, and its offset is not
+    /// covered.
     pub fn push_message(
         &mut self,
         partition: u32,
         offset: u64,
         payload: &[u8],
     ) -> Result<(), Undecodable> {
-        let source = format!("blob-stream/{partition}/{offset}");
+        let source = message_source(partition, offset);
+        let record = Record::from_json(payload).map_err(|e| Undecodable {
+            source: source.clone(),
+            error: e.to_string(),
+        })?;
+        self.cover(partition, offset);
+        self.push_record(&record, source, payload.len());
+        Ok(())
+    }
+
+    /// Cover the message at `offset` without landing anything: one an
+    /// operator chose to drop.
+    pub fn skip(&mut self, partition: u32, offset: u64) {
+        self.cover(partition, offset);
+    }
+
+    fn cover(&mut self, partition: u32, offset: u64) {
         let highest = self.offsets.entry(partition).or_insert(offset);
         *highest = (*highest).max(offset);
-        match Record::from_json(payload) {
-            Ok(record) => {
-                self.push_record(&record, source, payload.len());
-                Ok(())
-            }
-            Err(e) => Err(Undecodable {
-                source,
-                error: e.to_string(),
-            }),
-        }
     }
 
     /// Add one line of JSON records, as `celld export inspect` prints them:
@@ -108,7 +134,8 @@ impl Batch {
         Ok(())
     }
 
-    fn push_record(&mut self, record: &Record, source: String, bytes: usize) {
+    fn push_record(&mut self, record: &Record, mut source: String, bytes: usize) {
+        source.push_str(&self.tag);
         self.bytes += bytes + source.len();
         self.rows.push(LandingRow::from_record(record, source));
     }
@@ -218,12 +245,12 @@ mod tests {
     }
 
     #[test]
-    fn an_undecodable_message_is_skipped_but_its_offset_is_covered() {
+    fn an_undecodable_message_is_not_covered_unless_skipped() {
         let mut batch = Batch::default();
         let err = batch.push_message(2, 40, b"not json").unwrap_err();
         assert_eq!(err.source, "blob-stream/2/40");
-        assert_eq!(batch.len(), 0);
-        assert!(!batch.is_empty());
+        assert!(batch.is_empty(), "nothing to land and no offset to commit");
+        batch.skip(2, 40);
         let mut l = Fake::default();
         assert_eq!(batch.land(&mut l).unwrap(), BTreeMap::from([(2, 40)]));
         assert!(l.landed.is_empty(), "nothing to insert");
@@ -251,7 +278,7 @@ mod tests {
 
     #[test]
     fn json_lines_take_their_source_from_inspects_object() {
-        let mut batch = Batch::default();
+        let mut batch = Batch::tagged(" (ingest 1)");
         let mut line = serde_json::to_value(record(1)).unwrap();
         line["object"] = "export/changes/node-a/2026/09/29/02/1-a.parquet".into();
         batch.push_json_line(&line.to_string(), "stdin:1").unwrap();
@@ -264,9 +291,9 @@ mod tests {
         let landed = &l.landed[0];
         assert_eq!(
             landed[0].source,
-            "export/changes/node-a/2026/09/29/02/1-a.parquet"
+            "export/changes/node-a/2026/09/29/02/1-a.parquet (ingest 1)"
         );
         assert_eq!(landed[0].to_record().unwrap(), record(1));
-        assert_eq!(landed[1].source, "stdin:2");
+        assert_eq!(landed[1].source, "stdin:2 (ingest 1)");
     }
 }

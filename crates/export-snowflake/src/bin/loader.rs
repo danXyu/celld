@@ -39,8 +39,10 @@ settings (environment):
   EXPORT_BLOB_STREAM_CONFIG      run: blob-stream consumer config (.yaml or .json)
   EXPORT_MEMBER_ID               run: this loader's stable member id (default $HOSTNAME)
   EXPORT_GROUP                   run: consumer group (default snowflake)
+  EXPORT_SKIP                    run: messages to drop, as blob-stream/PARTITION/OFFSET, comma-separated
   EXPORT_BATCH_RECORDS (default 10000), EXPORT_BATCH_BYTES (default 8388608),
   EXPORT_BATCH_MS (default 5000) when a batch lands
+  EXPORT_VISIBLE_SECONDS (default 300) ingest: how long to wait for landed rows to be queryable
 ";
 
 fn main() -> ExitCode {
@@ -214,9 +216,15 @@ fn run(args: &[String]) -> Result<(), Error> {
 }
 
 /// Land the JSON-lines records in `file` in batches through Snowpipe
-/// Streaming, then route them. A line
+/// Streaming, wait until queries see them all, then route them. A line
 /// that is not a record is reported and fails the command once the rest
 /// have landed.
+///
+/// Snowpipe Streaming acknowledges rows once they are durable, which can
+/// be before a query sees them, so routing straight away could route
+/// nothing. Every row's source ends with a tag unique to this run, and the
+/// command counts the tagged rows in `EXPORT_LANDING` until all are there
+/// or `EXPORT_VISIBLE_SECONDS` (default 300) pass.
 #[allow(clippy::disallowed_methods)] // The file and stdin are the host's.
 fn ingest(file: &str) -> Result<(), Error> {
     use std::io::BufRead as _;
@@ -228,7 +236,12 @@ fn ingest(file: &str) -> Result<(), Error> {
     let limits = limits()?;
     let mut l = loader()?;
     let mut to = streaming()?;
-    let mut batch = Batch::default();
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis();
+    // No `%` or `_`: `visible` matches it with LIKE.
+    let tag = format!(" (ingest {started}-{})", std::process::id());
+    let mut batch = Batch::tagged(&tag);
     let (mut landed, mut bad) = (0, 0);
     for (n, line) in reader.lines().enumerate() {
         let line = line?;
@@ -249,7 +262,23 @@ fn ingest(file: &str) -> Result<(), Error> {
     }
     landed += batch.len();
     batch.land(&mut to)?;
+    let timeout = Duration::from_secs(env_number("EXPORT_VISIBLE_SECONDS", 300)?);
+    let deadline = std::time::Instant::now() + timeout;
+    let mut pause = Duration::from_millis(100);
+    let mut visible = l.visible(&tag)?;
+    while visible < landed as u64 && std::time::Instant::now() < deadline {
+        std::thread::sleep(pause);
+        pause = (pause * 2).min(Duration::from_secs(2));
+        visible = l.visible(&tag)?;
+    }
     l.route()?;
+    if visible < landed as u64 {
+        return Err(format!(
+            "landed {landed} records, but only {visible} were visible after {timeout:?} and \
+             were routed; the route task routes the rest when they appear"
+        )
+        .into());
+    }
     out(&format!("landed and routed {landed} records"))?;
     if bad > 0 {
         return Err(format!("{bad} lines were not records").into());
@@ -273,6 +302,13 @@ fn consume(sync_every: Duration) -> Result<(), Error> {
         limits: limits()?,
         linger: Duration::from_millis(env_number("EXPORT_BATCH_MS", 5000)?),
         sync_every,
+        skip: std::env::var("EXPORT_SKIP")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect(),
         ..Settings::default()
     };
     let mut l = loader()?;
@@ -300,9 +336,7 @@ fn consume(sync_every: Duration) -> Result<(), Error> {
         blob_stream::run(iterator, &mut l, &mut to, &settings, stop, |event| {
             let line = match event {
                 Event::Landed { .. } | Event::Synced(_) => None,
-                Event::Skipped(u) => {
-                    Some(format!("{}: not a record, skipped: {}", u.source, u.error))
-                }
+                Event::Skipped(source) => Some(format!("{source}: skipped (EXPORT_SKIP)")),
                 Event::LandFailed { error, retry } => Some(format!(
                     "landing a batch failed, retrying in {retry:?}: {error}"
                 )),

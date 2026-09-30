@@ -73,7 +73,7 @@ that never went through the topic.
 | `deploy` | create every object that is missing, resume the two tasks (Snowflake creates a task suspended), and sync the Dynamic Tables |
 | `sync` | render each table's Dynamic Table from the union of its `schema` records in `CELL_META`, and create or replace only those whose statement changed (`EXPORT_DYNAMIC_TABLES` holds what was deployed; replacing one restarts it with a full refresh) |
 | `run [SECONDS]` | (`blob-stream`) `deploy`, then consume the topic until SIGINT or SIGTERM, landing batches through Snowpipe Streaming and running `sync` every SECONDS (default 60) |
-| `ingest FILE` | land the records in FILE (JSON lines as `celld export inspect` prints them; `-` for stdin) through Snowpipe Streaming, then route them by running the route task's body, which returns once they are routed (`EXECUTE TASK` only schedules a run). A line that is not a record is reported and fails the command after the rest land |
+| `ingest FILE` | land the records in FILE (JSON lines as `celld export inspect` prints them; `-` for stdin) through Snowpipe Streaming, wait until queries see them all (Snowpipe Streaming acknowledges rows once they are durable, which can be before they are queryable; each run tags its rows' sources to count them, for up to `EXPORT_VISIBLE_SECONDS`, default 300), then route them by running the route task's body, which returns once they are routed (`EXECUTE TASK` only schedules a run). A line that is not a record is reported and fails the command after the rest land |
 | `erase SCRIPT CLASS CELL [--facet P] [--incarnation N] [--reason R]` | add a tombstone, unless an open one matches, and delete the stream's rows by running the erase task's body |
 | `query SQL [BIND...]` | run any statement with each `?` bound to a JSON value, as the reconciler's statements (#49) are, and print the rows |
 | `gaps`, `certified` | print `EXPORT_GAPS` or `CELL_CERTIFIED`: the read side the repair driver, `verify` and the reconciler need |
@@ -97,8 +97,11 @@ restarts, from `EXPORT_MEMBER_ID` or else `HOSTNAME`. The config's group
 defaults to `EXPORT_GROUP`, else `snowflake`. A batch that fails to land is
 retried with backoff (1s doubling to 60s) and its offsets stay uncommitted,
 so a Snowflake outage stalls the consumer rather than losing records. A
-message that is not a record is logged and skipped; its stream is not
-certified past it, and `EXPORT_GAPS` lists it for repair.
+message that is not a record stops `run` with an error naming it, after
+what came before it lands; nothing at or past it in its partition is
+committed. A newer loader may read it; `EXPORT_SKIP` (comma-separated
+`blob-stream/<partition>/<offset>`) drops ones an operator has looked at.
+Nothing downstream would report the record a dropped message held missing.
 
 `deploy` creates objects `IF NOT EXISTS`, so it never changes one that
 exists. After an upgrade changes a table, the pipe, the stream or a task,

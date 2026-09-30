@@ -494,21 +494,39 @@ partitions between them.
 | `EXPORT_MEMBER_ID` | `run` | This loader's member id in the consumer group, stable across restarts. Default: `HOSTNAME`. |
 | `EXPORT_GROUP` | no | The consumer group. Default `snowflake`, or the config file's. |
 | `EXPORT_BATCH_RECORDS`, `EXPORT_BATCH_BYTES`, `EXPORT_BATCH_MS` | no | A batch lands at 10000 records, 8 MiB, or 5 seconds after its first record, whichever comes first. |
+| `EXPORT_SKIP` | no | Messages to drop, comma-separated, as `blob-stream/<partition>/<offset>`. See below. |
 | `EXPORT_TARGET_LAG` | no | The Dynamic Tables' target lag. Default `1 minute`. |
 | `EXPORT_DYNAMIC_TABLE_PREFIX` | no | The Dynamic Tables' name prefix. Default `CF`. |
 
 A batch that fails to land is retried, with backoff, until it lands;
 nothing more is read meanwhile. A message on the topic that is not a
-record is skipped and logged; the record it should have been is then
-missing from its stream's watermark counts, so the stream is not certified
-past it and `EXPORT_GAPS` lists it for repair.
+record stops the loader with an error naming it, once everything before it
+has landed; its offset and everything after it in its partition stay
+uncommitted, so a restart reads it again. The usual cause is a record from
+a newer celld, which a newer loader reads. To drop a message you have
+looked at, add its name from the error to `EXPORT_SKIP` and restart; the
+record it held is then missing, and nothing reports that, so repair or
+backfill its cell.
 
 `deploy` creates objects `IF NOT EXISTS` and never changes one that exists.
 When an upgrade changes a table, the pipe, the stream or a task, drop that
 object and deploy again. Upgrading from a loader that read the bucket
-sink's files: drop `EXPORT_PIPE`, `EXPORT_STAGE` and `EXPORT_PARQUET`, and
-rename the `FILE_NAME` column of `EXPORT_LANDING`, `CELL_CHANGES` and
-`CELL_META` to `SOURCE` (or drop and recreate the three tables and reload).
+sink's files takes these statements, then `deploy`, which recreates the
+route task with the new column and resumes it:
+
+```sql
+ALTER TASK EXPORT_ROUTE SUSPEND;
+DROP TASK EXPORT_ROUTE;       -- its body still names FILE_NAME
+DROP PIPE EXPORT_PIPE;
+DROP STAGE EXPORT_STAGE;
+DROP FILE FORMAT EXPORT_PARQUET;
+ALTER TABLE EXPORT_LANDING RENAME COLUMN FILE_NAME TO SOURCE;
+ALTER TABLE CELL_CHANGES RENAME COLUMN FILE_NAME TO SOURCE;
+ALTER TABLE CELL_META RENAME COLUMN FILE_NAME TO SOURCE;
+```
+
+Rows landed but not yet routed stay in the `EXPORT_LANDING_NEW` stream, and
+the recreated task routes them.
 
 ### Loader commands
 
@@ -517,7 +535,7 @@ rename the `FILE_NAME` column of `EXPORT_LANDING`, `CELL_CHANGES` and
 | `deploy` | Create what is missing, resume the tasks, and sync the Dynamic Tables. |
 | `sync` | Create or replace each Dynamic Table whose schema changed. Replacing one restarts it with a full refresh. |
 | `run [SECONDS]` | `deploy`, then land the blob-stream topic through Snowpipe Streaming and `sync` every SECONDS (default 60) until stopped. Needs the `blob-stream` feature. |
-| `ingest FILE` | Land the records in FILE, JSON lines as `celld export inspect` prints them (`-` for stdin), through Snowpipe Streaming, and route them now. A line that is not a record fails the command after the rest land. |
+| `ingest FILE` | Land the records in FILE, JSON lines as `celld export inspect` prints them (`-` for stdin), through Snowpipe Streaming, wait until queries see them (up to `EXPORT_VISIBLE_SECONDS`, default 300), and route them. A line that is not a record fails the command after the rest land. |
 | `erase SCRIPT CLASS CELL [--facet P] [--incarnation N] [--reason R]` | Tombstone a stream in Snowflake and delete its rows. |
 | `query SQL [BIND...]` | Run a statement with each `?` bound to a JSON value, and print the rows. |
 | `gaps`, `certified` | Print `EXPORT_GAPS` or `CELL_CERTIFIED`. |

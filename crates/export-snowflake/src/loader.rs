@@ -340,6 +340,25 @@ impl<W: Warehouse> Loader<W> {
     }
 
     /// What the repair driver works from: `EXPORT_GAPS`.
+    /// How many rows in `EXPORT_LANDING` have a source ending with `tag`
+    /// (which must not contain `%` or `_`), as
+    /// [`crate::consume::Batch::tagged`] sets it. Snowpipe Streaming
+    /// acknowledges rows once they are durable, which can be before a query
+    /// sees them.
+    pub fn visible(&mut self, tag: &str) -> Result<u64, LoadError> {
+        // `tag` holds no LIKE wildcards: the caller makes it.
+        let pattern = format!("%{tag}");
+        let rows = self.query(
+            "SELECT COUNT(*) AS N FROM EXPORT_LANDING WHERE source LIKE ?",
+            &[serde_json::Value::String(pattern)],
+        )?;
+        let n = rows.get(0, "N").unwrap_or("0");
+        n.parse().map_err(|_| LoadError::Warehouse {
+            statement: "visible".to_string(),
+            source: WarehouseError::other(format!("COUNT(*) answered {n:?}")),
+        })
+    }
+
     pub fn gaps(&mut self) -> Result<Rows, LoadError> {
         self.run("gaps", "SELECT * FROM EXPORT_GAPS")
     }

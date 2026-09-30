@@ -256,6 +256,7 @@ fn settings(records: usize, linger: Duration) -> Settings {
         sync_every: Duration::from_secs(3600),
         retry: Duration::from_millis(10),
         retry_max: Duration::from_millis(20),
+        skip: BTreeSet::new(),
     }
 }
 
@@ -360,8 +361,35 @@ async fn revoked_partitions_are_let_go_only_after_their_batch_lands() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_message_that_is_not_a_record_is_skipped_and_committed() {
-    let h = start(settings(2, Duration::from_secs(3600)), Shared::default());
+async fn a_message_that_is_not_a_record_stops_the_loop_after_what_came_before_lands() {
+    let h = start(settings(10, Duration::from_secs(3600)), Shared::default());
+    h.record(0, 1, 1);
+    h.record(1, 7, 7);
+    let _ = h.feed.send(Next::Record(0, 2, b"{\"kind\":".to_vec()));
+    h.record(0, 3, 3);
+    let (calls, shared) = (h.calls.clone(), h.shared.clone());
+    let err = h.done.await.unwrap().unwrap_err().to_string();
+    assert!(err.contains("blob-stream/0/2 is not a record"), "{err}");
+    assert!(err.contains("EXPORT_SKIP"), "{err}");
+    let landed = shared.landed.lock().unwrap().clone();
+    assert_eq!(landed.len(), 1);
+    assert_eq!(txids(&landed[0]), [1, 7]);
+    let calls = calls.lock().unwrap().clone();
+    assert!(calls.contains(&Call::Store(0, 1)), "{calls:?}");
+    assert!(calls.contains(&Call::Store(1, 7)), "{calls:?}");
+    assert!(
+        !calls
+            .iter()
+            .any(|c| matches!(c, Call::Store(0, o) if *o >= 2)),
+        "nothing at or past the message is committed: {calls:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_message_listed_in_skip_is_dropped_and_committed() {
+    let mut s = settings(2, Duration::from_secs(3600));
+    s.skip.insert("blob-stream/0/1".into());
+    let h = start(s, Shared::default());
     let _ = h.feed.send(Next::Record(0, 1, b"{\"kind\":".to_vec()));
     h.record(0, 2, 2);
     h.record(0, 3, 3);

@@ -21,7 +21,9 @@ makes:
   and an append to a pipe's elastic channel runs the pipe's COPY (as
   test_sql.py does) over the NDJSON rows. The first attempt of the first
   append fails with 503 and must come back with the same request id and
-  retryCount 1; `appends` records every attempt;
+  retryCount 1; `appends` records every attempt. As on an elastic channel,
+  an acknowledged append is not queryable at once: its rows land only when
+  VISIBLE_AFTER more statements have run;
 - the stream EXPORT_LANDING_NEW is a view over EXPORT_LANDING's rows past an
   offset, advanced when a task that read it commits;
 - an EXECUTE IMMEDIATE block runs its statements one by one, a transaction's
@@ -43,6 +45,8 @@ from urllib.parse import parse_qs, urlparse
 from test_sql import connect, dynamic_table_as_view, emulate, pipe_as_insert
 
 PARTITION_ROWS = 3
+# Statements that run before an acknowledged append's rows are queryable.
+VISIBLE_AFTER = 2
 
 
 class Emulator:
@@ -60,6 +64,7 @@ class Emulator:
         self.pipes = {}  # name -> CREATE PIPE statement
         self.scoped_tokens = set()
         self.appends = []  # (pipe, requestId, retryCount, rows, status)
+        self.buffered = []  # [statements still to wait, pipe, rows], acknowledged, not yet queryable
         self.host = None  # this server's host:port, set by serve()
         self.tasks = {}  # name -> {"statements": [...], "state": ...}
         self.scheduled = []  # tasks EXECUTE TASK asked to run
@@ -219,6 +224,7 @@ class Emulator:
             return 503, {"message": "Service Unavailable"}
         handle = str(uuid.uuid4())
         with self.lock:
+            self.make_visible()
             try:
                 if "bindings" in body:
                     columns, rows = self.execute_bound(sql, body["bindings"])
@@ -274,9 +280,21 @@ class Emulator:
         self.appends.append((pipe, request_id, retry, rows, status))
         if status == 200:
             with self.lock:
-                self.cur.execute(emulate(pipe_as_insert(self.pipes[pipe])), (json.dumps(rows),))
+                self.buffered.append([VISIBLE_AFTER, pipe, rows])
             return 200, {"message": "OK"}
         return status, {"code": "EMULATED", "message": f"append answered {status}"}
+
+    def make_visible(self, everything=False):
+        """Count a statement against each buffered append, and land the
+        rows of those whose wait is over."""
+        waiting = []
+        for b in self.buffered:
+            b[0] -= 1
+            if b[0] <= 0 or everything:
+                self.cur.execute(emulate(pipe_as_insert(self.pipes[b[1]])), (json.dumps(b[2]),))
+            else:
+                waiting.append(b)
+        self.buffered = waiting
 
     def get(self, handle, query):
         if handle not in self.results:
