@@ -1,5 +1,7 @@
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use blob_stream_consumer::iterator::{ConsumerRecord, ConsumerSeekTarget, RevokedPartitions};
@@ -7,8 +9,10 @@ use blob_stream_consumer::{ConsumerBootstrapConfig, HeartbeatReport};
 use blob_stream_types::{CommittedSourceCheckpoint, Record as Message};
 use celld_export_format::{Body, Envelope, Origin, Position, Record, StreamId, WatermarkBody};
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::Instant;
 
 use super::*;
+use crate::consume::Limits;
 use crate::loader::{LoaderConfig, Rows, WarehouseError};
 use crate::{Deployment, LandingRow};
 

@@ -346,11 +346,13 @@ pub mod export_audit;
 pub mod export_bench;
 pub mod export_blob_stream;
 pub mod export_cli;
+pub mod export_kafka;
 pub(crate) mod export_kv;
 pub mod export_live;
 pub mod export_repair;
 pub mod export_restore;
 pub mod export_sink;
+pub mod export_topic;
 #[cfg(celld_internal_tests)]
 #[allow(clippy::disallowed_methods)]
 #[doc(hidden)]

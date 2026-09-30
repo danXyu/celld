@@ -21,27 +21,29 @@ today:
   facets, exported through the **bucket sink** as Parquet objects in the
   fleet bucket. Each facet exports on a stream of its own.
 - The **blob-stream sink**, in builds with the `export-blob-stream` Cargo
-  feature.
+  feature, and the **Kafka sink**, in builds with the `export-kafka`
+  feature. Configuration picks one.
 - Completeness records: watermarks, activation links, facet deletes, and
   `recovered` records from dead-node recovery.
 - The `celld export` commands: `repair`, `backfill`, `inspect`,
   `reconcile`, `verify`, and `erase`.
 - The Snowflake tables, views, Dynamic Tables and the `celld-export-loader`
-  binary, which consumes the blob-stream topic and lands its records in
-  Snowflake through Snowpipe Streaming.
+  binary, which consumes the blob-stream or Kafka topic and lands its
+  records in Snowflake through Snowpipe Streaming.
 
 Still to come:
 
 - **Repairing facet streams.** `repair` and `backfill` skip facet streams;
   a gap in one is reported but cannot be filled yet.
 - **Loading the bucket sink into Snowflake.** The loader reads blob-stream
-  only. A fleet on the bucket sink can pipe `celld export inspect` into
+  or Kafka only. A fleet on the bucket sink can pipe `celld export inspect` into
   `celld-export-loader ingest` by hand, but nothing loads it continuously.
 - **Auditing against Snowflake.** `reconcile` and `verify` compare the
   bucket with the bucket sink's records, not with the Snowflake tables, so
-  a blob-stream fleet cannot run them yet.
-- **Both sinks at once.** A node exports through one sink:
-  `CELLD_EXPORT_SINK=bucket,blob-stream` refuses to start.
+  a blob-stream or Kafka fleet cannot run them yet.
+- **Several sinks at once.** A node exports through one sink:
+  `CELLD_EXPORT_SINK=bucket,blob-stream` (or any list of more than one)
+  refuses to start.
 - **A real Snowflake account.** The SQL and the Snowpipe Streaming client
   are tested against an emulator. The steps to check them on a real
   account are in
@@ -69,8 +71,8 @@ log.
 - Export is off by default and costs nothing when off.
 
 It does not promise every intermediate transaction, the before-image of
-every update, exactly-once delivery, or a Kafka-compatible stream. A
-consumer drops duplicates by key and orders by position, never by arrival.
+every update, or exactly-once delivery, through any sink. A consumer drops
+duplicates by key and orders by position, never by arrival.
 
 ## Concepts
 
@@ -133,8 +135,8 @@ appear under `export/changes/` in `.celld/dev/objects.sqlite3`.
    then on. Changes made before export was on are not exported; backfill
    them (step 6).
 4. Point a consumer at the export. For Snowflake, export through the
-   [blob-stream sink](#blob-stream-sink) and run the loader
-   ([Loading into Snowflake](#loading-into-snowflake)).
+   [blob-stream sink](#blob-stream-sink) or the [Kafka sink](#kafka-sink)
+   and run the loader ([Loading into Snowflake](#loading-into-snowflake)).
 5. Watch the [metrics](#metrics), especially `celld.export.gaps` and
    `celld.export.dropped_records`.
 6. Backfill the cells that existed before export was on:
@@ -160,7 +162,7 @@ the settings with export still off.
 | variable | default | effect |
 | --- | --- | --- |
 | `CELLD_EXPORT` | `0` | `0` disables export. `1` enables it. |
-| `CELLD_EXPORT_SINK` | `bucket` | `bucket` or `blob-stream`. |
+| `CELLD_EXPORT_SINK` | `bucket` | `bucket`, `blob-stream` or `kafka`. |
 | `CELLD_EXPORT_BUCKET` | the fleet bucket | A different bucket for the bucket sink, on the same endpoint and credentials. |
 | `CELLD_EXPORT_CLASSES` | application classes, `__D1Database`, `__KvNamespace` | A comma-separated allow list of Durable Object classes. Facets follow their root's class. |
 | `CELLD_EXPORT_TABLES` | unset | A comma-separated deny list of `Class.table` entries. |
@@ -170,13 +172,15 @@ the settings with export still off.
 | `CELLD_EXPORT_FLUSH_MS` | `10000` | The bucket sink flush interval and watermark cadence. |
 | `CELLD_EXPORT_FLUSH_BYTES` | `8388608` | The buffered bytes that trigger an early bucket sink flush. |
 | `CELLD_EXPORT_RETENTION` | `none` | `<n>d` makes the bucket sink delete its objects after `n` days. `none` leaves the lifecycle to you. |
-| `CELLD_EXPORT_TOPIC` | `celld-changes` | The blob-stream topic. |
+| `CELLD_EXPORT_TOPIC` | `celld-changes` | The blob-stream or Kafka topic. |
 | `CELLD_EXPORT_BROKERS` | unset | Comma-separated `NODE_ID=host:port` brokers, or `k8s://NAMESPACE/SERVICE`. A static broker's `NODE_ID` must be the node ID the broker itself is configured with (its `node_identity`), because the producer assigns partitions by node ID. Required with the blob-stream sink. |
 | `CELLD_EXPORT_PARTITIONS` | unset | The topic's partition count, which every producer and consumer of the topic must agree on. Required with the blob-stream sink. |
 | `CELLD_EXPORT_ZONES` | unset | The topic's writer zones, comma-separated in the broker deployment's writer order: a zone's writer number is its position, from 0. Every node must list them alike. Unset means a single-writer topic. |
 | `CELLD_ZONE` | unset | The node's zone. With `CELLD_EXPORT_ZONES` set, it picks the writer this node produces as. |
 | `CELLD_EXPORT_WRITER_ID` | the node's zone (`CELLD_ZONE`) | The zone whose writer this node produces as, when it differs from the node's zone. It must be one of `CELLD_EXPORT_ZONES`. |
-| `CELLD_EXPORT_RETRY_MS` | `30000` | How long the blob-stream sink retries a record before it counts as dropped. |
+| `CELLD_EXPORT_KAFKA_BROKERS` | unset | Kafka bootstrap servers, comma-separated `host:port`. Required with the Kafka sink. |
+| `CELLD_EXPORT_KAFKA_PROPERTIES` | unset | A file of [librdkafka properties](https://github.com/confluentinc/librdkafka/blob/master/CONFIGURATION.md), one `name=value` per line, applied over the Kafka sink's own: TLS, SASL, compression, batching. It may not set `acks` below `all`. |
+| `CELLD_EXPORT_RETRY_MS` | `30000` | How long the blob-stream or Kafka sink retries a record before it counts as dropped. |
 | `CELLD_EXPORT_RECONCILE` | `24h` | The interval of `celld export reconcile --schedule`, as `<n>s`, `<n>m`, `<n>h`, or `<n>d`. The node itself does not reconcile. |
 
 Zone names are 1 to 128 ASCII letters, digits, `.`, `-` or `_`.
@@ -254,6 +258,58 @@ order by position, not by partition offset.
 
 A record the brokers do not accept within `CELLD_EXPORT_RETRY_MS` is
 dropped, counted in `celld.export.dropped_records`, and reported as a gap.
+
+### Kafka sink
+
+The Kafka sink sends each record to a Kafka topic as one message: the
+record's JSON, keyed by its stream, with the commit time as the message
+timestamp. Kafka's partitioner keeps a stream in one partition. The
+producer uses `acks=all` and idempotence, so a record counts as delivered
+only once every in-sync replica has it, and a retry does not duplicate or
+reorder it within its partition.
+
+Its client, librdkafka, is behind the `export-kafka` Cargo feature, which a
+default build and the release artifacts leave out. A node without it
+refuses to start with `CELLD_EXPORT_SINK=kafka`. The build compiles
+librdkafka and OpenSSL from source, so it needs a C compiler, `make` and
+`perl`, but no Kafka or SSL libraries installed:
+
+```sh
+cargo build --release --features export-kafka
+```
+
+Create the topic first, with the partitions and replication factor you
+want; the sink does not create it. Then:
+
+```sh
+CELLD_EXPORT=1
+CELLD_EXPORT_SINK=kafka
+CELLD_EXPORT_KAFKA_BROKERS=kafka-0.kafka:9092,kafka-1.kafka:9092
+CELLD_EXPORT_TOPIC=celld-changes
+CELLD_EXPORT_KAFKA_PROPERTIES=/etc/celld/kafka.properties   # optional
+```
+
+For a cluster that needs TLS or SASL, put the client settings in the
+properties file:
+
+```properties
+security.protocol=SASL_SSL
+sasl.mechanisms=SCRAM-SHA-512
+sasl.username=celld
+sasl.password=...
+compression.type=zstd
+```
+
+SASL `PLAIN` and `SCRAM` work over TLS; Kerberos (`GSSAPI`) and AWS MSK IAM
+authentication do not. The sink sets `compression.type=lz4` unless the
+file says otherwise.
+
+On start, and after a failure, the sink fetches the topic's metadata
+before producing, so a missing topic or an unreachable cluster shows up in
+the log as the reason records are dropped. Records wait for the producer
+as they do for blob-stream, and a record the cluster does not acknowledge
+within `CELLD_EXPORT_RETRY_MS` is dropped, counted in
+`celld.export.dropped_records`, and reported as a gap.
 
 ## Records
 
@@ -417,10 +473,11 @@ not affected.
 
 The [`celld-export-snowflake`](../crates/export-snowflake/README.md) crate
 holds the Snowflake objects and `celld-export-loader`, which deploys them,
-feeds them from the blob-stream topic, and keeps them in step. Records flow
+feeds them from the export topic, and keeps them in step. Records flow
 like this:
 
-1. Nodes export through the [blob-stream sink](#blob-stream-sink).
+1. Nodes export through the [blob-stream sink](#blob-stream-sink) or the
+   [Kafka sink](#kafka-sink).
 2. The loader reads the topic as a member of the consumer group `snowflake`
    and appends records in batches to the pipe `EXPORT_LANDING_PIPE` through
    [Snowpipe Streaming](https://docs.snowflake.com/user-guide/snowpipe-streaming/data-load-snowpipe-streaming-overview),
@@ -443,10 +500,16 @@ task, the erase task and the Dynamic Tables' refreshes.
 ### Build and deploy
 
 The loader is not in the release artifacts. Build it from the repository
-with both features; like the sink, the consumer needs `protoc`:
+with `sql-api` and the feature of your fleet's transport: `blob-stream`,
+whose consumer needs `protoc` like the sink, or `kafka`, which compiles
+librdkafka like the Kafka sink. A loader built with both reads whichever
+`EXPORT_SOURCE` names.
 
 ```sh
+# A blob-stream fleet
 cargo build --release -p celld-export-snowflake --features sql-api,blob-stream --bin celld-export-loader
+# A Kafka fleet
+cargo build --release -p celld-export-snowflake --features sql-api,kafka --bin celld-export-loader
 ```
 
 Prepare Snowflake as an administrator: a database, a warehouse, and a role
@@ -455,12 +518,15 @@ the account. Give the loader a user with that role and an RSA key pair. The
 [loader README](../crates/export-snowflake/README.md#verifying-on-a-real-account)
 has the exact statements.
 
-The loader reads blob-stream's own storage, S3 and DynamoDB, and asks the
-brokers for recent data, so it needs the consumer settings blob-stream's
-brokers use: a YAML or JSON file in the form of
+From blob-stream, the loader reads blob-stream's own storage, S3 and
+DynamoDB, and asks the brokers for recent data, so it needs the consumer
+settings blob-stream's brokers use: a YAML or JSON file in the form of
 [`examples/consumer.yaml`](../crates/export-snowflake/examples/consumer.yaml),
 with the topic, blob store, metadata store and broker discovery your
 brokers use, and AWS credentials that can read them.
+
+From Kafka, it needs the bootstrap servers, the topic, and any TLS or SASL
+settings, in a librdkafka properties file like the sink's.
 
 Then configure and run:
 
@@ -471,8 +537,14 @@ export SNOWFLAKE_PRIVATE_KEY_FILE=rsa_key.p8
 export SNOWFLAKE_DATABASE=CELLD
 export SNOWFLAKE_SCHEMA=EXPORT
 export SNOWFLAKE_WAREHOUSE=CELLD_EXPORT_WH
-export EXPORT_BLOB_STREAM_CONFIG=consumer.yaml
 export EXPORT_MEMBER_ID=loader-0
+
+# From blob-stream (the default source)
+export EXPORT_BLOB_STREAM_CONFIG=consumer.yaml
+# or from Kafka
+export EXPORT_SOURCE=kafka
+export EXPORT_KAFKA_BROKERS=kafka-0.kafka:9092,kafka-1.kafka:9092
+export EXPORT_KAFKA_PROPERTIES=kafka.properties   # optional
 
 celld-export-loader run 60
 ```
@@ -490,11 +562,15 @@ partitions between them.
 | `SNOWFLAKE_DATABASE`, `SNOWFLAKE_SCHEMA` | yes | Where the objects live. |
 | `SNOWFLAKE_WAREHOUSE` | yes | Runs the loader's statements, the tasks and the Dynamic Tables. |
 | `SNOWFLAKE_ROLE`, `SNOWFLAKE_URL` | no | A role other than the user's default; an API URL other than the account's. |
-| `EXPORT_BLOB_STREAM_CONFIG` | `run` | The blob-stream consumer config, `.yaml`, `.yml` or `.json`. |
-| `EXPORT_MEMBER_ID` | `run` | This loader's member id in the consumer group, stable across restarts. Default: `HOSTNAME`. |
+| `EXPORT_SOURCE` | no | The topic's transport: `blob-stream` (default) or `kafka`. It must match the nodes' `CELLD_EXPORT_SINK`. |
+| `EXPORT_BLOB_STREAM_CONFIG` | `run` from blob-stream | The blob-stream consumer config, `.yaml`, `.yml` or `.json`. |
+| `EXPORT_KAFKA_BROKERS` | `run` from Kafka | Bootstrap servers, comma-separated `host:port`. |
+| `EXPORT_KAFKA_TOPIC` | no | The Kafka topic. Default `celld-changes`, as the nodes' `CELLD_EXPORT_TOPIC`. |
+| `EXPORT_KAFKA_PROPERTIES` | no | A file of librdkafka consumer properties, `name=value` per line, applied over the loader's own. It may not turn on `enable.auto.commit`. |
+| `EXPORT_MEMBER_ID` | `run` | This loader's member id in the consumer group, stable across restarts. Default: `HOSTNAME`. Kafka uses it as the client id. |
 | `EXPORT_GROUP` | no | The consumer group. Default `snowflake`, or the config file's. |
 | `EXPORT_BATCH_RECORDS`, `EXPORT_BATCH_BYTES`, `EXPORT_BATCH_MS` | no | A batch lands at 10000 records, 8 MiB, or 5 seconds after its first record, whichever comes first. |
-| `EXPORT_SKIP` | no | Messages to drop, comma-separated, as `blob-stream/<partition>/<offset>`. See below. |
+| `EXPORT_SKIP` | no | Messages to drop, comma-separated, as `blob-stream/<partition>/<offset>` or `kafka/<partition>/<offset>`. See below. |
 | `EXPORT_TARGET_LAG` | no | The Dynamic Tables' target lag. Default `1 minute`. |
 | `EXPORT_DYNAMIC_TABLE_PREFIX` | no | The Dynamic Tables' name prefix. Default `CF`. |
 
@@ -534,7 +610,7 @@ the recreated task routes them.
 | --- | --- |
 | `deploy` | Create what is missing, resume the tasks, and sync the Dynamic Tables. |
 | `sync` | Create or replace each Dynamic Table whose schema changed. Replacing one restarts it with a full refresh. |
-| `run [SECONDS]` | `deploy`, then land the blob-stream topic through Snowpipe Streaming and `sync` every SECONDS (default 60) until stopped. Needs the `blob-stream` feature. |
+| `run [SECONDS]` | `deploy`, then land the topic `EXPORT_SOURCE` names through Snowpipe Streaming and `sync` every SECONDS (default 60) until stopped. Needs the `blob-stream` or `kafka` feature. |
 | `ingest FILE` | Land the records in FILE, JSON lines as `celld export inspect` prints them (`-` for stdin), through Snowpipe Streaming, wait until queries see them (up to `EXPORT_VISIBLE_SECONDS`, default 300), and route them. A line that is not a record fails the command after the rest land. |
 | `erase SCRIPT CLASS CELL [--facet P] [--incarnation N] [--reason R]` | Tombstone a stream in Snowflake and delete its rows. |
 | `query SQL [BIND...]` | Run a statement with each `?` bound to a JSON value, and print the rows. |
@@ -593,8 +669,8 @@ celld-export-loader query \
   "SELECT TO_JSON(OBJECT_CONSTRUCT(*)) FROM EXPORT_GAPS" | tail -n +2 > gaps.jsonl
 
 # Snapshot every stream it names, through the highest position its rows name.
-# With CELLD_EXPORT_SINK=blob-stream and the nodes' blob-stream settings, the
-# snapshots go to the topic, and the running loader lands them.
+# With CELLD_EXPORT_SINK=blob-stream or kafka and the nodes' settings for it,
+# the snapshots go to the topic, and the running loader lands them.
 celld export repair --gaps gaps.jsonl
 ```
 

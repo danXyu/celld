@@ -54,11 +54,24 @@ pub fn is_never_exported(class: &str) -> bool {
     })
 }
 
-/// `CELLD_EXPORT_SINK`: `bucket`, `blob-stream`, or both, comma-separated.
+/// `CELLD_EXPORT_SINK`: `bucket`, `blob-stream` or `kafka`, comma-separated.
+/// A node and the export CLI run one of them; the list form is parsed so the
+/// refusal can say so.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Sinks {
     pub bucket: bool,
     pub blob_stream: bool,
+    pub kafka: bool,
+}
+
+impl Sinks {
+    /// How many sinks the list names.
+    pub fn count(&self) -> usize {
+        [self.bucket, self.blob_stream, self.kafka]
+            .into_iter()
+            .filter(|on| *on)
+            .count()
+    }
 }
 
 /// `CELLD_EXPORT_CLASSES`.
@@ -109,7 +122,15 @@ pub struct Config {
     /// Every producer and consumer of a topic must agree on it, so it has no
     /// default. Required when the blob-stream sink is on.
     pub partitions: Option<u32>,
-    /// blob-stream retry deadline before a record counts as dropped.
+    /// `CELLD_EXPORT_KAFKA_BROKERS`: the Kafka bootstrap servers,
+    /// `host:port` comma-separated. Required when the Kafka sink is on.
+    pub kafka_brokers: Option<String>,
+    /// `CELLD_EXPORT_KAFKA_PROPERTIES`: a file of librdkafka producer
+    /// properties, `name=value` per line, applied over the sink's own
+    /// (security, SASL credentials, compression).
+    pub kafka_properties: Option<std::path::PathBuf>,
+    /// blob-stream and Kafka retry deadline before a record counts as
+    /// dropped.
     pub retry: Duration,
     /// Reconciler interval. Read by the loader deployment, not the node; it
     /// is parsed here so a node and the loader agree on one grammar.
@@ -133,6 +154,7 @@ impl Config {
             None => Sinks {
                 bucket: true,
                 blob_stream: false,
+                kafka: false,
             },
             Some(list) => parse_sinks(&list)?,
         };
@@ -197,6 +219,18 @@ impl Config {
             "CELLD_EXPORT_PARTITIONS",
             get("CELLD_EXPORT_PARTITIONS")?,
         )?;
+        let kafka_brokers = match non_empty(
+            "CELLD_EXPORT_KAFKA_BROKERS",
+            get("CELLD_EXPORT_KAFKA_BROKERS")?,
+        )? {
+            Some(brokers) => Some(parse_kafka_brokers(&brokers)?),
+            None => None,
+        };
+        let kafka_properties = non_empty(
+            "CELLD_EXPORT_KAFKA_PROPERTIES",
+            get("CELLD_EXPORT_KAFKA_PROPERTIES")?,
+        )?
+        .map(std::path::PathBuf::from);
         let reconcile = match get("CELLD_EXPORT_RECONCILE")? {
             None => DEFAULT_RECONCILE,
             Some(value) => parse_interval("CELLD_EXPORT_RECONCILE", &value)?,
@@ -225,6 +259,9 @@ impl Config {
             }
             blob_stream_writer_id(writer_id.as_deref(), zone.as_deref(), &zones)?;
         }
+        if sinks.kafka && kafka_brokers.is_none() {
+            bail!("CELLD_EXPORT_SINK includes kafka but CELLD_EXPORT_KAFKA_BROKERS is unset");
+        }
         if max_record_bytes > queue_bytes {
             bail!(
                 "CELLD_EXPORT_MAX_RECORD_BYTES ({max_record_bytes}) exceeds \
@@ -248,6 +285,8 @@ impl Config {
             zone,
             zones,
             partitions,
+            kafka_brokers,
+            kafka_properties,
             retry,
             reconcile,
         }))
@@ -382,16 +421,20 @@ fn parse_sinks(list: &str) -> anyhow::Result<Sinks> {
     let mut sinks = Sinks {
         bucket: false,
         blob_stream: false,
+        kafka: false,
     };
     for item in items(list) {
         match item {
             "bucket" => sinks.bucket = true,
             "blob-stream" => sinks.blob_stream = true,
-            other => bail!("CELLD_EXPORT_SINK must list bucket and/or blob-stream, not {other:?}"),
+            "kafka" => sinks.kafka = true,
+            other => {
+                bail!("CELLD_EXPORT_SINK must be bucket, blob-stream or kafka, not {other:?}")
+            }
         }
     }
-    if !sinks.bucket && !sinks.blob_stream {
-        bail!("CELLD_EXPORT_SINK must list bucket and/or blob-stream");
+    if sinks.count() == 0 {
+        bail!("CELLD_EXPORT_SINK must be bucket, blob-stream or kafka");
     }
     Ok(sinks)
 }
@@ -467,6 +510,25 @@ fn parse_brokers(value: &str) -> anyhow::Result<String> {
     Ok(value.to_string())
 }
 
+/// Kafka bootstrap servers: `host:port`, comma-separated. Returned as
+/// written; librdkafka takes the same list.
+fn parse_kafka_brokers(value: &str) -> anyhow::Result<String> {
+    let mut any = false;
+    for broker in items(value) {
+        let valid = broker.rsplit_once(':').is_some_and(|(host, port)| {
+            !host.is_empty() && port.parse::<u16>().is_ok_and(|port| port > 0)
+        });
+        if !valid {
+            bail!("CELLD_EXPORT_KAFKA_BROKERS entries must be host:port, not {broker:?}");
+        }
+        any = true;
+    }
+    if !any {
+        bail!("CELLD_EXPORT_KAFKA_BROKERS must list at least one host:port");
+    }
+    Ok(value.to_string())
+}
+
 /// `<n>s`, `<n>m`, `<n>h` or `<n>d`, with `n > 0`.
 pub(crate) fn parse_interval(name: &str, value: &str) -> anyhow::Result<Duration> {
     let unit = match value.chars().last() {
@@ -535,7 +597,8 @@ mod tests {
             config.sinks,
             Sinks {
                 bucket: true,
-                blob_stream: false
+                blob_stream: false,
+                kafka: false,
             }
         );
         assert_eq!(config.bucket_override, None);
@@ -553,6 +616,8 @@ mod tests {
         assert_eq!(config.zone, None);
         assert!(config.zones.is_empty());
         assert_eq!(config.partitions, None);
+        assert_eq!(config.kafka_brokers, None);
+        assert_eq!(config.kafka_properties, None);
         assert_eq!(config.retry, Duration::from_millis(30_000));
         assert_eq!(config.reconcile, Duration::from_secs(24 * 3600));
     }
@@ -560,7 +625,7 @@ mod tests {
     #[test]
     fn every_variable_is_read() {
         let config = enabled(&[
-            ("CELLD_EXPORT_SINK", "bucket, blob-stream"),
+            ("CELLD_EXPORT_SINK", "bucket, blob-stream,kafka"),
             ("CELLD_EXPORT_BUCKET", "changes"),
             ("CELLD_EXPORT_CLASSES", "Chat,__D1Database"),
             ("CELLD_EXPORT_TABLES", "Chat.drafts, Chat.my.table"),
@@ -576,6 +641,11 @@ mod tests {
             ("CELLD_ZONE", "us-east-1a"),
             ("CELLD_EXPORT_ZONES", "us-east-1a, us-east-1b,us-east-1c"),
             ("CELLD_EXPORT_PARTITIONS", "64"),
+            ("CELLD_EXPORT_KAFKA_BROKERS", "k1:9092, k2.internal:9093"),
+            (
+                "CELLD_EXPORT_KAFKA_PROPERTIES",
+                "/etc/celld/kafka.properties",
+            ),
             ("CELLD_EXPORT_RETRY_MS", "9"),
             ("CELLD_EXPORT_RECONCILE", "6h"),
         ]);
@@ -583,9 +653,11 @@ mod tests {
             config.sinks,
             Sinks {
                 bucket: true,
-                blob_stream: true
+                blob_stream: true,
+                kafka: true,
             }
         );
+        assert_eq!(config.sinks.count(), 3);
         assert_eq!(config.bucket_override.as_deref(), Some("changes"));
         assert_eq!(
             config.classes,
@@ -609,6 +681,14 @@ mod tests {
         assert_eq!(config.blob_stream_writer_id().unwrap(), 2);
         assert_eq!(config.blob_stream_writers(), 3);
         assert_eq!(config.partitions, Some(64));
+        assert_eq!(
+            config.kafka_brokers.as_deref(),
+            Some("k1:9092, k2.internal:9093")
+        );
+        assert_eq!(
+            config.kafka_properties.as_deref(),
+            Some(std::path::Path::new("/etc/celld/kafka.properties"))
+        );
         assert_eq!(config.retry, Duration::from_millis(9));
         assert_eq!(config.reconcile, Duration::from_secs(6 * 3600));
     }
@@ -650,7 +730,7 @@ mod tests {
     #[test]
     fn malformed_values_are_refused() {
         for (name, value) in [
-            ("CELLD_EXPORT_SINK", "kafka"),
+            ("CELLD_EXPORT_SINK", "pulsar"),
             ("CELLD_EXPORT_SINK", ""),
             ("CELLD_EXPORT_BUCKET", ""),
             ("CELLD_EXPORT_TABLES", "drafts"),
@@ -675,6 +755,12 @@ mod tests {
             ("CELLD_EXPORT_BROKERS", "a:9092"),
             ("CELLD_EXPORT_BROKERS", "=a:9092"),
             ("CELLD_EXPORT_BROKERS", "b0=a:9092,b0=b:9092"),
+            ("CELLD_EXPORT_KAFKA_BROKERS", " "),
+            ("CELLD_EXPORT_KAFKA_BROKERS", ","),
+            ("CELLD_EXPORT_KAFKA_BROKERS", "k1"),
+            ("CELLD_EXPORT_KAFKA_BROKERS", "k1:9092,:9092"),
+            ("CELLD_EXPORT_KAFKA_BROKERS", "k1:none"),
+            ("CELLD_EXPORT_KAFKA_PROPERTIES", ""),
             ("CELLD_EXPORT_RECONCILE", "24"),
             ("CELLD_EXPORT_RECONCILE", "0h"),
             ("CELLD_EXPORT_RECONCILE", "1w"),
@@ -699,6 +785,26 @@ mod tests {
             config.brokers.as_deref(),
             Some("broker-a=a:9092,broker-b=b.internal:9092")
         );
+    }
+
+    #[test]
+    fn enabled_kafka_needs_brokers_and_nothing_of_blob_streams() {
+        let message = error(&[("CELLD_EXPORT", "1"), ("CELLD_EXPORT_SINK", "kafka")]);
+        assert!(message.contains("CELLD_EXPORT_KAFKA_BROKERS"), "{message}");
+        // Kafka partitions its topic itself: no partition count or zones.
+        let config = enabled(&[
+            ("CELLD_EXPORT_SINK", "kafka"),
+            ("CELLD_EXPORT_KAFKA_BROKERS", "k1:9092"),
+        ]);
+        assert_eq!(
+            config.sinks,
+            Sinks {
+                bucket: false,
+                blob_stream: false,
+                kafka: true,
+            }
+        );
+        assert_eq!(config.sinks.count(), 1);
     }
 
     #[test]

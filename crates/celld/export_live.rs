@@ -371,16 +371,18 @@ impl Exporter {
         node: String,
         ask: impl Fn(TicketAsk) + Send + Sync + 'static,
     ) -> anyhow::Result<Arc<Exporter>> {
-        // Delivered positions are tracked for one sink; running both at once
-        // needs a position per sink.
+        // Delivered positions are tracked for one sink; running several at
+        // once needs a position per sink.
         anyhow::ensure!(
-            !(config.sinks.bucket && config.sinks.blob_stream),
-            "CELLD_EXPORT_SINK=bucket,blob-stream is not supported yet; choose one sink"
+            config.sinks.count() == 1,
+            "CELLD_EXPORT_SINK names several sinks, which is not supported yet; choose one"
         );
         let (outcomes_tx, outcomes_rx) = mpsc::unbounded_channel();
         let wake = outcomes_tx.clone();
         let sink: Arc<dyn ExportSink> = if config.sinks.blob_stream {
             crate::export_blob_stream::start(&config, outcomes_tx)?
+        } else if config.sinks.kafka {
+            crate::export_kafka::start(&config, outcomes_tx)?
         } else {
             Arc::new(BucketSink::start(
                 bucket,

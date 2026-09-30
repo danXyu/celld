@@ -1,7 +1,7 @@
 name: Export Snowflake
 
 # The change export's Snowflake side: the crate's Rust (with the loader's
-# `sql-api` and `blob-stream` features), then its SQL and the
+# `sql-api`, `blob-stream` and `kafka` features), then its SQL and the
 # celld-export-loader binary against the Snowflake emulator in
 # crates/export-snowflake/sqltest. The
 # emulator tests need Python and fakesnow, which the main CI job does not
@@ -38,6 +38,18 @@ jobs:
     name: Rust and emulator tests
     runs-on: ubuntu-22.04
     timeout-minutes: 45
+    # A single-node Kafka for the loader's Kafka consumer tests against a real
+    # broker (CELLD_TEST_KAFKA_BROKERS); without it they skip.
+    services:
+      kafka:
+        image: apache/kafka:3.9.1
+        ports:
+          - 9092:9092
+        options: >-
+          --health-cmd "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"
+          --health-interval 5s
+          --health-timeout 10s
+          --health-retries 20
     steps:
       - uses: actions/checkout@v6
 
@@ -72,6 +84,8 @@ jobs:
         run: cargo clippy -p celld-export-snowflake -p celld-export-format --all-targets --all-features --locked -- -D warnings
 
       - name: Test
+        env:
+          CELLD_TEST_KAFKA_BROKERS: localhost:9092
         run: cargo test -p celld-export-snowflake -p celld-export-format --all-features --locked
 
       # The SQL against synthetic records, and the loader binary end to end

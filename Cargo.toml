@@ -64,6 +64,12 @@ bd-server-stats = { git = "https://github.com/bitdriftlabs/shared-core.git" }
 # reads its own: YAML or protobuf JSON, through the same protobuf fork.
 protobuf-json-mapping = { git = "https://github.com/bitdriftlabs/rust-protobuf.git", branch = "patch-stack" }
 serde_yaml = "0.9"
+# The change-export Kafka sink (celld's `export-kafka` feature) and the
+# Snowflake loader's Kafka source (its `kafka` feature). librdkafka is built
+# from source and linked statically, with OpenSSL for SASL_SSL, so a feature
+# build needs a C toolchain and nothing installed; default builds never
+# compile it.
+rdkafka = { version = "0.39", default-features = false, features = ["tokio", "libz-static", "ssl-vendored", "zstd"] }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 ed25519-dalek = { version = "2", features = ["pkcs8"] }
 encoding_rs = "0.8"

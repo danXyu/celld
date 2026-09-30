@@ -4239,8 +4239,8 @@ async fn async_main(
         if config.sinks.bucket && settings.bucket.is_none() {
             anyhow::bail!(
                 "CELLD_EXPORT=1 with the bucket sink but this node has no \
-                 bucket (CELLD_BUCKET); choose CELLD_EXPORT_SINK=blob-stream \
-                 for a node without one"
+                 bucket (CELLD_BUCKET); choose CELLD_EXPORT_SINK=blob-stream or \
+                 kafka for a node without one"
             );
         }
         anyhow::bail!("CELLD_EXPORT=1 needs the node's bucket-backed runtime");

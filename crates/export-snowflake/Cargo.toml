@@ -4,7 +4,7 @@
 # and runs nothing, except through the loader module's `Warehouse` trait. The
 # `sql-api` feature adds a Warehouse on Snowflake's SQL API and the
 # celld-export-loader binary that deploys and drives it; the `blob-stream`
-# feature adds the consumer that feeds it from the export topic. The tests in
+# and `kafka` features add the consumers that feed it from the export topic. The tests in
 # sqltest/ run the SQL and the binary against a Snowflake emulator.
 [package]
 name = "celld-export-snowflake"
@@ -32,8 +32,9 @@ blob-stream-consumer = { workspace = true, optional = true }
 blob-stream-proto = { workspace = true, optional = true }
 blob-stream-types = { workspace = true, optional = true }
 protobuf-json-mapping = { workspace = true, optional = true }
+rdkafka = { workspace = true, optional = true }
 serde_yaml = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true, features = ["macros", "rt-multi-thread", "signal", "time"] }
+tokio = { workspace = true, optional = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { workspace = true, optional = true }
 
 [features]
@@ -50,6 +51,15 @@ blob-stream = [
     "dep:blob-stream-types",
     "dep:protobuf-json-mapping",
     "dep:serde_yaml",
+    "dep:tokio",
+    "dep:tokio-util",
+]
+# The consumer that feeds the loader from a Kafka topic instead, which the
+# nodes' `export-kafka` sink writes. Off by default: it builds librdkafka (C)
+# from source. `run` reads the topic EXPORT_SOURCE names.
+kafka = [
+    "dep:anyhow",
+    "dep:rdkafka",
     "dep:tokio",
     "dep:tokio-util",
 ]
