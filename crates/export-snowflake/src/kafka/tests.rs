@@ -265,6 +265,27 @@ async fn until(what: &str, mut ready: impl FnMut() -> bool) {
     }
 }
 
+/// Whether `group` is stable with partitions assigned to a member.
+fn assigned(brokers: &str, group: &str) -> bool {
+    let consumer: BaseConsumer = ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .create()
+        .unwrap();
+    let Ok(list) = consumer.fetch_group_list(Some(group), Duration::from_secs(5)) else {
+        return false;
+    };
+    list.groups().iter().any(|g| {
+        g.state() == "Stable"
+            && g.members().iter().any(|m| {
+                // The consumer protocol's assignment: a version (i16), then
+                // the number of topics (i32).
+                m.assignment()
+                    .and_then(|a| a.get(2..6))
+                    .is_some_and(|n| i32::from_be_bytes(n.try_into().unwrap()) > 0)
+            })
+    })
+}
+
 /// Committed offsets of `group` on `topic`, as Kafka's next offsets.
 fn committed(brokers: &str, topic: &str, group: &str, partitions: i32) -> Vec<i64> {
     let consumer: BaseConsumer = ClientConfig::new()
@@ -347,9 +368,12 @@ async fn a_revoked_member_lands_what_it_holds_before_letting_go() {
     let topic = topic(&brokers, 2, &messages).await;
     // A lingers forever, so only a revocation (or a stop) lands its batch.
     let a = member(&brokers, &topic, &topic, Duration::from_secs(3600));
-    // Time for A to join and read the topic; nothing A does is visible
+    // Wait for A to hold partitions, or B would join the same first
+    // rebalance, and then for A to read them; nothing A reads is visible
     // until it lands.
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    let (b2, g2) = (brokers.clone(), topic.clone());
+    until("A's assignment", move || assigned(&b2, &g2)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
     let a_events = a.events.clone();
     // B joining makes the group take A's partitions back.
     let b = member(&brokers, &topic, &topic, Duration::from_millis(100));
