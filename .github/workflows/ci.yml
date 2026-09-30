@@ -90,6 +90,21 @@ jobs:
       - name: Test
         run: cargo test --locked
 
+      # The DynamoDB control table's contract against DynamoDB Local: the
+      # SigV4 signing, the request shapes, and the error classes that the
+      # in-process fake cannot vouch for.
+      - name: Test, DynamoDB control table
+        run: |
+          set -euo pipefail
+          docker run -d --name dynamodb-local -p 127.0.0.1:8000:8000 \
+            amazon/dynamodb-local:latest -jar DynamoDBLocal.jar -inMemory
+          for _ in $(seq 1 30); do
+            curl -s -o /dev/null http://127.0.0.1:8000 && break
+            sleep 1
+          done
+          CELLD_TEST_DYNAMODB_ENDPOINT=http://127.0.0.1:8000 \
+            cargo test --locked -p celld --lib control::
+
       # The blob-stream sink's own tests, with its client compiled in.
       - name: Test, blob-stream sink
         run: cargo test --locked -p celld --features export-blob-stream --lib export_blob_stream

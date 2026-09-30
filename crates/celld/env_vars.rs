@@ -300,6 +300,7 @@ pub fn validate() -> anyhow::Result<()> {
             bail!("CELLD_PRESSURE_OWNERSHIP must be release or sticky, not {value:?}");
         }
     }
+    crate::control::validate_env()?;
     if let Some(zone) = value("CELLD_ZONE")? {
         crate::export::parse_zone("CELLD_ZONE", &zone)?;
     }

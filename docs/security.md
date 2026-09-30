@@ -211,6 +211,14 @@ The fleet bucket is the root of authority for the fleet. It stores the
 deployments, the cell state, the ownership leases, the node leases, and the
 shared peer-authentication secret.
 
+A fleet that keeps its coordination records in a DynamoDB table splits
+that authority: the table holds the ownership records and the node leases,
+and `fleet/control.json` in the bucket names the table. A person who can
+write either one can disrupt the fleet. Scope the table credential to the
+one table, with `GetItem`, `PutItem`, `DeleteItem`, `Query`,
+`DescribeTable`, and `DescribeTimeToLive`; `celld control init` also needs
+`CreateTable`, `UpdateContinuousBackups`, and `DescribeContinuousBackups`.
+
 A person who holds the bucket credentials controls the fleet. Give each
 credential access to one fleet bucket only, and replace a credential after a
 suspected disclosure.

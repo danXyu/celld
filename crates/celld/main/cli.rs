@@ -39,6 +39,7 @@ pub(crate) enum Action {
     Preview(Vec<String>),
     Dev(Vec<String>),
     Cell(Vec<String>),
+    Control(Vec<String>),
     D1(Vec<String>),
     Export(Vec<String>),
     Kv(Vec<String>),
@@ -78,6 +79,7 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
             "deploy" => return Ok(Action::Deploy(arguments)),
             "dev" => return Ok(Action::Dev(arguments)),
             "cell" => return Ok(Action::Cell(arguments)),
+            "control" => return Ok(Action::Control(arguments)),
             "d1" => return Ok(Action::D1(arguments)),
             "export" => return Ok(Action::Export(arguments)),
             "kv" => return Ok(Action::Kv(arguments)),
@@ -275,6 +277,7 @@ USAGE:
   celld preview NAME --context CONTEXT --namespace NS --fleet FLEET [OPTIONS]
   celld dev [PROJECT] [--host IP] [--port PORT] [--logs]
   celld cell list [CLASS] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
+  celld control init|show --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
   celld d1 migrations apply DATABASE [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX]
   celld d1 execute DATABASE --command SQL [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX]
   celld export reconcile|verify|erase --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]

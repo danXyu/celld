@@ -37,6 +37,18 @@ APIs, and Wrangler configuration.
   identity from Azure App Service or Azure Container Apps does not work. Use a
   workload identity or a storage account key on these platforms.
 
+## DynamoDB coordination records
+
+- A DynamoDB control table needs an `s3://` fleet bucket, because the table
+  signs with the bucket's AWS credential chain.
+- A running bucket fleet cannot move to a table, and a table fleet cannot
+  move back: `celld control migrate` is not implemented. Start a new fleet
+  on the table, or stop every node before the first table node starts.
+- `celld cell list` reads the cell prefixes in the bucket. On a table fleet
+  a cell that has an ownership record but has never written data has no
+  prefix, so the listing leaves it out. Such a cell holds no data.
+- The shared fleet sample `fleet/capacity-v1.json` stays in the bucket.
+
 ## WebSockets
 
 - An outbound Durable Object WebSocket keeps its cell resident. The connection

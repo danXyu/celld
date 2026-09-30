@@ -3495,6 +3495,33 @@ fn node_bucket(
     }
 }
 
+/// Resolve where this fleet keeps its coordination records before the node
+/// reads one: the bucket, or the DynamoDB table `fleet/control.json` names.
+/// The first node of a fleet records its own `CELLD_CONTROL` there, and a
+/// node configured for another store than the fleet chose refuses to start.
+async fn resolve_control(client: &celld::bucket::Bucket) -> anyhow::Result<()> {
+    let resolved = client
+        .resolve_control(celld::control::Role::Node)
+        .await
+        .context("resolve the fleet's coordination store")?;
+    tracing::info!(
+        event = "control_store_resolved",
+        store = %resolved,
+        "coordination records live in {resolved}"
+    );
+    Ok(())
+}
+
+/// The lease lane follows the choice [`resolve_control`] confirmed, over its
+/// own connection pool.
+async fn resolve_lease_control(lease_client: &celld::bucket::Bucket) -> anyhow::Result<()> {
+    lease_client
+        .resolve_control(celld::control::Role::Lease)
+        .await
+        .context("resolve the lease lane's coordination store")?;
+    Ok(())
+}
+
 /// The shutdown handoff parks the successor dormant, so the batch does not
 /// start restore work there. The fleet drain token also admits one donor at a
 /// time. Keep enough ownership operations in flight to overlap object-store
@@ -3605,6 +3632,7 @@ async fn async_main(
         Action::Deploy(arguments) => return fleet::run_deploy(arguments).await,
         Action::Dev(arguments) => return celld::dev::run(arguments).await,
         Action::Cell(arguments) => return celld::cell_cli::run(arguments).await,
+        Action::Control(arguments) => return celld::control_cli::run(arguments).await,
         Action::D1(arguments) => return celld::d1_cli::run(arguments).await,
         Action::Export(arguments) => return celld::export_cli::run(arguments).await,
         Action::Kv(arguments) => return celld::kv_cli::run(arguments).await,
@@ -3867,12 +3895,14 @@ async fn async_main(
             } else {
                 fleet::validate_bucket(&client).await?;
             }
+            resolve_control(&client).await?;
             celld::wake_format::ensure_ready(&client).await?;
             // The list above proves the bucket answers; it does not prove the
             // store enforces the conditional writes or ranged reads that a
             // cell needs. Test both contracts here before the node serves.
             fleet::probe_storage_before_serving(&client, settings.control_plane).await?;
             let lease_client = node_bucket(&settings, managed_storage.as_ref(), true)?;
+            resolve_lease_control(&lease_client).await?;
             if settings.control_plane {
                 celld::control_plane::wait_for_initial_deployment(&client).await?;
                 deploy_agent = Some(client.clone());
@@ -4094,8 +4124,10 @@ async fn async_main(
             };
             let (ownership, peer_key, wake, wake_scan) = if settings.bucket.is_some() {
                 let client = node_bucket(&settings, managed_storage.as_ref(), false)?;
+                resolve_control(&client).await?;
                 celld::wake_format::ensure_ready(&client).await?;
                 let lease_client = node_bucket(&settings, managed_storage.as_ref(), true)?;
+                resolve_lease_control(&lease_client).await?;
                 let peer_key = peer_auth::load_or_create(&client).await?;
                 let wake = Arc::new(celld::wake::WakeFlusher::new());
                 celld::js::set_arm_gate(ArmGate {
@@ -4180,8 +4212,10 @@ async fn async_main(
         } else {
             let (ownership, peer_key) = if settings.bucket.is_some() {
                 let client = node_bucket(&settings, managed_storage.as_ref(), false)?;
+                resolve_control(&client).await?;
                 celld::wake_format::ensure_ready(&client).await?;
                 let lease_client = node_bucket(&settings, managed_storage.as_ref(), true)?;
+                resolve_lease_control(&lease_client).await?;
                 let peer_key = peer_auth::load_or_create(&client).await?;
                 (
                     Some(Ownership::Bucket(Arc::new(

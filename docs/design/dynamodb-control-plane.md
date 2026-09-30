@@ -1,7 +1,10 @@
 # DynamoDB control plane: an optional home for fleet coordination
 
-Status: design, revision 1, 2026-09-29. Nothing in this document is
-implemented.
+Status: revision 2, 2026-09-29. The table, its selection, the routing of
+every coordination record, and `celld control init|show` are
+implemented. [Not built yet](#not-built-yet) lists what revision 1
+proposed and this revision leaves for later; the
+[Decisions](#decisions) section records what changed and why.
 
 celld coordinates a fleet through conditional writes to the fleet bucket.
 The bucket holds each cell's ownership record, each node's lease, and a
@@ -24,12 +27,12 @@ active every day, pays for an ownership write on every cold activation.
 - [Goals and non-goals](#goals-and-non-goals)
 - [What moves and what stays](#what-moves-and-what-stays)
 - [Selecting the backend](#selecting-the-backend)
+- [Routing](#routing)
 - [The table](#the-table)
 - [The store contract](#the-store-contract)
 - [Records](#records)
 - [Ordering across two stores](#ordering-across-two-stores)
-- [Code structure](#code-structure)
-- [The startup probe](#the-startup-probe)
+- [The startup checks](#the-startup-checks)
 - [Partition limits and scan cost](#partition-limits-and-scan-cost)
 - [Latency](#latency)
 - [Cost](#cost)
@@ -37,9 +40,7 @@ active every day, pays for an ownership write on every cold activation.
 - [Security](#security)
 - [Configuration](#configuration)
 - [Testing](#testing)
-- [Migration](#migration)
-- [Rollout](#rollout)
-- [Later: the wake index](#later-the-wake-index)
+- [Not built yet](#not-built-yet)
 - [Decisions](#decisions)
 - [Open questions](#open-questions)
 
@@ -48,15 +49,13 @@ active every day, pays for an ownership write on every cold activation.
 Goals:
 
 - A fleet can choose DynamoDB for coordination state with one setting.
-  Nothing changes for a fleet that does not.
+  Nothing changes for a fleet that does not: a bucket fleet issues exactly
+  the store requests it issued before.
 - Both guarantees in [guarantees.md](../guarantees.md) hold unchanged in
   either mode: at most one node owns a cell, and an acknowledged write
   survives any single-node loss.
-- Every caller reaches coordination state through one typed interface.
-  No module outside the two backends builds a coordination key or calls
-  the bucket's conditional write for one.
-- A fleet can move from bucket to DynamoDB, and back, with a short
-  coordinated stop and no bulk copy of per-cell records.
+- No call site can reach the wrong copy of a coordination record, including
+  call sites written after this change.
 
 Non-goals:
 
@@ -64,30 +63,29 @@ Non-goals:
   or export output out of the bucket.
 - A general "metadata database". The table holds only records that are
   compare-and-swapped or scanned as a set.
-- Other databases. The interface admits one, but this design qualifies
-  DynamoDB alone.
+- Other databases. Nothing here prevents one, but only DynamoDB is built.
 - Multi-region. Global tables are refused (see
   [The store contract](#the-store-contract)).
 
 ## What moves and what stays
 
-| Record | Today | DynamoDB mode | Why |
-|---|---|---|---|
-| Cell ownership `cells/<cell>/own.json` | bucket | **table** | Written on every activation and release; read on every bucket-proof ack |
-| Node lease and folded node-log record `nodes/<node>.json` | bucket | **table** | Compare-and-swapped every TTL/3; scanned by five loops |
-| Node load telemetry (inside the lease today) | bucket | **table, own item** | Advisory; split out so lease scans stay small |
-| Fleet capacity sample `fleet/capacity-v1.json` | bucket | **removed** | A query over load items replaces it |
-| Waker role lease `wake/waker.json` | bucket | **table** | Compare-and-swapped every tick from two loops |
-| Drain token `drain/token.json` | bucket | **table** | Polled every second during drains |
-| Deploy pointers `deploy/current.json`, `deploy/<script>/current.json` | bucket | **table** | Switched together in one transaction |
-| Queue attachments `deploy/queues/<q>/consumer.json` | bucket | **table** | Part of the same deploy transaction |
-| Backend marker `fleet/control.json` | — | **bucket (new)** | Tells every node and CLI where coordination lives |
-| Wake index `wake/entries/`, `wake/retired/`, `wake/format.json` | bucket | bucket | Its protocol depends on immutable names; see [Later](#later-the-wake-index) |
-| Peer-auth secret `fleet/peer-auth.json` | bucket | bucket | Written once, read at boot; nothing to gain |
-| LTX data `cells/<cell>/ltx/` | bucket | bucket | Data |
-| Node-log bundles, recovery checkpoints, loss records `log/` | bucket | bucket | Data; the export reconciler lists loss records |
-| Deploy modules, manifests, assets | bucket | bucket | Immutable, addressed through the pointers |
-| `probe/`, `preview-snapshots/`, `node-cells/` | bucket | bucket | Unchanged |
+| Record | Bucket key | Home on a table fleet |
+|---|---|---|
+| Cell ownership | `cells/<cell>/own.json` | **table** |
+| Node lease, with the folded node-log record and load | `nodes/<node>.json` | **table** |
+| Drain token | `drain/token.json` | **table** |
+| Waker role lease | `wake/waker.json` | **table** |
+| Fleet deploy pointer | `deploy/current.json` | **table** |
+| Named deploy pointer | `deploy/<script>/current.json` | **table** |
+| Queue attachment | `deploy/queues/<queue>/consumer.json` | **table** |
+| Backend marker (new) | `fleet/control.json` | bucket |
+| Fleet capacity sample | `fleet/capacity-v1.json` | bucket |
+| Wake index | `wake/entries/`, `wake/retired/`, `wake/format.json` | bucket |
+| Peer-auth secret | `fleet/peer-auth.json` | bucket |
+| LTX data | `cells/<cell>/ltx/` | bucket |
+| Node-log bundles, recovery checkpoints, loss records | `log/` | bucket |
+| Deploy modules, manifests, assets | `deploy/<script>/<version>/`, `deploy-blobs/` | bucket |
+| Everything else | | bucket |
 
 The LTX epoch chain stays a bucket listing. Restore derives it from
 `cells/<cell>/ltx/` after the ownership write, and an index of it in the
@@ -98,66 +96,83 @@ write that the listing does not have.
 
 `CELLD_CONTROL` names the backend: unset or `bucket` for the bucket,
 `dynamodb://TABLE` for a table. The choice belongs to the fleet, not to
-one node, so the bucket records it.
-
-`fleet/control.json` is created once, with a conditional create:
+one node, so the bucket records it in `fleet/control.json`, created once
+with a conditional create:
 
 ```json
-{"format": 1, "backend": "dynamodb", "table": "celld-prod", "region": "us-east-1", "fleet": "b6f1…"}
+{"format":1,"backend":"dynamodb","table":"celld-prod","region":"us-east-1","fleet":"b6f1…"}
 ```
 
-- A node creates the marker at startup if it is absent, from its own
-  `CELLD_CONTROL`. The bucket form is `{"format":1,"backend":"bucket"}`.
-- A node whose `CELLD_CONTROL` disagrees with the marker refuses to
-  start and names both values. Two nodes can therefore never coordinate
-  one fleet through two stores.
-- Creating a `dynamodb` marker requires that `nodes/` holds no unexpired
-  lease, the same refusal check `wake_format.rs` uses. A running bucket
-  fleet cannot be joined by a DynamoDB node.
-- The `fleet` value is random. The table holds the same value in its
-  meta item, so a bucket prefix pointed at another fleet's table is
-  refused.
-- CLIs (`celld deploy`, `celld cell`, `celld queue`, `celld export`) read
-  the marker and open the same backend. Operators do not pass a new flag
-  to them.
+- `celld control init` creates the table if needed, claims it, and writes
+  the marker. It is the recommended first step for a table fleet.
+- A serving node resolves the marker at startup, before it reads any
+  record (`control::resolve`, role `Node`). If the marker is absent the
+  node records its own `CELLD_CONTROL`, so a bucket fleet gets
+  `{"format":1,"backend":"bucket"}` on the first start of this release.
+- A node whose `CELLD_CONTROL` disagrees with the marker refuses to start
+  and names both values. Two nodes therefore never coordinate one fleet
+  through two stores.
+- Creating a `dynamodb` marker requires that the bucket holds no unexpired
+  node lease. A running bucket fleet cannot be joined by a table node.
+- The `fleet` value is random. The table's meta item holds the fleet that
+  claimed it, so a second fleet pointed at the same table is refused.
+- The node's lease lane is a second bucket client with its own connection
+  pool. It resolves second (role `Lease`), follows the marker, and opens
+  its own table client, so lease traffic keeps its isolated pool.
+- Operator commands resolve read-only (role `Operator`) and follow the
+  marker. `celld deploy`, `celld cell`, `celld queue` and the rest need no
+  new flag.
 
-A bucket without a marker is a bucket fleet. This keeps every existing
-fleet valid. Releases before this one do not read the marker, so the
-upgrade that introduces it needs the coordinated stop described in
-[Migration](#migration) before any fleet switches backend, exactly as the
-wake format change did.
+Releases before this one do not read the marker, so a table fleet must not
+run an older binary. That is the same constraint the wake-format change
+carried.
+
+## Routing
+
+`Bucket` routes the coordination records itself. `ControlKey::parse`
+(`crates/celld/control.rs`) recognizes exactly the seven key shapes in the
+table above. When the bucket client's route is a table, `get`, `head`,
+`put`, `put_cas`, `delete` and the new `delete_if_token` send a recognized
+key to the table, and `list` and `objects_page` answer a listing that
+covers `nodes/`, `drain/`, `wake/` or `deploy/` with the table's records
+merged in (and any bucket object under a record's key left out). Every
+other key goes to the bucket as before.
+
+The route is resolved once per opened client and shared by every clone of
+it. A bucket fleet's route is the bucket, and a bucket fleet takes none
+of the new branches: the check is a string match with no I/O, so the
+sequence of store requests is unchanged. A client that is never resolved
+behaves as a bucket fleet, unless the process is configured for a table,
+in which case it refuses every coordination record. That makes a missed
+resolution loud instead of letting it read an empty bucket.
+
+This replaces the typed `ControlStore` interface of revision 1; see
+[Decisions](#decisions).
 
 ## The table
 
 One table. String partition key `pk`, string sort key `sk`. No secondary
-indexes, no local indexes, no streams in revision 1. On-demand capacity by
-default. Point-in-time recovery and deletion protection on. DynamoDB TTL
-may be enabled only on the attribute `gc_at`, which celld sets on load
-items and never on an authority item.
+indexes, no streams, no time-to-live. On-demand capacity, point-in-time
+recovery and deletion protection when `celld control init` creates it.
 
-| Item | `pk` | `sk` | Attributes |
-|---|---|---|---|
-| Fleet meta | `meta` | `fleet` | `fleet`, `format`, `lease_shards` |
-| Cell owner | `cell#<cell>` | `own` | `node` (empty when released), `epoch`, `v` |
-| Node lease | `nodes#<shard>` | `<node>` | lease fields, `log` map, `v`, `updated_ms` |
-| Node load | `load` | `<node>` | load fields, `updated_ms`, `gc_at` |
-| Waker role | `fleet` | `waker` | `node`, `expires_ms`, `v` |
-| Drain token | `fleet` | `drain` | `node`, `expires_ms`, `restoration_baseline`, `v` |
-| Fleet pointer | `deploy` | `current` | pointer fields, `v` |
-| Named pointer | `deploy` | `script#<name>` | pointer fields, `v` |
-| Queue attachment | `deploy` | `queue#<queue>` | attachment fields, `v` |
-| Probe | `probe` | `<random>` | `v` |
+| Item | `pk` | `sk` |
+|---|---|---|
+| Fleet meta | `meta` | `fleet` |
+| Cell owner | `cell#<cell>` | `own` |
+| Node lease | `nodes` | `<node>` |
+| Drain token | `fleet` | `drain` |
+| Waker role | `fleet` | `waker` |
+| Fleet pointer | `deploy` | `current` |
+| Named pointer | `deploy` | `script#<name>` |
+| Queue attachment | `deploy` | `queue#<queue>` |
+| Probe (transient) | `probe` | `<random>` |
 
-`<shard>` is a stable hash of the node name modulo `lease_shards`,
-which is fixed when the fleet is created (default 1; see
-[Partition limits](#partition-limits-and-scan-cost)).
-
-Every item stores its fields as native attributes rather than a JSON
-blob, except the folded `log` object, which keeps its JSON shape
-(`NodeLogWire`) as a map. `NodeLeaseWire` keeps unknown fields today by
-preserving raw lease bodies for mixed-version readers. The table
-preserves them the same way: a writer loads the item, replaces the fields
-it owns, and writes back every attribute it read.
+Every item carries the same three attributes: `doc`, the record's JSON
+body exactly as the bucket would hold it; `v`, the version token; and
+`updated_ms`, the writer's wall clock. Keeping the body verbatim means every
+reader and writer, including one that preserves fields a newer release
+added (`CapacitySample` keeps raw lease bodies for that reason), works
+unchanged.
 
 ## The store contract
 
@@ -165,151 +180,93 @@ The guarantees need four properties from the bucket: conditional create,
 conditional overwrite, read-after-write, and exact ranged reads. The table
 must provide the first three for every record it holds.
 
-**Version tokens.** Every authority item carries `v`, a random 128-bit
-hex string that the writer generates for each write. The existing
-`CasGuard::{Absent, Match(token)}` (`crates/logic/types.rs:285`) carries
-it unchanged. The core never parses a token, so an etag and a `v` are
-interchangeable.
+**Version tokens.** `v` is a random 128-bit hex string that the writer
+generates for each write. It travels through `CasGuard::Match` like an
+etag; the core never parses a token.
 
-- `CasGuard::Absent` becomes `attribute_not_exists(pk)`.
-- `CasGuard::Match(t)` becomes `v = :t`.
+- A create is `attribute_not_exists(pk)`.
+- An overwrite is `v = :expected`.
 
-**Resolving ambiguity.** A write that times out can have committed. The
-bucket resolves that with a readback. The table does the same, but the
-answer is exact: if the read returns `v` equal to the token this writer
-generated, the write committed; any other value means it did not, or was
-overwritten after. Every write also sets
-`ReturnValuesOnConditionCheckFailure = ALL_OLD`, so a rejected write
-returns the current item and the core's follow-up read is free.
+Because the writer generated the token, a readback after an ambiguous
+write is exact: the item holds this writer's token or it does not.
 
-**Error classes.** Each response maps onto the classes the bucket lane
-already uses (`LeaseCasError`, `ownership_store.rs:355`):
+**Error classes.** Each failure maps onto the classes the bucket lane
+already uses (`LeaseCasError`, and `bucket::cas_write_did_not_commit`):
 
 | Response | Class |
 |---|---|
-| `ConditionalCheckFailedException`, or `TransactionCanceledException` whose reasons include `ConditionalCheckFailed` | clean rejection |
-| `ProvisionedThroughputExceededException`, `ThrottlingException`, `RequestLimitExceeded` | not committed |
-| `ValidationException`, `AccessDeniedException`, `ResourceNotFoundException`, `UnrecognizedClientException` | not committed |
-| `InternalServerError`, any 5xx, a timeout, a reset connection | ambiguous |
-| `TransactionConflictException`, `TransactionInProgressException` | not committed |
+| `ConditionalCheckFailedException` | clean rejection (`Ok(None)`) |
+| Any other 4xx, including throttling, validation, access denied, and resource not found | not committed |
+| A connection that never opened | not committed |
+| 5xx, a timeout, a reset connection, an unreadable success response | may have committed |
 
-Throttling is not committed: DynamoDB rejects a throttled request before
-applying it. This matters, because it lets a throttled lease renewal
-retry with its current token instead of spending a readback.
+DynamoDB authenticates, validates and admits a request before it applies
+it, so a 4xx answer means nothing changed. Throttling is in that class,
+which lets a throttled lease renewal retry with the token it already
+holds instead of spending a readback.
 
-**No transport retries on writes.** The bucket's conditional client
-retries zero times (`bucket.rs`, `cas_retry`), and the reason carries
-over: a hidden retry of a write that already committed answers as a lost
-race. The DynamoDB client retries reads and nothing else. A
-`TransactWriteItems` call carries a `ClientRequestToken`, which makes a
-retried transaction idempotent for ten minutes; the deploy path uses that
-and retries.
+**No repeated writes.** The bucket's conditional client retries zero times
+(`bucket.rs`, `cas_retry`), because a repeat of a write that already
+committed answers as a lost race. The table client repeats reads, up to
+twice, and never repeats a write.
 
-**Consistency.** Every read of an authority item uses
-`ConsistentRead = true`. The table is refused if it is a global table.
-Reads never go through DAX. There are no secondary indexes to read by
-mistake. Load items are advisory and read eventually consistent, which
-halves their cost.
+**Consistency.** Every `GetItem` and `Query` sets `ConsistentRead`. The
+startup checks refuse a global table, a secondary index, and
+time-to-live.
 
-**Clocks.** `capacity_record_is_recent` (`ownership_store.rs:344`) uses
-the bucket's `Last-Modified` to drop stale leases from placement. The
-table has no server write time, so every lease and load item carries
-`updated_ms`, the writer's wall clock. The filter already tolerates three
-TTLs of skew; it keeps that window.
+**Clocks.** `capacity_record_is_recent` filters leases by the bucket's
+`Last-Modified`. A listed table record reports `updated_ms` in that field,
+the writer's clock rather than the store's; the filter's three-TTL window
+already tolerates that skew.
 
-**Timeouts.** The lease lane keeps its own client, pool and user agent,
-as it does on the bucket (`fleet::lease_bucket_client_with_credentials`).
-Its bounds stay configurable and start at the bucket's values: connect
-3 s, request 15 s. The self-fence arithmetic in the core already bounds a
-renewal attempt by the authority it has left, so faster responses need no
-core change to benefit.
+**Timeouts.** The table client uses the bucket's bounds, connect 3 s and
+request 15 s, because they are part of the self-fence arithmetic.
 
 ## Records
 
 ### Cell ownership
 
-`read_owner`, `cas_owner` and `release_owner` map one to one onto
-`GetItem`, conditional `PutItem`, and conditional `UpdateItem`. The epoch
-rule is unchanged: every acquire writes `epoch + 1`, and a release writes
-an empty `node` and keeps the epoch. `Effect::VerifyOwnership`
-(`actor.rs:3851`) stays one read.
+`read_owner`, `cas_owner` and `release_owner` in `ownership_store.rs` are
+unchanged; their `get` and `put_cas` reach the table. The epoch rule is
+unchanged: every acquire writes `epoch + 1`, and a release writes an empty
+`node` and keeps the epoch. `Effect::VerifyOwnership` stays one read.
 
-Two behaviors change:
+Two behaviors change on a table fleet:
 
-- `delete_streams` (`ltx_repl.rs:2957`) deletes everything under
-  `cells/<cell>` in the bucket, which today includes `own.json`. In table
-  mode the owner item is not deleted with the streams. The epoch stays
-  monotonic across a delete, which the fence already assumes.
-- `celld cell list` enumerates `cells/` prefixes. A cell that was
-  acquired but never wrote an LTX file has a prefix today because of
-  `own.json`. In table mode it has none and is not listed. Such a cell
-  holds no data, so the listing is still complete for data.
+- `delete_streams` (`ltx_repl.rs`) deletes the bucket objects under
+  `cells/<cell>`, which on a bucket fleet includes `own.json`. On a table
+  fleet the owner item survives, so the epoch stays monotonic across the
+  delete, which the fence already assumes.
+- `celld cell list` enumerates `cells/` prefixes. A cell that was acquired
+  but never wrote an LTX file has a prefix on a bucket fleet because of
+  `own.json`, and none on a table fleet. Such a cell holds no data.
 
 ### Node leases and the folded log
 
-`cas_node_lease` becomes a conditional `PutItem` on `v`. The folded log
-record rides in the same item, so the node-log paths that CAS a dead
-node's lease (`node_log.rs`, `write_dead_record`) and the claim and seal
-steps of recovery use the same call.
+Lease renewal, dead-session recovery (`node_log::write_dead_record`), and
+every lease reader reach the table through the same routed calls. The
+folded node-log record rides in the lease item.
 
 The rule "a folded record is never deleted, and an absent record proves
-the bucket is complete" is unchanged. What changes is dead-node GC
-(`dead_node_gc.rs:369`). The bucket has no conditional delete, so GC
-writes a tombstone and then deletes unconditionally, and a folded record
-is kept forever as a tombstone because a late unconditional delete could
-erase a successor's record. The table has conditional delete, and a
-delete conditioned on `v` cannot remove a record a successor rewrote. So:
+the bucket is complete" is unchanged. Dead-node GC (`dead_node_gc.rs`)
+writes a tombstone and then deletes. It now deletes with
+`delete_if_token`, passing the tombstone's token: on the bucket that is
+the unconditional delete it always was, and on the table the delete is
+conditioned on the token, so a delete that lands late cannot remove a
+record a successor wrote.
 
-- A dead record with no log is removed with one `DeleteItem` conditioned
-  on the `v` that GC read and judged dead.
-- A dead, sealed record keeps today's terminal state, a tombstone with
-  `expires_ms = 0`. The dead-leader sweep still needs it to find sealed
-  sessions and GC their bundles. Removing it is a separate change.
+Every loop that lists `nodes/` and reads each lease (the capacity scan,
+node-log maintenance, the dead-leader sweep, dead-node GC, the ready gate,
+the wake-format stop check, `fleet::node_lease_ids`) gets its listing from
+one `Query` on the `nodes` partition and then reads each lease as before.
 
-Every loop that listed `nodes/` and read each lease (the capacity scan,
-node-log `maintain`, `sweep_dead_leaders`, dead-node GC, the ready gate,
-the wake-format stop check, `fleet::node_lease_ids`) becomes one `Query`
-per lease shard. A node keeps one fleet view, refreshed at most once per
-`CELLD_FLEET_VIEW_MS` (default 5000), and every loop reads that view
-instead of its own scan. A loop that needs a fresher view than the cache
-holds, such as recovery about to judge a lease expired, forces a refresh.
+### Fleet singletons and deploy pointers
 
-### Load and placement
-
-A node writes its load item with an unconditional `PutItem` on every
-renewal. It carries no authority, so a lost or late write is harmless.
-Placement, rebalance, the format gate and container `max_instances` read
-load with one eventually consistent `Query` on `pk = load`.
-
-This removes the capacity sample and its refresh claim. The sample exists
-so that one node scans the fleet and the rest read one object; a single
-query over small items is cheaper than that object's read would be in the
-table, where reads are billed per 4 KB. It also removes the sample's size
-problem: the sample embeds every lease, and at about 1.5 KB per node it
-passes DynamoDB's 400 KB item limit between 200 and 400 nodes.
-
-### Fleet singletons
-
-The waker role and the drain token keep their protocols: read, then
-conditional write on `v`. The drain token is still released by writing an
-expired record, because readers treat "absent" and "expired" alike and
-the release path does not need to change.
-
-### Deploy pointers
-
-`celld deploy` today writes modules and manifests, then compare-and-swaps
-the queue attachments, then the named pointer, then the fleet pointer
-(`deploy.rs`). A crash between the pointer writes leaves them
-inconsistent until the next deploy.
-
-In table mode the attachments and both pointers switch in one
-`TransactWriteItems`, each conditioned on the `v` the deploy read. The
-blobs, modules and manifests are still written to the bucket first. A
-node polls the fleet pointer every `CELLD_DEPLOY_POLL_S` as today; a
-stream-driven push is left for later.
-
-The managed control-plane client (`control_plane.rs`) writes the same
-pointers and uses the same interface.
+The waker role, the drain token, the deploy pointers and the queue
+attachments keep their protocols unchanged, through the routed calls.
+`control_plane::deployment_exists` lists `deploy/` to find a pointer; the
+merged listing returns the table's pointers alongside the bucket's
+deployments.
 
 ## Ordering across two stores
 
@@ -336,93 +293,50 @@ objects is linearizable, so an operation that completes before another
 begins is observed by it whichever store holds each. The orderings hold
 without change provided that (a) every authority read is consistent and
 (b) no step returns before the store has acknowledged. Both are rules of
-[The store contract](#the-store-contract), and the probe checks (a).
+[The store contract](#the-store-contract), and the startup checks enforce
+(a).
 
 The epoch in the LTX key remains the fence. A stale owner's writes land
 in a superseded prefix whichever store holds the owner record.
 
-## Code structure
+The end-to-end run in [Testing](#testing) exercised orderings 1 to 4: a
+node killed with `SIGKILL` right after acknowledging a write was
+recovered and sealed by its peer from the table's copy of its lease, and
+the peer served the next write on top of the acknowledged one.
 
-A new module, `control_store.rs`, holds one enum, in the style of the
-existing `Ownership` adapter (`actor.rs:194`):
+## The startup checks
 
-```rust
-pub enum ControlStore {
-    Bucket(BucketControl),
-    Dynamo(DynamoControl),
-}
-```
+A table node, and `celld control init`, check before serving:
 
-Its operations are typed, not keyed: `read_owner`, `cas_owner`,
-`release_owner`, `read_lease`, `cas_lease`, `delete_dead_lease`,
-`fleet_leases`, `publish_load`, `fleet_load`, `read_singleton`,
-`cas_singleton`, `read_pointer`, `switch_pointers`. `BucketControl` is
-the code that exists today, moved behind these methods. `Ownership`
-keeps its `Memory` variant for the single-node development mode, and its
-`Bucket` variant takes a `ControlStore`.
+- `DescribeTable`: the table is active, its keys are `pk`/`sk` strings,
+  it has no secondary indexes and no replicas.
+- `DescribeTimeToLive`: time-to-live is disabled.
+- The meta item names this fleet, or is absent and is then claimed.
+- The probe: create an absent item, fail to create it again, update it
+  with the current token, fail to update it with a stale token, and read
+  back the last write. A failure stops the node, as the bucket probe's
+  does.
 
-These modules build coordination keys or call the bucket's conditional
-write for them today, and move behind the interface:
+The bucket probe still runs too: the wake index and the marker are
+bucket records written with conditional writes.
 
-- `ownership_store.rs`: owners, leases, the capacity sample,
-  `fleet_class_instances`
-- `node_log.rs`: dead-session lease writes, the `nodes/` listing in the
-  dead-leader sweep
-- `dead_node_gc.rs`, `drain_token.rs`, `wake.rs` (waker role and owner
-  reads), `wake_format.rs` (the stop check), `fleet.rs` (lease lookups,
-  pointer reads), `deploy.rs`, `control_plane.rs` (pointer writes), and
-  the ready gate in `main.rs`
-
-The refactor is behavior-neutral for bucket fleets and lands first, on
-its own. A lint test rejects `"nodes/"`, `"own.json"`, `"drain/"`,
-`"wake/waker"` and `"deploy/current"` outside the two backends.
-
-**The DynamoDB client.** `dynamo.rs` implements the eight operations the
-table needs (`GetItem`, `PutItem`, `UpdateItem`, `DeleteItem`, `Query`,
-`TransactWriteItems`, `DescribeTable`, `DescribeContinuousBackups`) as
-JSON over the `reqwest` client celld already has. It does not depend on
-the AWS SDK. Requests are signed with `object_store::aws::AwsAuthorizer`,
-and credentials come from `AmazonS3::credentials()` on the fleet's own S3
-client, so the table uses exactly the credential chain the bucket does:
-environment, web identity, container and instance metadata. A DynamoDB
-fleet therefore requires an `s3://` bucket.
-
-## The startup probe
-
-The bucket probe (`Bucket::probe_cas_steps`, `bucket.rs`) provokes the
-two rejections a conforming store must produce. A table-mode node runs the
-same four steps against a `probe` item, then checks:
-
-- `DescribeTable`: key schema `pk`/`sk` strings, no global replicas, no
-  secondary indexes, and a TTL attribute that is absent or `gc_at`.
-- The meta item exists and its `fleet` matches the bucket marker.
-- `DescribeContinuousBackups`: point-in-time recovery is on. A warning,
-  not a refusal.
-
-A violation stops the node, as a bucket violation does. `celld diagnose`
-runs the same checks and prints the table's billing mode and any
-throttling seen since boot.
+`celld diagnose` prints which store holds the records. `celld control
+show` prints the marker, the table's shape check, its fleet, whether
+point-in-time recovery is on, and the number of node leases.
 
 ## Partition limits and scan cost
 
 A DynamoDB partition serves up to 1,000 write units and 3,000 read units
-per second. All node leases share one partition key per shard.
+per second. All node leases share the `nodes` partition.
 
-- **Writes.** A lease without load telemetry is about 600 bytes, one
-  write unit, renewed every TTL/3. One shard carries renewals for about
-  3,000 nodes.
-- **Reads.** Consistent lease scans are the binding limit. With one fleet
-  view per node refreshed every 5 s, N nodes read N leases each, so read
-  units grow with N²: about 300 read units per second at 100 nodes,
-  2,700 at 300, and 30,000 at 1,000.
-
-Revision 1 targets fleets up to 300 nodes. One shard serves about 200
-nodes at the default view interval; above that, set `lease_shards` to 2
-or more, which spreads the scan across partitions but does not reduce its
-total cost. A fleet beyond 300 nodes should raise `CELLD_FLEET_VIEW_MS`
-as well. A design
-that reads only leases that changed is future work, and the N² term is
-inherited from the bucket, where the same scans cost more.
+- **Writes.** A lease with its load telemetry is about 1.5 KB, two write
+  units, renewed every TTL/3. The partition carries renewals for roughly
+  1,500 nodes.
+- **Reads.** Every lease scan is a `Query` on that partition followed by a
+  `GetItem` per lease, and several loops on every node scan, so reads
+  grow with N². The bucket has the same shape, and the table answers it
+  faster and more cheaply, but past a few hundred nodes the scans need the
+  work under [Not built yet](#not-built-yet).
 
 Owner items are keyed by cell, so activation traffic spreads across
 partitions without configuration.
@@ -430,7 +344,7 @@ partitions without configuration.
 ## Latency
 
 Estimates, not measurements: same region, small items, S3 Standard,
-on-demand table. Phase 0 of the [rollout](#rollout) replaces them.
+on-demand table.
 
 | Operation | Bucket p50 / p99 | Table p50 / p99 |
 |---|---|---|
@@ -438,12 +352,12 @@ on-demand table. Phase 0 of the [rollout](#rollout) replaces them.
 | Cold activation, control-plane part (owner read, placement read, owner write) | 90 / 400 ms | 15 / 60 ms |
 | Cold activation including the LTX epoch listing, which stays in the bucket | 130 / 550 ms | 50 / 230 ms |
 | Bucket-proof acknowledgement (LTX PUT, then owner read) | 60 / 400 ms | 45 / 320 ms |
-| Fleet lease scan, 100 nodes | 450 ms / 1.3 s | 20 / 60 ms |
 
 Default fleet-durability writes and warm requests do not touch
 coordination state and do not change. The largest effect is on the tail
 of lease renewal, where a slow conditional write spends self-fence
-margin.
+margin. Against DynamoDB Local on one machine, renewals completed in 4 to
+17 ms.
 
 ## Cost
 
@@ -454,202 +368,141 @@ units.
 
 | Workload | Bucket per month | Table per month |
 |---|---|---|
-| 100-node fleet overhead (renewals, scans, singletons, pointer polls) | about $1,400 | about $200–350 |
 | 10M cells, 3 activation cycles per cell per day | about $10,100 | about $1,350 |
 | Unchanged: LTX epoch listing per activation | about $4,500 | about $4,500 |
 
-The saving comes from per-cell traffic, not from the fleet size. Large
-fan-out reads cost more in the table than in the bucket, which is why the
-load items are small and the capacity sample is not carried over.
+The saving comes from per-cell traffic, not from the fleet size.
 
 ## Failure modes
 
 - **Either store unavailable stops the fleet.** Today one regional
-  dependency can stop the fleet; in table mode there are two. A table
+  dependency can stop the fleet; on a table fleet there are two. A table
   outage stops lease renewal, and every node self-fences within one TTL.
-  A bucket outage still stops restore and bucket-proof writes. Fleets
-  that choose the table accept this in exchange for the latency and cost
-  above; it is the main reason the bucket stays the default.
+  A bucket outage still stops restore and bucket-proof writes. This is
+  the main reason the bucket stays the default.
 - **Throttling.** An on-demand table throttles traffic that more than
   doubles its previous peak. A throttled renewal is not committed and
   retries with its token inside its remaining authority, but a sustained
-  throttle self-fences nodes. Operators should pre-warm the table for the
-  expected peak or use provisioned capacity with headroom. `celld
-  diagnose` reports throttled requests, and a metric counts them.
+  throttle self-fences nodes. Pre-warm the table for the expected peak, or
+  use provisioned capacity with headroom.
 - **Clock skew.** Unchanged in kind. Lease expiry compares the writer's
   `expires_ms` with the reader's clock, as it does today.
-- **Marker loss.** If `fleet/control.json` is deleted from a table
-  fleet, a bucket-configured node could create a bucket marker and start
-  beside the table fleet, because it sees no leases in `nodes/`. Every
-  table-mode node therefore re-reads the marker on each fleet-view
-  refresh and recreates it with a conditional create when it is missing,
-  so the window lasts one refresh while any table node runs. A table node
-  that finds a bucket marker in its place self-fences. The marker joins
-  the reserved prefixes and the security guide.
+- **Marker loss.** If `fleet/control.json` is deleted while a table fleet
+  runs, a bucket-configured node could create a bucket marker and start
+  beside it, because the bucket shows no live lease. The marker is under
+  the reserved `fleet/` prefix. Detecting its loss from a running table
+  node is an open question.
 - **A table restored from a backup.** Point-in-time recovery restores
   owner epochs that can be lower than the epochs already written in the
   bucket. Restore refuses to proceed when the newest non-empty epoch is
   at or above the claimed one, so a rolled-back epoch cannot overwrite
-  data, but cells then cannot activate. Restoring the table requires the
-  epoch floor repair described in [Migration](#migration).
+  data, but those cells then cannot activate until their epochs are
+  repaired.
 
 ## Security
 
-The bucket is documented as the fleet's root of authority. In table mode
-authority is split: ownership and leases are in the table, and the
-peer-auth secret, deployments and data are in the bucket. A principal
-that can write either can disrupt the fleet. The table needs:
+The bucket is documented as the fleet's root of authority. On a table
+fleet authority is split: ownership and leases are in the table, and the
+peer-auth secret, deployments, data and the marker are in the bucket. A
+principal that can write either can disrupt the fleet. A node needs
+`GetItem`, `PutItem`, `DeleteItem`, `Query`, `DescribeTable` and
+`DescribeTimeToLive` on the one table. `celld control init` also needs
+`CreateTable`, `UpdateContinuousBackups` and `DescribeContinuousBackups`.
 
-```
-dynamodb:GetItem, PutItem, UpdateItem, DeleteItem, Query,
-TransactWriteItems, ConditionCheckItem, DescribeTable,
-DescribeContinuousBackups
-```
-
-on the one table ARN. CLI principals that only deploy need `GetItem`,
-`TransactWriteItems` and `ConditionCheckItem`. Encryption at rest uses
-the table's KMS setting.
+The table client signs with `object_store`'s SigV4 signer and the S3
+client's own credential chain, so the table authenticates exactly as the
+bucket does. celld links no AWS SDK.
 
 ## Configuration
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `CELLD_CONTROL` | `bucket` | `bucket`, or `dynamodb://TABLE` |
-| `CELLD_CONTROL_REGION` | `AWS_REGION` | The table's region |
-| `CELLD_CONTROL_ENDPOINT` | none | An endpoint override, for DynamoDB Local in tests |
-| `CELLD_FLEET_VIEW_MS` | 5000 | The shared lease view's maximum age |
+| `CELLD_CONTROL` | follow the marker; `bucket` for a new fleet | `bucket`, or `dynamodb://TABLE` |
+| `CELLD_CONTROL_REGION` | the bucket's region | The table's region, when the marker does not name one |
+| `CELLD_CONTROL_ENDPOINT` | none | An endpoint override, for DynamoDB Local |
 
-`celld control init --table NAME` creates the table with the schema,
-on-demand billing, point-in-time recovery, and deletion protection, and
-writes the meta item. Operators who manage tables with their own tooling
-create it to the same schema and run `celld control init --adopt`, which
-checks the table and writes only the meta item.
+```
+celld control init --table NAME [--table-region REGION] [--no-create] --bucket s3://NAME
+celld control show --bucket s3://NAME [--json]
+```
 
 ## Testing
 
-- **One contract suite, three backends.** The existing ownership and
-  lease tests run against `Memory`, `Bucket` (local store), and `Dynamo`
-  through one parameterized suite.
-- **DynamoDB Local in CI.** A job runs the celld integration tests with
-  `CELLD_CONTROL=dynamodb://…` against DynamoDB Local.
-- **A fault-injecting fake.** An in-process table implements the eight
-  operations and can commit a write and then time out, throttle, or
-  return 500. It drives the ambiguity tests: every ambiguous write must
-  resolve through its `v` token, and a throttled renewal must retry
-  without a readback.
-- **Cross-store ordering tests.** The node-log double-loss, incarnation
-  and recovery-witness tests (`node_log/*_tests.rs`) run in table mode,
-  with the fake delaying table responses relative to bucket responses.
-- **Release qualification against real DynamoDB**, as release tests run
-  against R2 today.
+- **A fake table** (`control/tests.rs`) implements the operations celld
+  sends and injects a throttle, or a write that applies and then answers
+  500. The tests cover the key mapping, listing plans, the marker rules,
+  table-shape refusals, the fleet claim, conditional deletes, the error
+  classes, and that a write is attempted once.
+- **DynamoDB Local.** `a_live_table_honors_the_contract` runs the create,
+  shape check, probe, claim, conditional writes, paging and conditional
+  deletes against a real endpoint when `CELLD_TEST_DYNAMODB_ENDPOINT` is
+  set. CI starts DynamoDB Local and runs it.
+- **The existing suites** run unchanged on bucket fleets, whose routes are
+  fixed to the bucket.
+- **End to end**, by hand, with MinIO for the bucket and DynamoDB Local
+  for the table: `celld control init`, `celld deploy`, two nodes, a
+  Durable Object counter written through both, and `SIGKILL` of the
+  owner. The survivor recovered and sealed the dead node's log from its
+  table lease and continued the counter without losing an acknowledged
+  increment. The bucket held only the marker and data; the table held the
+  owner, lease, meta and pointer items.
 
-## Migration
+## Not built yet
 
-A fleet moves from the bucket to the table in one short coordinated stop
-and a lazy copy of owner records. Copying ten million owner records up
-front would take hours of listing; the lazy copy needs no downtime for
-them.
+These were proposed in revision 1 and are left for later:
 
-1. Stop every node. `celld control migrate --to dynamodb://TABLE`
-   refuses while any lease is unexpired.
-2. The command copies, preserving every field: every `nodes/*.json`
-   (including tombstones and folded logs, which recovery needs), the
-   drain token, the waker lease, the deploy pointers and queue
-   attachments. It writes the marker with `"migrating": true`.
-3. Start nodes configured for the table. While the marker says
-   `migrating`, an owner read that finds no item reads
-   `cells/<cell>/own.json` from the bucket and, if present, creates the
-   item with the same node and epoch under `attribute_not_exists`. The
-   bucket record is frozen, because no bucket-mode node can start, so
-   every copier writes the same value and one wins.
-4. A background task walks `cells/` and copies the remaining owner
-   records the same way. When it completes, it clears `migrating`, and
-   owner reads stop consulting the bucket.
-
-Moving back runs the same steps in the other direction, copying items
-to objects.
-
-The same epoch-floor rule repairs a table restored from a backup: `celld
-control repair-epochs` walks `cells/`, and for each cell whose newest
-non-empty LTX epoch is at or above the owner item's epoch, writes an
-unowned item at that epoch.
-
-## Rollout
-
-- **Phase 0, measure.** Per-record-class latency histograms and request
-  counters on today's bucket calls. This sizes the benefit before the
-  work starts, and several findings are useful for bucket fleets
-  regardless: sharing one lease view across loops removes most of the
-  bucket's largest request line, the repeated `nodes/` scans.
-- **Phase 1, the interface.** `ControlStore` with the bucket backend
-  only, every caller moved behind it, the lint test, and the shared fleet
-  view. No behavior change.
-- **Phase 2, the table.** `DynamoControl`, the client, the probe, the
-  marker, `celld control init`, the contract suite in CI, and updates to
-  [guarantees.md](../guarantees.md), [security.md](../security.md) and
-  [limitations.md](../limitations.md).
-- **Phase 3, migration.** `celld control migrate`, the lazy owner copy,
-  `repair-epochs`, and a qualification run that migrates a loaded fleet
-  both ways.
-- **Phase 4, the wake index**, if phase 0 shows alarm arming or the due
-  scan matter.
-
-## Later: the wake index
-
-The wake index stays in the bucket in this revision. Its protocol assumes
-immutable entry names: a late PUT can only recreate an obsolete name, and
-a retirement watermark tells the collector which names are obsolete. That
-protocol would work in the table unchanged, but moving it only pays off
-if the scans get cheaper too, and the table cannot enumerate "minutes that
-have entries" the way a delimiter listing does.
-
-A sketch for a later revision:
-
-- Entries as items under `pk = wake#<minute>#<shard>`, with the shard a
-  hash of the cell, so one busy minute does not load one partition.
-- A minute directory item written with each arm, and deleted only for
-  minutes older than a grace period once every shard is empty. Arms clamp
-  their discovery minute to no earlier than the current minute, so no arm
-  can target a directory entry the collector is about to delete. The
-  minute is only a discovery hint; SQLite holds the deadline.
-- Arm as a transaction with a condition check on the cell's retirement
-  item, so a late arm cannot recreate a retired entry and the collector no
-  longer has to chase ghosts. The eager delete then has to use the
-  published key rather than recomputing it from `at_ms`, because of the
-  clamp.
+- **Migration.** `celld control migrate`, with a lazy copy of owner
+  records, in either direction. Today a fleet chooses its store when it
+  starts, and a bucket fleet with live leases cannot switch.
+- **Repairing epochs after a table restore**, `celld control
+  repair-epochs`.
+- **Splitting load telemetry out of the lease** into its own small item,
+  which would cut the cost of every consistent lease scan by about two
+  thirds.
+- **Replacing the capacity sample with a query.** The sample stays in the
+  bucket; a table item could not hold it past a few hundred nodes.
+- **One shared lease view per node**, so the several loops that scan the
+  leases share one read, and lease shards past a few hundred nodes.
+- **Switching the deploy pointers in one transaction.**
+- **The wake index**, which keeps its bucket protocol of immutable entry
+  names and retirement watermarks.
+- **Release qualification against real DynamoDB**, beside the R2 release
+  tests.
 
 ## Decisions
 
 - **The bucket stays the default and the only required store.** The
   table adds an availability dependency and is AWS-only; fleets on R2,
   GCS, Azure and Tigris are unaffected.
-- **One table, not one per record type.** One set of permissions, one
-  probe, one backup policy.
-- **No AWS SDK.** Signing and credentials come from `object_store`, which
-  celld already uses for S3, and the client is small.
+- **Route by key inside `Bucket`, not through a typed interface.**
+  Revision 1 proposed a `ControlStore` enum and moving every caller behind
+  it. More than a dozen modules and several operator commands build these
+  keys, and a missed one would silently read an empty copy of a record
+  and split the fleet. Routing at the one client every caller already
+  holds covers them all, including future ones, leaves bucket fleets
+  byte-for-byte unchanged, and keeps the change small enough to review.
+- **Store the JSON body verbatim.** The records keep their wire formats,
+  so every reader works unchanged, mixed-version field preservation
+  survives, and a future migration is a byte copy.
 - **Random version tokens rather than counters.** A token the writer
   generated resolves an ambiguous write exactly on readback.
-- **Load leaves the lease.** It is advisory, rewritten on every renewal,
-  and makes every authority scan three times more expensive.
-- **The capacity sample is not ported.** It exists to save bucket reads.
-  In the table it would cost more than the query it replaces, and it does
-  not fit an item past a few hundred nodes.
-- **The wake index waits.** Its protocol is the most intricate in the
-  bucket, and the benefit is unmeasured.
-- **The LTX epoch chain stays a listing.** An index would create a new
-  write-then-index ordering.
+- **No AWS SDK.** Signing and credentials come from `object_store`, which
+  celld already uses for S3.
+- **A 4xx is not committed.** DynamoDB applies nothing it refuses, which
+  keeps a throttled renewal from costing a readback.
+- **The capacity sample, wake index and peer-auth secret stay in the
+  bucket.** None is on a latency-critical path that the table improves
+  today, and each has its own reason to stay: the sample's size, the wake
+  index's protocol, and the secret's write-once use.
 
 ## Open questions
 
-- Do facet scopes (`facet_streams.rs`, which calls `delete_streams`) have
-  owner records of their own, and should deleting a facet delete its
-  owner item?
-- Should the dead-leader sweep learn to read sealed sessions from another
-  record, so a sealed, dead lease can be deleted outright in table mode
-  instead of kept as a tombstone?
-- Is 300 nodes the right target for revision 1, or does the reference
-  deployment need an incremental lease view now?
-- Should the deploy pointer poll become a push from DynamoDB Streams, and
-  is a second consumer of the table worth that dependency?
+- Do facet scopes have owner records of their own, and should deleting a
+  facet delete its owner item?
+- How should a running table node notice that `fleet/control.json` was
+  removed?
 - Should the table require the bucket and the table to share a region, or
   only warn?
+- Is a strongly consistent `Query` plus a `GetItem` per lease worth
+  collapsing into the `Query`'s own bodies for the scans that do not judge
+  lease expiry?

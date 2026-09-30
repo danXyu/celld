@@ -396,16 +396,15 @@ async fn retire_dead_node(bucket: &Bucket, node: &str, now_ms: u64) -> anyhow::R
     // No conditional delete in object_store: fence with a CAS tombstone
     // (`expires_ms: 0`, still a dead record), then delete. A crash between
     // the two leaves a record that still reads as dead and retires on the
-    // next pass.
+    // next pass. A control table conditions the delete on the tombstone's
+    // own token, so there a delete that lands late spares a successor's
+    // record instead of erasing it.
     let tombstone = serde_json::to_vec(&NodeWire {
         expires_ms: 0,
         ..record
     })?;
     match bucket.put_cas(&key, tombstone, Some(&etag)).await? {
-        Some(_) => {
-            bucket.delete(&key).await?;
-            Ok(true)
-        }
+        Some(token) => bucket.delete_if_token(&key, &token).await,
         None => Ok(false),
     }
 }

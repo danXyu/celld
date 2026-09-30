@@ -122,6 +122,12 @@ impl Storage {
         let store =
             crate::fleet::bucket_client(&self.bucket, self.endpoint.as_deref(), &self.region)?;
         crate::fleet::validate_bucket(&store).await?;
+        // An operator command reaches the same records the fleet does:
+        // through the table when `fleet/control.json` selected one.
+        store
+            .resolve_control(crate::control::Role::Operator)
+            .await
+            .context("resolve the fleet's coordination store")?;
         Ok(store)
     }
 }

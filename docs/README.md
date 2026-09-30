@@ -250,6 +250,40 @@ The bucket credentials give full control of the fleet, so keep them
 safe. The bucket contains the deployments, the SQLite replicas, the
 ownership records, the node leases, and the peer-authentication secret.
 
+### Coordination records in DynamoDB
+
+An `s3://` fleet can keep its coordination records in one Amazon DynamoDB
+table instead of the bucket. These records are the cell ownership records,
+the node leases, the drain token, the waker role, the deploy pointers,
+and the queue attachments. The cell data, the deployments, the node-log
+bundles, and everything else stay in the bucket. A lease renewal or an
+ownership write then takes a few milliseconds instead of tens, and costs
+less at scale. The bucket stays the default and the only required store.
+See the [design](design/dynamodb-control-plane.md) for the trade-offs.
+
+Create the table and record the choice before the fleet's first node
+starts:
+
+```sh
+celld control init --table celld-prod --bucket "$CELLD_BUCKET"
+```
+
+The command creates the table if it is absent, with on-demand capacity,
+deletion protection, and point-in-time recovery. It claims the table for
+this fleet and writes the choice to `fleet/control.json` in the bucket.
+Then start every node with `CELLD_CONTROL=dynamodb://celld-prod`. A node
+reads `fleet/control.json` at startup and refuses to start when its own
+`CELLD_CONTROL` disagrees. Every operator command follows the file, so
+`celld deploy` and `celld cell` need no new flag. `celld control show`
+prints the choice and the table's health.
+
+The table authenticates with the same AWS credential chain as the bucket.
+celld refuses a global table, a secondary index, and time-to-live, because
+each can serve or delete a record that another node already replaced. A
+fleet that already runs on the bucket cannot switch while any node lease
+is live; stop the fleet first. `celld control migrate` does not exist yet,
+so a running fleet's records are not copied.
+
 A bucket value can add a key prefix: `s3://YOUR-BUCKET/PREFIX`. Every
 object of the fleet then goes below `PREFIX/`, so two fleets can share one
 bucket. A bucket value without a prefix keeps the objects at the root of
@@ -1057,6 +1091,9 @@ For the full list, run `celld -h`. This table shows the primary settings:
 | `CELLD_ZONE` | The node's availability zone, such as `us-east-1a`. Use 1 to 128 ASCII letters, numbers, dots, dashes, or underscores. Change export's blob-stream sink uses it to pick the node's writer (see [export](export.md)) |
 | `CELLD_WATCH` | The local work directory for SQLite and replication |
 | `CELLD_ESBUILD` | The path of the esbuild executable |
+| `CELLD_CONTROL` | Where the fleet keeps its coordination records: `bucket` (the default) or `dynamodb://TABLE`. See [coordination records in DynamoDB](#coordination-records-in-dynamodb) |
+| `CELLD_CONTROL_REGION` | The DynamoDB table's region, when it differs from the bucket's |
+| `CELLD_CONTROL_ENDPOINT` | A DynamoDB endpoint override, for DynamoDB Local |
 | `CELLD_ACTIVATIONS` | The limit for concurrent cold-cell activations (default: 8 for each available CPU, at least 16 and at most 128). A cold activation waits on the object store for most of its time, so the default is above the CPU count |
 | `CELLD_DEPLOY_POLL_S` | The interval in seconds at which a node reads the deployment pointer and adopts a new deployment in place (default: 30) |
 | `CELLD_DEPLOY_MAX_AGE_S` | How long a resident Durable Object can keep the previous deployment's code after an adoption before celld forces the move (default: 60; 0 forces at once) |
