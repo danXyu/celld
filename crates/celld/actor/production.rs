@@ -34,9 +34,8 @@ impl Actor {
                     if arm.at_mono_ms > crate::asyncrt::mono_ms() {
                         // Only an arm longer than MAX_QUEUED_DELAY comes out
                         // before its deadline; queue it again for the rest.
-                        if timer_slots.is_armed(&arm.slot, arm.ordinal) {
-                            let key = delays.insert(arm.clone(), queued_delay(&arm));
-                            timer_slots.install(&arm, key);
+                        if let Some(key) = timer_slots.armed_value_mut(&arm.slot, arm.ordinal) {
+                            *key = delays.insert(arm.clone(), queued_delay(&arm));
                         }
                     } else if timer_slots.fire(&arm.slot, arm.ordinal).is_some() {
                         self.step(ActorInput::TimerFired(arm.timer), &mut out);

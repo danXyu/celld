@@ -154,11 +154,12 @@ impl<V> TimerSlots<V> {
         displaced
     }
 
-    /// Whether this arm is still the one armed for its slot.
-    pub fn is_armed(&self, slot: &TimerSlot, ordinal: u64) -> bool {
+    /// The value of this arm, only while it is still the one armed for its slot.
+    pub fn armed_value_mut(&mut self, slot: &TimerSlot, ordinal: u64) -> Option<&mut V> {
         self.armed
-            .get(slot)
-            .is_some_and(|(armed, _)| *armed == ordinal)
+            .get_mut(slot)
+            .filter(|(armed, _)| *armed == ordinal)
+            .map(|(_, value)| value)
     }
 
     /// Removes the current arm only when both parts of its identity match.
@@ -1233,12 +1234,13 @@ pub struct StepOutput {
 
 /// The longest delay handed to the timer queue at once.
 ///
-/// tokio-util's `DelayQueue` panics on a delay past 2^36 - 1 ms (about 795
-/// days), aborting the node, and a Durable Object may arm an alarm years
-/// ahead. A longer arm waits this long, comes out of the queue before its
-/// deadline, and is queued again for the rest (`Actor::run`).
+/// tokio-util's `DelayQueue` panics on a deadline more than 2^36 - 1 ms
+/// (about 795 days) past its last wake, not past now, and a Durable Object
+/// may arm an alarm years ahead. A longer arm waits this long, comes out of
+/// the queue before its deadline, and is queued again for the rest
+/// (`Actor::run`). A day leaves the queue about 794 days to go without a wake.
 pub(crate) const MAX_QUEUED_DELAY: std::time::Duration =
-    std::time::Duration::from_millis(365 * 24 * 60 * 60 * 1000);
+    std::time::Duration::from_millis(24 * 60 * 60 * 1000);
 
 /// How long `arm` waits in the timer queue from now.
 pub(crate) fn queued_delay(arm: &TimerArm) -> std::time::Duration {
