@@ -35,6 +35,10 @@ pub struct Scenario {
     /// Long or large: `all` skips it unless asked by name.
     #[serde(default)]
     pub heavy: bool,
+    /// Route peer and bucket traffic through the harness's proxies, so the
+    /// `net` step can fault it (s3 backend).
+    #[serde(default)]
+    pub network: bool,
     /// Backends this scenario is meaningful on; empty means any.
     #[serde(default)]
     pub backends: Vec<String>,
@@ -118,6 +122,36 @@ pub enum Step {
         #[serde(default)]
         reload: bool,
     },
+    /// Fault the network (needs `"network": true`): the traffic `from` one
+    /// endpoint `to` another (`node:N`, `nodes`, `bucket`, `client`,
+    /// `any`), and with `both` the reverse too. It replaces an earlier rule
+    /// on the same pair; a rule with no fault lifts it.
+    Net {
+        from: String,
+        to: String,
+        #[serde(default)]
+        both: bool,
+        #[serde(default)]
+        delay_ms: f64,
+        #[serde(default)]
+        jitter_ms: f64,
+        #[serde(default)]
+        kbps: Option<f64>,
+        #[serde(default)]
+        reset: f64,
+        /// `blackhole` or `reject`.
+        #[serde(default)]
+        partition: Option<String>,
+    },
+    /// Lift every network fault.
+    NetClear {},
+    /// Wait for a node to exit on its own, as a node cut off from the
+    /// bucket must; fails if it is still running after `timeout_s`.
+    AwaitExit {
+        node: usize,
+        #[serde(default = "default_exit_timeout")]
+        timeout_s: f64,
+    },
     /// Send one request to every cell of `cells`, `concurrency` at a time.
     Touch {
         request: Request,
@@ -156,6 +190,10 @@ pub enum Step {
         #[serde(default = "default_touch_concurrency")]
         concurrency: usize,
     },
+}
+
+fn default_exit_timeout() -> f64 {
+    60.0
 }
 
 fn default_signal() -> String {

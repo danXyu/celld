@@ -1,0 +1,112 @@
+{
+  "backends": [
+    "s3"
+  ],
+  "network": true,
+  "nodes": 3,
+  "name": "N5-flaky-peers",
+  "description": "Every peer link resets 5% of new connections and adds up to 20 ms of jitter each way: a lossy network rather than a dead one. Watch errors, the fleet proof's tail, and how many connections each pair reopens.",
+  "setup": [
+    {
+      "step": "net",
+      "from": "nodes",
+      "to": "bucket",
+      "both": true,
+      "delay_ms": 10,
+      "jitter_ms": 5
+    },
+    {
+      "step": "touch",
+      "request": {
+        "path": "/do/write",
+        "query": {
+          "bytes": "100"
+        },
+        "counts_write": true
+      },
+      "cells": {
+        "count": 1000,
+        "prefix": "fl"
+      },
+      "concurrency": 16
+    }
+  ],
+  "phases": [
+    {
+      "name": "clean",
+      "duration_s": 20,
+      "rate": 300,
+      "load": [
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "100"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 1000,
+            "prefix": "fl"
+          },
+          "label": "write"
+        },
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 1000,
+            "prefix": "fl"
+          },
+          "node": 0,
+          "weight": 2,
+          "label": "read-via-node-0"
+        }
+      ]
+    },
+    {
+      "name": "flaky",
+      "before": [
+        {
+          "step": "net",
+          "from": "nodes",
+          "to": "nodes",
+          "both": true,
+          "reset": 0.05,
+          "jitter_ms": 20
+        }
+      ],
+      "duration_s": 20,
+      "rate": 300,
+      "load": [
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "100"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 1000,
+            "prefix": "fl"
+          },
+          "label": "write"
+        },
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 1000,
+            "prefix": "fl"
+          },
+          "node": 0,
+          "weight": 2,
+          "label": "read-via-node-0"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,92 @@
+{
+  "backends": [
+    "s3"
+  ],
+  "network": true,
+  "nodes": 3,
+  "name": "N3-bucket-cut",
+  "description": "Node 1 loses the bucket (blackhole) while its peers stay reachable. A node that cannot renew its lease must fence itself: the await_exit step times how long that takes, the timeline how long its cells were unavailable, and the verification sweep that no acknowledged write was lost. The node then returns on a healed network.",
+  "setup": [
+    {
+      "step": "net",
+      "from": "nodes",
+      "to": "bucket",
+      "both": true,
+      "delay_ms": 10,
+      "jitter_ms": 5
+    },
+    {
+      "step": "touch",
+      "request": {
+        "path": "/do/write",
+        "query": {
+          "bytes": "100"
+        },
+        "counts_write": true
+      },
+      "cells": {
+        "count": 600,
+        "prefix": "bc"
+      },
+      "concurrency": 16
+    }
+  ],
+  "phases": [
+    {
+      "name": "bucket-cut",
+      "duration_s": 70,
+      "rate": 150,
+      "timeout_ms": 60000,
+      "load": [
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "100"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 600,
+            "prefix": "bc"
+          },
+          "node": 0
+        }
+      ],
+      "during": [
+        {
+          "at_s": 10,
+          "step": "net",
+          "from": "node:1",
+          "to": "bucket",
+          "both": true,
+          "partition": "blackhole"
+        },
+        {
+          "at_s": 11,
+          "step": "await_exit",
+          "node": 1,
+          "timeout_s": 45
+        },
+        {
+          "at_s": 45,
+          "step": "net_clear"
+        },
+        {
+          "at_s": 46,
+          "step": "net",
+          "from": "nodes",
+          "to": "bucket",
+          "both": true,
+          "delay_ms": 10,
+          "jitter_ms": 5
+        },
+        {
+          "at_s": 47,
+          "step": "start",
+          "node": 1
+        }
+      ]
+    }
+  ]
+}

@@ -12,6 +12,7 @@ mod cluster;
 mod hist;
 mod keys;
 mod load;
+mod netem;
 mod report;
 mod run;
 mod scenario;

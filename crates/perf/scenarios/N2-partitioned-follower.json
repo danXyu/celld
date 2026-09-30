@@ -1,0 +1,81 @@
+{
+  "backends": [
+    "s3"
+  ],
+  "network": true,
+  "nodes": 3,
+  "name": "N2-partitioned-follower",
+  "description": "Node 2 loses every peer link (blackhole, both ways) for 30 s but keeps the bucket. Leaders must stop waiting on it as a follower and prove writes through the bucket; node 2 keeps its lease, so its own cells are unreachable from node 0 while the partition lasts. No acknowledged write may be lost.",
+  "setup": [
+    {
+      "step": "net",
+      "from": "nodes",
+      "to": "bucket",
+      "both": true,
+      "delay_ms": 10,
+      "jitter_ms": 5
+    },
+    {
+      "step": "touch",
+      "request": {
+        "path": "/do/write",
+        "query": {
+          "bytes": "100"
+        },
+        "counts_write": true
+      },
+      "cells": {
+        "count": 600,
+        "prefix": "pf"
+      },
+      "concurrency": 16
+    }
+  ],
+  "phases": [
+    {
+      "name": "partition",
+      "duration_s": 60,
+      "rate": 150,
+      "timeout_ms": 60000,
+      "load": [
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "100"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 600,
+            "prefix": "pf"
+          },
+          "node": 0
+        }
+      ],
+      "during": [
+        {
+          "at_s": 10,
+          "step": "net",
+          "from": "node:2",
+          "to": "nodes",
+          "both": true,
+          "partition": "blackhole"
+        },
+        {
+          "at_s": 40,
+          "step": "net_clear"
+        },
+        {
+          "at_s": 41,
+          "step": "net",
+          "from": "nodes",
+          "to": "bucket",
+          "both": true,
+          "delay_ms": 10,
+          "jitter_ms": 5
+        }
+      ]
+    }
+  ]
+}

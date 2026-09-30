@@ -441,9 +441,14 @@ plan above:
 - **Fault seams.** The `perf` feature exposes a slow or throttling bucket
   (`CELLD_PERF_BUCKET_FAULTS`) and a slow fsync
   (`CELLD_PERF_FSYNC_DELAY_US`) to a node started as a subprocess, and not
-  only to in-process tests. An ordinary build refuses both variables. The
-  `LogTransport` injector was not built; delay and loss between nodes are
-  left to `tc netem`.
+  only to in-process tests. An ordinary build refuses both variables.
+- **Network faults.** The harness, not celld, injects them. A scenario with
+  `"network": true` routes each node's peer and bucket traffic through TCP
+  proxies. `net` steps set delay, jitter, bandwidth, resets and partitions
+  on each direction of a link, and they can change during a phase. This
+  replaces the `LogTransport` injector and `tc netem` of the plan. It needs
+  no root and runs on macOS, and it covers every peer protocol and the
+  bucket, not only the log. The scenarios are N1 to N5.
 - **Count tests.** They are integration tests in `crates/celld`, where the
   test can start the `celld` binary it was built with. They are not in the
   harness crate. The core-round-trip gate counts `core.requests` and
@@ -497,6 +502,24 @@ The other findings of the first runs were:
 - **The takeover works.** A killed owner's cells answered "owner
   unreachable" for about the lease TTL (10 s), then served again, with no
   acknowledged write lost (F5).
+
+The network scenarios (N1 to N5, three nodes on MinIO, macOS) found:
+
+- **A silent partition costs far more than a refused one.** Node 1, cut off
+  from its peers and the bucket while it kept running, fenced itself in
+  about 7 s either way. With the links blackholed, requests held on it
+  waited up to 35 s and 365 writes failed with `NodeFenced`. With the links
+  refused, 2 writes failed and the worst request took 1 s (N4).
+- **A peer partition stalls requests for its whole length.** Node 2 lost
+  its peers but kept the bucket and its lease. Requests for its cells
+  through node 0 neither failed nor met the operation deadline: they waited
+  for the 30 s partition to heal, up to 37 s. Node 0 opened 1,727 new
+  connections to node 2 meanwhile (N2).
+- **A node cut off from the bucket fences itself**, here in 6.3 s. Its cells
+  moved, 24 writes failed with `NodeFenced`, and none was lost (N3).
+- **Tunnels churn.** Over 70 s, node 0 opened 191 connections to one peer
+  where the log links held one. Each tunnel carries one request at a time.
+- **No scenario lost an acknowledged write.**
 
 The runs also point at costs to look at next:
 

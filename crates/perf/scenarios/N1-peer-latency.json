@@ -1,0 +1,232 @@
+{
+  "backends": [
+    "s3"
+  ],
+  "network": true,
+  "nodes": 3,
+  "name": "N1-peer-latency",
+  "description": "The same write and forwarded-read load as the round trip between nodes grows from 0 to 40 ms (a symmetric delay on every peer link; the bucket link has a 20 to 30 ms round trip). Fleet proofs wait for a follower, and forwarded reads cross the peer tunnel, so both should track the RTT; the peer connections line shows how many tunnels each pair opened.",
+  "setup": [
+    {
+      "step": "net",
+      "from": "nodes",
+      "to": "bucket",
+      "both": true,
+      "delay_ms": 10,
+      "jitter_ms": 5
+    },
+    {
+      "step": "touch",
+      "request": {
+        "path": "/do/write",
+        "query": {
+          "bytes": "100"
+        },
+        "counts_write": true
+      },
+      "cells": {
+        "count": 1000,
+        "prefix": "lat"
+      },
+      "concurrency": 16
+    }
+  ],
+  "phases": [
+    {
+      "name": "rtt-0ms",
+      "before": [
+        {
+          "step": "net",
+          "from": "nodes",
+          "to": "nodes",
+          "both": true,
+          "delay_ms": 0
+        }
+      ],
+      "duration_s": 20,
+      "rate": 300,
+      "load": [
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "100"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 1000,
+            "prefix": "lat"
+          },
+          "weight": 1,
+          "label": "write"
+        },
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 1000,
+            "prefix": "lat"
+          },
+          "node": 0,
+          "weight": 2,
+          "label": "read-via-node-0"
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "rtt-2ms",
+      "before": [
+        {
+          "step": "net",
+          "from": "nodes",
+          "to": "nodes",
+          "both": true,
+          "delay_ms": 1
+        }
+      ],
+      "duration_s": 20,
+      "rate": 300,
+      "load": [
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "100"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 1000,
+            "prefix": "lat"
+          },
+          "weight": 1,
+          "label": "write"
+        },
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 1000,
+            "prefix": "lat"
+          },
+          "node": 0,
+          "weight": 2,
+          "label": "read-via-node-0"
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "rtt-10ms",
+      "before": [
+        {
+          "step": "net",
+          "from": "nodes",
+          "to": "nodes",
+          "both": true,
+          "delay_ms": 5
+        }
+      ],
+      "duration_s": 20,
+      "rate": 300,
+      "load": [
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "100"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 1000,
+            "prefix": "lat"
+          },
+          "weight": 1,
+          "label": "write"
+        },
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 1000,
+            "prefix": "lat"
+          },
+          "node": 0,
+          "weight": 2,
+          "label": "read-via-node-0"
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "rtt-40ms",
+      "before": [
+        {
+          "step": "net",
+          "from": "nodes",
+          "to": "nodes",
+          "both": true,
+          "delay_ms": 20
+        }
+      ],
+      "duration_s": 20,
+      "rate": 300,
+      "load": [
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "100"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 1000,
+            "prefix": "lat"
+          },
+          "weight": 1,
+          "label": "write"
+        },
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 1000,
+            "prefix": "lat"
+          },
+          "node": 0,
+          "weight": 2,
+          "label": "read-via-node-0"
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    }
+  ]
+}

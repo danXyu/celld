@@ -21,8 +21,8 @@ on:
         description: "Scenario names for the dev backend (default: all)"
         default: "all"
       fleet:
-        description: "Scenario names for the s3 backend (default: F1 F3 F5 F9 S3 S5)"
-        default: "F1 F3 F5 F9 S3 S5"
+        description: "Scenario names for the s3 backend (default: F1 F3 F5 F9 S3 S5 N2 N3)"
+        default: "F1 F3 F5 F9 S3 S5 N2 N3"
       repeat:
         description: "Repeats per scenario"
         default: "3"
@@ -78,7 +78,7 @@ jobs:
             echo "repeat=1" >> "$GITHUB_OUTPUT"
           else
             echo "dev=all" >> "$GITHUB_OUTPUT"
-            echo "fleet=F1 F3 F5 F9 S3 S5" >> "$GITHUB_OUTPUT"
+            echo "fleet=F1 F3 F5 F9 S3 S5 N2 N3" >> "$GITHUB_OUTPUT"
             echo "repeat=3" >> "$GITHUB_OUTPUT"
           fi
 

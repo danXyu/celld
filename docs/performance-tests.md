@@ -21,6 +21,7 @@ pipeline has its own Criterion targets, described in
 - [Component benchmarks](#component-benchmarks)
 - [Scenarios](#scenarios)
 - [Injected faults](#injected-faults)
+- [Network faults](#network-faults)
 - [Writing a scenario](#writing-a-scenario)
 - [Results and comparison](#results-and-comparison)
 - [CI and cadence](#ci-and-cadence)
@@ -210,6 +211,11 @@ finds a lost or unreadable write.
 | `F8-bucket-throttle` | s3 | 10% and 50% of bucket requests answered 429: no amplification |
 | `F9-idle-cost`, `F9-idle-cost-resident` | s3 | Bucket requests an idle fleet makes on its own, with and without 10k resident cells |
 | `F11-hot-namespace` | s3 | One KV namespace does not scale out |
+| `N1-peer-latency` | s3, network | Fleet proofs and forwarded reads as the peer round trip grows from 0 to 40 ms |
+| `N2-partitioned-follower` | s3, network | A node loses its peers but keeps the bucket: writes fall back to bucket proofs, its cells are unreachable, nothing is lost |
+| `N3-bucket-cut` | s3, network | A node loses the bucket: how long until it fences itself, and how long its cells are unavailable |
+| `N4-isolated-owner` | s3, network | A running node loses every link (blackhole, then reject): it fences, and its cells move only after its lease lapses |
+| `N5-flaky-peers` | s3, network | Peer links that reset 5% of connections and jitter by up to 20 ms |
 
 `all` skips the heavy scenarios; name them to run them.
 
@@ -236,6 +242,57 @@ that request's latency, and an injected 429 as a throttled request.
 filesystem: LTX files, follower batches, and their directories. SQLite's
 own syncs do not pass through it. A scenario's `node_env` sets it on one
 node to make a gray follower.
+
+## Network faults
+
+A scenario with `"network": true` (`s3` backend only) routes each node's
+traffic through proxies in the harness:
+
+- peers dial the proxy that the node advertises, which forwards to the
+  node's internal listener;
+- the node dials the bucket through a proxy of its own.
+
+The harness's own requests still go directly to each node, so measuring a
+fault never passes through it. A `net` step sets a fault on one direction
+of a link, and a later `net` or `net_clear` step changes it, at any point
+in a phase:
+
+```json
+{"step": "net", "from": "node:1", "to": "bucket", "partition": "blackhole"}
+{"step": "net", "from": "nodes", "to": "nodes", "both": true, "delay_ms": 5, "jitter_ms": 2}
+{"step": "net_clear"}
+```
+
+- **Endpoints:** `node:N`, `nodes` (any node), `bucket`, `client`, and
+  `any`.
+- **Direction:** `from` sends the bytes and `to` receives them. A
+  connection's requests travel initiator to acceptor, and its responses the
+  other way, so a one-way rule leaves the reverse path open. `both` sets
+  both directions.
+- **Identifying the sender:** the proxy reads which node opened a peer
+  connection from the `x-cells-peer-source` header of its first signed
+  request.
+
+| Fault | Effect |
+| --- | --- |
+| `delay_ms`, `jitter_ms` | Each chunk waits the delay plus a uniform jitter, never reordered; a symmetric delay `d` adds `2d` to a round trip |
+| `kbps` | A bandwidth limit per connection and direction |
+| `reset` | The chance that a new connection closes as soon as it opens |
+| `partition: blackhole` | Bytes are held and new connections hang until the rule is lifted, as with a lost route |
+| `partition: reject` | Open connections close and new ones are refused, as with a dead host |
+
+A rule can be changed at any point in a phase. `await_exit` waits for a
+node that must fence itself and reports how long that took. `start` brings
+the node back on its old ports after the network heals.
+
+Each phase result records, per link, the connections opened, the
+connections reset and the bytes carried, along with the rules in force. The
+summary prints the peer connections, which shows how many tunnels and log
+streams a phase needed.
+
+This emulates faults at the TCP layer. It cannot drop one packet, so loss
+shows as latency (`jitter_ms`) or as resets. For packet-level faults on
+Linux, add `tc netem` on the loopback interface.
 
 ## Writing a scenario
 
@@ -270,9 +327,9 @@ A scenario is a JSON file in `crates/perf/scenarios`. Fixtures are in
 ```
 
 - **Scenario fields:** `name`, `description`, `fixture`, `nodes`, `env`,
-  `node_env` (by node index), `backends`, `heavy`, `variants` (each a
-  `name` with `env` and `nodes` overrides; the scenario runs once per
-  variant), `setup`, `phases`, `after`, `verify`.
+  `node_env` (by node index), `backends`, `heavy`, `network`, `variants`
+  (each a `name` with `env` and `nodes` overrides; the scenario runs once
+  per variant), `setup`, `phases`, `after`, `verify`.
 - **Steps** (`setup`, a phase's `before`, a phase's `during` with `at_s`,
   and `after`):
   - `touch`: one request to every cell;
@@ -283,6 +340,8 @@ A scenario is a JSON file in `crates/perf/scenarios`. Fixtures are in
   - `signal` (`KILL`, `TERM`, `STOP`, `CONT` to one node);
   - `start` (one node, optionally `wipe_local`);
   - `redeploy` (s3 backend, optionally `reload`);
+  - `net` and `net_clear` ([network faults](#network-faults));
+  - `await_exit` (wait for a node to exit on its own);
   - `collect`: one request per cell, summing and maxing the numeric fields
     of the answers.
 - **Phases:** `rate` or `rates` (one phase per rate), `duration_s`,
@@ -398,9 +457,6 @@ local NVMe, and nothing else running.
   8 GB), before each release. Run the `s3` backend against that bucket with
   its endpoint. The harness starts every node on the machine it runs on,
   so a multi-host fleet needs nodes started by hand or by an operator.
-- **Network faults between nodes.** Use `tc netem` on Linux around the
-  `s3` backend: delay, jitter, and loss on the loopback or a bridge. There
-  is no in-process network injector for the peer log transport.
 - **Contended activation** (500 claimants for the same cells) needs more
   nodes than one machine runs well. celld-tck exercises its safety, but
   not its latency.

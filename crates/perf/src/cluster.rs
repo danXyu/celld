@@ -24,6 +24,9 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::process::{Child, Command};
 
+use crate::netem::{Endpoint, Network};
+use std::sync::Arc;
+
 #[derive(Clone, Debug)]
 pub enum Backend {
     Dev,
@@ -56,6 +59,9 @@ pub struct Options {
     pub node_env: BTreeMap<usize, BTreeMap<String, String>>,
     /// Unique per run, so runs never share bucket state.
     pub run_id: String,
+    /// Put every node's peer and bucket traffic through [`Network`]'s
+    /// proxies (s3 backend only).
+    pub network: bool,
 }
 
 pub struct Node {
@@ -69,6 +75,10 @@ pub struct Node {
     state: PathBuf,
     public_port: u16,
     internal_port: u16,
+    /// With a network: the proxy peers reach this node through, which the
+    /// node advertises, and the node's own proxy to the bucket.
+    peer_proxy_port: Option<u16>,
+    bucket_proxy_port: Option<u16>,
 }
 
 pub struct Cluster {
@@ -77,6 +87,35 @@ pub struct Cluster {
     project: PathBuf,
     bucket: Option<String>,
     http: reqwest::Client,
+    network: Option<Arc<Network>>,
+    proxies: Vec<tokio::task::JoinHandle<()>>,
+}
+
+fn cluster_network(options: &Options) -> anyhow::Result<bool> {
+    if options.network && !matches!(options.backend, Backend::S3 { .. }) {
+        bail!("network faults need the s3 backend: a dev node has no peers and no bucket link");
+    }
+    Ok(options.network)
+}
+
+/// The bucket endpoint's socket address, for a proxy to forward to. Only a
+/// plain-HTTP endpoint can be proxied this way.
+async fn bucket_address(backend: &Backend) -> anyhow::Result<std::net::SocketAddr> {
+    let Backend::S3 {
+        endpoint: Some(endpoint),
+        ..
+    } = backend
+    else {
+        bail!("network faults need an explicit --endpoint for the bucket");
+    };
+    let authority = endpoint
+        .strip_prefix("http://")
+        .ok_or_else(|| anyhow!("network faults need an http:// endpoint, not {endpoint}"))?
+        .trim_end_matches('/');
+    tokio::net::lookup_host(authority)
+        .await?
+        .next()
+        .ok_or_else(|| anyhow!("{authority} resolves to nothing"))
 }
 
 fn free_port() -> anyhow::Result<u16> {
@@ -123,12 +162,23 @@ impl Cluster {
                 options.run_id
             )),
         };
+        let network = if cluster_network(&options)? {
+            Some(Network::new(
+                (0..options.nodes)
+                    .map(|index| format!("perf-{index}"))
+                    .collect(),
+            ))
+        } else {
+            None
+        };
         let mut cluster = Cluster {
             nodes: Vec::new(),
             project,
             bucket,
             http,
             options,
+            network,
+            proxies: Vec::new(),
         };
         if matches!(cluster.options.backend, Backend::S3 { .. }) {
             cluster.deploy().await?;
@@ -144,8 +194,32 @@ impl Cluster {
                 state: cluster.options.work.join(format!("node-{index}")),
                 public_port: free_port()?,
                 internal_port: free_port()?,
+                peer_proxy_port: None,
+                bucket_proxy_port: None,
             };
             cluster.nodes.push(node);
+        }
+        if let Some(network) = cluster.network.clone() {
+            let bucket = bucket_address(&cluster.options.backend).await?;
+            for node in &mut cluster.nodes {
+                let peers = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+                node.peer_proxy_port = Some(peers.local_addr()?.port());
+                let target = format!("127.0.0.1:{}", node.internal_port).parse()?;
+                cluster.proxies.push(network.serve(
+                    peers,
+                    target,
+                    Endpoint::Node(node.index),
+                    None,
+                ));
+                let objects = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+                node.bucket_proxy_port = Some(objects.local_addr()?.port());
+                cluster.proxies.push(network.serve(
+                    objects,
+                    bucket,
+                    Endpoint::Bucket,
+                    Some(Endpoint::Node(node.index)),
+                ));
+            }
         }
         for index in 0..cluster.nodes.len() {
             cluster.launch(index).await?;
@@ -173,13 +247,17 @@ impl Cluster {
         command
     }
 
-    fn s3_args(&self) -> Vec<String> {
+    /// The bucket arguments; `through` replaces the endpoint with a node's
+    /// bucket proxy.
+    fn s3_args(&self, through: Option<u16>) -> Vec<String> {
         let Backend::S3 {
             endpoint, region, ..
         } = &self.options.backend
         else {
             return Vec::new();
         };
+        let proxied = through.map(|port| format!("http://127.0.0.1:{port}"));
+        let endpoint = proxied.as_ref().or(endpoint.as_ref());
         let mut args = vec![
             "--bucket".to_string(),
             self.bucket.clone().unwrap_or_default(),
@@ -198,7 +276,7 @@ impl Cluster {
         command
             .arg("deploy")
             .arg(&self.project)
-            .args(self.s3_args())
+            .args(self.s3_args(None))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let output = command.output().await.context("run celld deploy")?;
@@ -228,12 +306,18 @@ impl Cluster {
             Backend::S3 { .. } => {
                 std::fs::create_dir_all(&node.state)?;
                 let internal = format!("127.0.0.1:{}", node.internal_port);
+                // Peers dial the advertised address: the node's proxy, with
+                // a network, or its listener.
+                let advertise = format!(
+                    "127.0.0.1:{}",
+                    node.peer_proxy_port.unwrap_or(node.internal_port)
+                );
                 command
                     .arg("--no-control-plane")
-                    .args(self.s3_args())
+                    .args(self.s3_args(node.bucket_proxy_port))
                     .args(["--listen", &format!("127.0.0.1:{}", node.public_port)])
                     .args(["--internal-listen", &internal])
-                    .args(["--advertise", &internal])
+                    .args(["--advertise", &advertise])
                     .env("CELLD_WATCH", &node.state)
                     .env("CELLD_NODE", format!("perf-{index}"));
             }
@@ -533,6 +617,43 @@ impl Cluster {
         Ok(())
     }
 
+    /// The fleet's network, when the scenario asked for one.
+    pub fn network(&self) -> Option<&Arc<Network>> {
+        self.network.as_ref()
+    }
+
+    /// Wait up to `timeout` for a node to exit on its own (a node cut off
+    /// from the bucket must fence itself). Returns the seconds waited and
+    /// its exit status, and leaves the node stopped for a later `start`.
+    pub async fn await_exit(
+        &mut self,
+        index: usize,
+        timeout: Duration,
+    ) -> anyhow::Result<(f64, String)> {
+        let node = self
+            .nodes
+            .get_mut(index)
+            .ok_or_else(|| anyhow!("no node {index}"))?;
+        let mut child = node
+            .child
+            .take()
+            .ok_or_else(|| anyhow!("node {index} is not running"))?;
+        let started = Instant::now();
+        match tokio::time::timeout(timeout, child.wait()).await {
+            Ok(status) => {
+                node.pid = None;
+                Ok((started.elapsed().as_secs_f64(), status?.to_string()))
+            }
+            Err(_) => {
+                node.child = Some(child);
+                bail!(
+                    "node {index} was still running after {} s",
+                    timeout.as_secs_f64()
+                )
+            }
+        }
+    }
+
     /// The node's pid, if it runs.
     pub fn running(&self, index: usize) -> bool {
         self.nodes.get(index).is_some_and(|node| node.pid.is_some())
@@ -549,6 +670,9 @@ impl Cluster {
 
 impl Drop for Cluster {
     fn drop(&mut self) {
+        for proxy in &self.proxies {
+            proxy.abort();
+        }
         // `kill_on_drop` covers the children; `celld dev`'s own node is a
         // grandchild, so stop it by pid too.
         for node in &self.nodes {

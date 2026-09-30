@@ -9,6 +9,7 @@ use crate::cluster::{Backend, Cluster, Options};
 use crate::hist::Hist;
 use crate::keys::Keyspace;
 use crate::load::Driver;
+use crate::netem::{Fault, Partition, Selector};
 use crate::scenario::{Scenario, Step};
 use crate::sysstat;
 use serde_json::{json, Map, Value};
@@ -49,6 +50,7 @@ pub async fn run(scenario: &Scenario, options: &RunOptions) -> anyhow::Result<Sc
         env: env.clone(),
         node_env: scenario.node_env.clone(),
         run_id: options.run_id.clone(),
+        network: scenario.network,
     })
     .await?;
     let outcome = drive(scenario, options, &mut cluster, &env).await;
@@ -116,6 +118,7 @@ async fn drive(
                 let duration =
                     Duration::from_secs_f64((phase.duration_s * options.duration_scale).max(1.0));
                 let before = snapshot(cluster).await;
+                let links_before = cluster.network().map(|network| network.stats());
                 let sampler = Sampler::start(cluster);
                 let phase_started = Instant::now();
                 let run = driver.run_phase(
@@ -189,6 +192,7 @@ async fn drive(
                         .collect::<Map<String, Value>>(),
                     "nodes": nodes,
                     "server": server,
+                    "network": network_delta(cluster, links_before.as_ref()),
                 });
                 let checks: Vec<Value> = phase
                     .checks
@@ -272,6 +276,9 @@ fn step_name(step: &Step) -> &'static str {
         Step::Signal { .. } => "signal",
         Step::Start { .. } => "start",
         Step::Redeploy { .. } => "redeploy",
+        Step::Net { .. } => "net",
+        Step::NetClear {} => "net_clear",
+        Step::AwaitExit { .. } => "await_exit",
     }
 }
 
@@ -326,6 +333,42 @@ async fn run_step(step: &Step, cluster: &mut Cluster, driver: &Driver) -> anyhow
             cluster.redeploy(*reload).await?;
             json!({"reload": reload})
         }
+        Step::Net {
+            from,
+            to,
+            both,
+            delay_ms,
+            jitter_ms,
+            kbps,
+            reset,
+            partition,
+        } => {
+            let network = cluster
+                .network()
+                .ok_or_else(|| anyhow::anyhow!("a net step needs \"network\": true"))?;
+            let fault = Fault {
+                delay_ms: *delay_ms,
+                jitter_ms: *jitter_ms,
+                kbps: *kbps,
+                reset: *reset,
+                partition: partition.as_deref().map(Partition::parse).transpose()?,
+            };
+            network.set(Selector::parse(from)?, Selector::parse(to)?, fault, *both);
+            json!({"rules": network.rules_json()})
+        }
+        Step::NetClear {} => {
+            let network = cluster
+                .network()
+                .ok_or_else(|| anyhow::anyhow!("a net_clear step needs \"network\": true"))?;
+            network.clear();
+            json!({})
+        }
+        Step::AwaitExit { node, timeout_s } => {
+            let (seconds, status) = cluster
+                .await_exit(*node, Duration::from_secs_f64(*timeout_s))
+                .await?;
+            json!({"node": node, "exited_after_s": seconds, "status": status})
+        }
         Step::EvictAll {} => json!({"asked": cluster.evict_all().await?}),
         Step::Collect {
             request,
@@ -338,6 +381,41 @@ async fn run_step(step: &Step, cluster: &mut Cluster, driver: &Driver) -> anyhow
                 .await
         }
     })
+}
+
+/// What crossed the fleet's network during a phase: per link, the
+/// connections opened, the connections reset, and the bytes carried; and
+/// the rules in force at its end. `null` without a network.
+fn network_delta(cluster: &Cluster, before: Option<&BTreeMap<String, Value>>) -> Value {
+    let Some(network) = cluster.network() else {
+        return Value::Null;
+    };
+    let empty = BTreeMap::new();
+    let before = before.unwrap_or(&empty);
+    let links: Map<String, Value> = network
+        .stats()
+        .into_iter()
+        .map(|(link, now)| {
+            let then = before.get(&link);
+            let delta = |field: &str| {
+                number(&now[field]).saturating_sub(then.map_or(0, |then| number(&then[field])))
+            };
+            (
+                link,
+                json!({
+                    "connections": delta("connections"),
+                    "resets": delta("resets"),
+                    "bytes": delta("bytes"),
+                }),
+            )
+        })
+        .filter(|(_, delta)| {
+            delta
+                .as_object()
+                .is_some_and(|fields| fields.values().any(|value| value != 0))
+        })
+        .collect();
+    json!({"links": links, "rules": network.rules_json()})
 }
 
 /// Every node's metrics; `null` for a node that is down or does not answer.

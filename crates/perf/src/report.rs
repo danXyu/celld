@@ -116,6 +116,25 @@ pub fn summary(result: &Value) -> String {
             if !notes.is_empty() {
                 let _ = writeln!(out, "      {}", notes.join("; "));
             }
+            // Peer links: connections opened (and reset) per pair, which
+            // is how many tunnels and log streams the phase needed.
+            if let Some(links) = phase["network"]["links"].as_object() {
+                let peers: Vec<String> = links
+                    .iter()
+                    .filter(|(link, stats)| {
+                        !link.contains("bucket")
+                            && stats["connections"].as_u64().unwrap_or(0)
+                                + stats["resets"].as_u64().unwrap_or(0)
+                                > 0
+                    })
+                    .map(|(link, stats)| {
+                        format!("{link} {}+{}r", stats["connections"], stats["resets"])
+                    })
+                    .collect();
+                if !peers.is_empty() {
+                    let _ = writeln!(out, "      peer connections: {}", peers.join(", "));
+                }
+            }
             if let Some(errors) = phase["errors"]
                 .as_object()
                 .filter(|errors| !errors.is_empty())
