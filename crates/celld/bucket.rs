@@ -25,6 +25,7 @@
 //! that carries no CAS token is an error, never an empty token a later
 //! conditional write would trust.
 
+use crate::control::{ControlKey, Route, Table};
 use anyhow::anyhow;
 use anyhow::Context;
 use bytes::Bytes;
@@ -197,6 +198,14 @@ pub struct Bucket {
     /// to. Call sites keep forming unprefixed keys; this type is the one
     /// place that knows where in the bucket a fleet lives.
     pub prefix: String,
+    /// Where the fleet's coordination records live: this bucket, or a
+    /// DynamoDB table that `fleet/control.json` selected. Shared by every
+    /// clone, so resolving once at startup routes them all. See
+    /// [`crate::control`].
+    control: Arc<Route>,
+    /// The S3 client's credential chain and region, which a control table
+    /// signs with. `None` on every other backend.
+    aws: Option<Arc<crate::control::AwsAccess>>,
 }
 
 /// One page of [`Bucket::common_prefixes_page`].
@@ -251,6 +260,9 @@ pub fn cas_write_did_not_commit(error: &anyhow::Error) -> bool {
     // than the outermost error. A chain that carries no `object_store`
     // error at all -- an applied write whose response had no CAS token --
     // does not match, which leaves it ambiguous. That is the safe answer.
+    if crate::control::table_write_did_not_commit(error) {
+        return true;
+    }
     error.downcast_ref::<Error>().is_some_and(|error| {
         matches!(
             error,
@@ -578,6 +590,8 @@ impl Bucket {
             backend: StorageBackend::S3,
             name: "telemetry-test".to_string(),
             prefix,
+            control: Route::bucket(),
+            aws: None,
         }
     }
 
@@ -598,7 +612,17 @@ impl Bucket {
             backend,
             name,
             prefix,
+            control: Route::bucket(),
+            aws: None,
         }
+    }
+
+    /// This bucket with a coordination route no one has resolved yet, as a
+    /// production client starts, so a test can resolve it.
+    #[cfg(test)]
+    pub(crate) fn with_unresolved_control_for_test(mut self) -> Self {
+        self.control = Route::unresolved();
+        self
     }
 
     /// `bucket` is `[s3://|gs://|az://]NAME[/PREFIX]`. With a PREFIX every
@@ -651,6 +675,8 @@ impl Bucket {
             backend: StorageBackend::Local,
             name: database.display().to_string(),
             prefix: String::new(),
+            control: Route::bucket(),
+            aws: None,
         })
     }
 
@@ -715,6 +741,7 @@ impl Bucket {
             retry_timeout: Duration::from_secs(30),
             ..RetryConfig::default()
         };
+        let mut aws = None;
         let (store, paginated, cas_store): (
             Arc<dyn ObjectStore>,
             Arc<dyn PaginatedListStore>,
@@ -756,7 +783,14 @@ impl Bucket {
                     }
                 }
                 let cas_builder = builder.clone().with_retry(cas_retry);
-                let client = Arc::new(builder.build().context("build s3 client")?);
+                let client = builder.build().context("build s3 client")?;
+                // Kept for a DynamoDB control table, which then authenticates
+                // through exactly the chain the bucket does.
+                aws = Some(Arc::new(crate::control::AwsAccess {
+                    credentials: client.credentials().clone(),
+                    region: region.to_string(),
+                }));
+                let client = Arc::new(client);
                 (
                     client.clone(),
                     client,
@@ -833,6 +867,8 @@ impl Bucket {
             backend,
             name: bucket.to_string(),
             prefix,
+            control: Route::unresolved(),
+            aws,
         })
     }
 
@@ -842,11 +878,48 @@ impl Bucket {
         self.backend.scheme()
     }
 
+    /// Where this bucket's coordination records go, `dynamodb` or the
+    /// bucket's own scheme, for the startup banner.
+    pub fn control_scheme(&self) -> &'static str {
+        match self.control.table() {
+            Ok(Some(_)) => "dynamodb",
+            _ => self.scheme(),
+        }
+    }
+
     /// The dialect this bucket speaks, for choosing the matching
     /// replication store.
     #[doc(hidden)]
     pub fn backend(&self) -> StorageBackend {
         self.backend
+    }
+
+    /// The shared coordination route; see [`crate::control::resolve`].
+    pub(crate) fn control_route(&self) -> &Route {
+        &self.control
+    }
+
+    pub(crate) fn aws_access(&self) -> Option<&crate::control::AwsAccess> {
+        self.aws.as_deref()
+    }
+
+    /// Resolve where this bucket's coordination records live. A serving
+    /// node calls it once for each client before it reads a record.
+    pub async fn resolve_control(
+        &self,
+        role: crate::control::Role,
+    ) -> anyhow::Result<crate::control::Resolved> {
+        crate::control::resolve(self, role).await
+    }
+
+    /// The control table a key is routed to, when the fleet selected one and
+    /// the key names a coordination record. Every other key, and every key
+    /// of a bucket fleet, stays in the bucket.
+    fn routed(&self, key: &str) -> anyhow::Result<Option<(&Arc<Table>, ControlKey)>> {
+        let Some(record) = ControlKey::parse(key) else {
+            return Ok(None);
+        };
+        Ok(self.control.table()?.map(|table| (table, record)))
     }
 
     /// Scope a caller's key to this client's prefix.
@@ -920,6 +993,18 @@ impl Bucket {
 
     /// Body and CAS token, or `None` when the key does not exist.
     pub async fn get(&self, key: &str) -> anyhow::Result<Option<(Bytes, String)>> {
+        if let Some((table, record)) = self.routed(key)? {
+            return table.get_record(&record).await;
+        }
+        self.get_bucket_object(key).await
+    }
+
+    /// [`Self::get`] from the bucket itself, never routed to a control
+    /// table.
+    pub(crate) async fn get_bucket_object(
+        &self,
+        key: &str,
+    ) -> anyhow::Result<Option<(Bytes, String)>> {
         let key = self.key(key);
         match self.store.get(&Path::from(key.as_str())).await {
             Ok(result) => {
@@ -941,6 +1026,9 @@ impl Bucket {
 
     /// Size and CAS token, or `None` when the key does not exist.
     pub async fn head(&self, key: &str) -> anyhow::Result<Option<(u64, String)>> {
+        if let Some((table, record)) = self.routed(key)? {
+            return table.head_record(&record).await;
+        }
         let key = self.key(key);
         match self.store.head(&Path::from(key.as_str())).await {
             Ok(meta) => {
@@ -958,6 +1046,10 @@ impl Bucket {
     }
 
     pub async fn put(&self, key: &str, body: impl Into<PutPayload>) -> anyhow::Result<()> {
+        if let Some((table, record)) = self.routed(key)? {
+            let body = Bytes::from(body.into());
+            return table.put_record(&record, &body).await;
+        }
         let key = self.key(key);
         self.store
             .put(&Path::from(key.as_str()), body.into())
@@ -1037,6 +1129,10 @@ impl Bucket {
         body: impl Into<PutPayload>,
         token: Option<&str>,
     ) -> anyhow::Result<Option<String>> {
+        if let Some((table, record)) = self.routed(key)? {
+            let body = Bytes::from(body.into());
+            return table.cas_record(&record, &body, token).await;
+        }
         let key = self.key(key);
         let mode = match token {
             None => PutMode::Create,
@@ -1078,6 +1174,10 @@ impl Bucket {
 
     /// Idempotent: deleting an absent key succeeds, as S3's DELETE does.
     pub async fn delete(&self, key: &str) -> anyhow::Result<()> {
+        if let Some((table, record)) = self.routed(key)? {
+            table.delete_record(&record, None).await?;
+            return Ok(());
+        }
         let key = self.key(key);
         match self.store.delete(&Path::from(key.as_str())).await {
             Ok(()) | Err(Error::NotFound { .. }) => Ok(()),
@@ -1087,6 +1187,23 @@ impl Bucket {
                 self.name
             ))),
         }
+    }
+
+    /// Delete a record only while it still holds `token`, where the store can
+    /// condition a delete. `Ok(false)` means the record changed after the
+    /// caller read it and is still there.
+    ///
+    /// Object stores cannot, so on the bucket this is the unconditional
+    /// [`Self::delete`], and a caller keeps fencing the delete with a
+    /// tombstone write first. A control table conditions the delete on the
+    /// tombstone's token, so a delete that lands late cannot remove a record
+    /// a successor wrote in the meantime.
+    pub async fn delete_if_token(&self, key: &str, token: &str) -> anyhow::Result<bool> {
+        if let Some((table, record)) = self.routed(key)? {
+            return table.delete_record(&record, Some(token)).await;
+        }
+        self.delete(key).await?;
+        Ok(true)
     }
 
     /// Batched delete: the S3-family backends fold this into DeleteObjects
@@ -1133,7 +1250,43 @@ impl Bucket {
     /// Every object under `prefix/`; the client paginates internally.
     /// Listed keys come back the way the caller wrote them, because the
     /// caller parses them and knows nothing of the fleet's prefix.
+    ///
+    /// On a fleet whose coordination records live in a control table, the
+    /// records under `prefix/` come from the table and any bucket object
+    /// under a record's key is left out: the table is the one copy that
+    /// counts.
     pub async fn list(&self, prefix: &str) -> anyhow::Result<Vec<ObjectMeta>> {
+        let plan = crate::control::listing_plan(prefix);
+        if plan.partitions.is_empty() {
+            return self.list_bucket_objects(prefix).await;
+        }
+        let Some(table) = self.control.table()? else {
+            return self.list_bucket_objects(prefix).await;
+        };
+        let mut objects = if plan.table_only {
+            Vec::new()
+        } else {
+            self.list_bucket_objects(prefix)
+                .await?
+                .into_iter()
+                .filter(|object| ControlKey::parse(object.location.as_ref()).is_none())
+                .collect()
+        };
+        objects.extend(
+            table
+                .list_records(&plan, prefix)
+                .await?
+                .iter()
+                .map(crate::control::Listed::object_meta),
+        );
+        Ok(objects)
+    }
+
+    /// [`Self::list`] of the bucket itself, never routed to a control table.
+    pub(crate) async fn list_bucket_objects(
+        &self,
+        prefix: &str,
+    ) -> anyhow::Result<Vec<ObjectMeta>> {
         let path = Path::from(self.key(prefix.trim_end_matches('/')));
         let mut stream = self.store.list(Some(&path));
         let mut objects = Vec::new();
@@ -1176,6 +1329,25 @@ impl Bucket {
         page_token: Option<String>,
         max_keys: usize,
     ) -> anyhow::Result<ObjectPage> {
+        let plan = crate::control::listing_plan(prefix);
+        if plan.table_only {
+            if let Some(table) = self.control.table()? {
+                // Only the node leases are ever paged, and they are one
+                // partition, so the page is exact.
+                anyhow::ensure!(
+                    plan.partitions == [crate::control::NODES_PARTITION],
+                    "a control table pages only the node leases, not {prefix:?}"
+                );
+                let (records, page_token) = table.lease_page(page_token, max_keys).await?;
+                return Ok(ObjectPage {
+                    objects: records
+                        .iter()
+                        .map(crate::control::Listed::object_meta)
+                        .collect(),
+                    page_token,
+                });
+            }
+        }
         // `PaginatedListStore` does not append the separator that
         // `ObjectStore::list` appends to a path-segment prefix.
         let path = if prefix.is_empty() {

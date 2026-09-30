@@ -349,6 +349,13 @@ async fn diagnose_checks(
         format!("bucket {}://{}", bucket.scheme(), bucket.name),
         "",
     ))?;
+    let control = bucket
+        .resolve_control(crate::control::Role::Operator)
+        .await?;
+    out.row(&Check::ok(
+        "control",
+        format!("coordination records in {control}"),
+    ))?;
     // A store that cannot fence makes every peer result moot, so the
     // storage verdict comes before the fleet walk.
     probe_storage(out, bucket, read_only).await?;
@@ -603,6 +610,9 @@ pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
     let bucket = options.bucket.expect("validated deployment bucket");
     let store = bucket_client(&bucket, options.endpoint.as_deref(), &region)?;
     validate_bucket(&store).await?;
+    store
+        .resolve_control(crate::control::Role::Operator)
+        .await?;
     crate::wake_format::ensure_ready(&store).await?;
     let started = std::time::Instant::now();
     deploy::write(&store, &built).await?;

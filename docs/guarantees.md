@@ -25,6 +25,16 @@ celld needs four properties from the object store:
 - Ranged reads: a read must return the requested byte range and the bytes
   from that range.
 
+A fleet can keep its coordination records (the cell ownership records,
+the node leases, and the fleet's small shared records) in a DynamoDB
+table instead of the bucket. The table must provide the first three
+properties too. celld reads every record with a strongly consistent read,
+and it refuses a global table, a secondary index, and time-to-live, which
+can each break them. The startup test of a table node runs the same
+conditional-write checks against a probe item. The epoch in each LTX key
+still fences a stale owner, whichever store holds the ownership record.
+See [DynamoDB control plane](design/dynamodb-control-plane.md).
+
 The qualified stores are Amazon S3, Cloudflare R2, Tigris, Google Cloud
 Storage, and Azure Blob Storage. celld's release tests run against R2,
 and the S3 path uses the same client and the same headers.

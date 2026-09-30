@@ -330,6 +330,8 @@ pub mod clean_reload;
 pub mod cli_options;
 pub mod cli_output;
 pub mod container;
+pub mod control;
+pub mod control_cli;
 pub mod control_plane;
 pub mod d1_cli;
 pub mod dead_node_gc;

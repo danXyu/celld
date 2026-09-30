@@ -570,10 +570,10 @@ impl BucketOwnership {
         self.live.clone()
     }
 
-    /// The storage scheme this adapter coordinates through (`s3` or `gs`),
-    /// for the startup banner.
+    /// The store this adapter coordinates through (`s3`, `gs`, `az`, or
+    /// `dynamodb` for a control table), for the startup banner.
     pub fn storage_scheme(&self) -> &'static str {
-        self.bucket.scheme()
+        self.bucket.control_scheme()
     }
 
     /// Stable identity for this exact lease-writing process.

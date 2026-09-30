@@ -71,6 +71,9 @@ impl Reachable {
         name: Option<&str>,
     ) -> anyhow::Result<Self> {
         let bucket = crate::fleet::bucket_client(fleet.bucket, fleet.endpoint, fleet.region)?;
+        bucket
+            .resolve_control(crate::control::Role::Operator)
+            .await?;
         let nodes = live_nodes(&bucket, fleet.unsafe_public_advertise, subject.source).await?;
         // The same secret and the same source shape `celld diagnose` uses.
         let auth = crate::peer_auth::PeerAuth::new(
