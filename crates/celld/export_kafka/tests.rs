@@ -43,6 +43,52 @@ fn the_producer_is_durable_and_bounded_by_the_retry_deadline() {
     assert_eq!(property(&settings, "acks"), Some("all"));
     assert_eq!(property(&settings, "enable.idempotence"), Some("true"));
     assert_eq!(property(&settings, "message.timeout.ms"), Some("9000"));
+    assert_eq!(
+        property(&settings, "allow.auto.create.topics"),
+        Some("false")
+    );
+    // The default record limit plus framing.
+    assert_eq!(property(&settings, "message.max.bytes"), Some("1114112"));
+}
+
+#[test]
+fn the_message_limit_follows_the_record_limit() {
+    let settings = |max: &str| {
+        Settings::from_config(&config(&[
+            ("CELLD_EXPORT_KAFKA_BROKERS", "k1:9092"),
+            ("CELLD_EXPORT_MAX_RECORD_BYTES", max),
+            ("CELLD_EXPORT_QUEUE_BYTES", "1073741824"),
+        ]))
+    };
+    let large = settings("4194304").unwrap();
+    assert_eq!(property(&large, "message.max.bytes"), Some("4259840"));
+    // librdkafka's floor.
+    let small = settings("2048").unwrap();
+    assert_eq!(property(&small, "message.max.bytes"), Some("1000000"));
+    // librdkafka's ceiling.
+    let message = format!("{:#}", settings("999999999").unwrap_err());
+    assert!(message.contains("more than a Kafka message"), "{message}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kafka.properties");
+    for (text, refused) in [
+        ("message.max.bytes=1000000\n", true),
+        ("message.max.bytes=lots\n", true),
+        ("message.max.bytes=2000000\n", false),
+    ] {
+        std::fs::write(&path, text).unwrap();
+        let result = Settings::from_config(&config(&[
+            ("CELLD_EXPORT_KAFKA_BROKERS", "k1:9092"),
+            ("CELLD_EXPORT_KAFKA_PROPERTIES", path.to_str().unwrap()),
+        ]));
+        match result {
+            Err(e) if refused => assert!(format!("{e:#}").contains("message.max.bytes")),
+            Ok(settings) if !refused => {
+                assert_eq!(property(&settings, "message.max.bytes"), Some("2000000"))
+            }
+            other => panic!("{text:?}: {other:?}"),
+        }
+    }
 }
 
 #[test]
@@ -79,6 +125,19 @@ fn a_properties_file_may_not_weaken_acks_or_be_malformed() {
     for (text, expected) in [
         ("acks=1\n", "acks must stay all"),
         ("acks = 0", "acks must stay all"),
+        (
+            "delivery.report.only.error=true",
+            "delivery.report.only.error must stay false",
+        ),
+        ("message.timeout.ms=0", "set from CELLD_EXPORT_RETRY_MS"),
+        (
+            "delivery.timeout.ms=600000",
+            "set from CELLD_EXPORT_RETRY_MS",
+        ),
+        (
+            "allow.auto.create.topics=true",
+            "allow.auto.create.topics must stay false",
+        ),
         ("linger.ms=5\nbatch.size\n", "line 2: expected name=value"),
         ("=5", "line 1: a property needs a name"),
     ] {
@@ -215,7 +274,126 @@ mod client {
         assert_eq!(read, expected);
     }
 
+    /// Against a real broker that creates topics on demand (CI's does): a
+    /// missing topic fails the connection, with its name, and stays missing.
+    #[tokio::test]
+    async fn a_missing_topic_is_an_error_not_created() {
+        use rdkafka::consumer::BaseConsumer;
+        use rdkafka::consumer::Consumer as _;
+
+        let Ok(brokers) = std::env::var("CELLD_TEST_KAFKA_BROKERS") else {
+            eprintln!("skipped: set CELLD_TEST_KAFKA_BROKERS to run against a broker");
+            return;
+        };
+        let topic = format!("celld-export-missing-{}", rand::random::<u64>());
+        let settings = Settings::from_config(&config(&[
+            ("CELLD_EXPORT_KAFKA_BROKERS", &brokers),
+            ("CELLD_EXPORT_TOPIC", &topic),
+        ]))
+        .unwrap();
+        let message = match crate::export_kafka::client::connect(&settings).await {
+            Ok(_) => panic!("connected to a missing topic"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(message.contains(&topic), "{message}");
+
+        // Consumers never ask for topics to be created.
+        let consumer: BaseConsumer = rdkafka::ClientConfig::new()
+            .set("bootstrap.servers", &brokers)
+            .create()
+            .unwrap();
+        let exists = tokio::task::spawn_blocking(move || {
+            let metadata = consumer
+                .fetch_metadata(None, Duration::from_secs(10))
+                .unwrap();
+            metadata.topics().iter().any(|t| t.name() == topic)
+        })
+        .await
+        .unwrap();
+        assert!(!exists, "the sink created the topic");
+    }
+
+    /// Against a real broker: a record at `CELLD_EXPORT_MAX_RECORD_BYTES`,
+    /// which does not compress, is delivered to a topic whose own limit
+    /// allows it.
+    #[tokio::test]
+    async fn a_record_at_the_size_limit_is_delivered() {
+        use crate::export_topic::Message;
+
+        let Ok(brokers) = std::env::var("CELLD_TEST_KAFKA_BROKERS") else {
+            eprintln!("skipped: set CELLD_TEST_KAFKA_BROKERS to run against a broker");
+            return;
+        };
+        let topic = format!("celld-export-large-{}", rand::random::<u64>());
+        create_topic_with(&brokers, &topic, &[("max.message.bytes", "2097152")]).await;
+        let config = config(&[
+            ("CELLD_EXPORT_KAFKA_BROKERS", &brokers),
+            ("CELLD_EXPORT_TOPIC", &topic),
+            ("CELLD_EXPORT_RETRY_MS", "30000"),
+        ]);
+        let settings = Settings::from_config(&config).unwrap();
+        let producer = crate::export_kafka::client::connect(&settings)
+            .await
+            .unwrap();
+        let payload: Vec<u8> = (0..config.max_record_bytes)
+            .map(|_| rand::random::<u8>())
+            .collect();
+        let results = producer
+            .produce(vec![Message {
+                key: b"a stream".to_vec(),
+                payload: payload.into(),
+                event_ts_ms: 1_790_685_296_000,
+            }])
+            .await;
+        assert_eq!(results.len(), 1);
+        let landed = results[0].as_ref().expect("delivered");
+        assert!(landed.starts_with(&format!("{topic}/")), "{landed}");
+    }
+
+    /// Against a real broker: a delivery report that never comes (as with
+    /// `delivery.report.only.error`, which the properties file refuses)
+    /// drops the record once the retry deadline passes rather than holding
+    /// every later one.
+    #[tokio::test]
+    async fn a_missing_delivery_report_drops_the_record_by_the_deadline() {
+        use crate::export_topic::Message;
+
+        let Ok(brokers) = std::env::var("CELLD_TEST_KAFKA_BROKERS") else {
+            eprintln!("skipped: set CELLD_TEST_KAFKA_BROKERS to run against a broker");
+            return;
+        };
+        let topic = format!("celld-export-silent-{}", rand::random::<u64>());
+        create_topic(&brokers, &topic).await;
+        let settings = Settings::new(
+            topic.clone(),
+            brokers.clone(),
+            Duration::from_secs(2),
+            crate::export::DEFAULT_MAX_RECORD_BYTES,
+            vec![("delivery.report.only.error".into(), "true".into())],
+        )
+        .unwrap();
+        let producer = crate::export_kafka::client::connect(&settings)
+            .await
+            .unwrap();
+        let results = tokio::time::timeout(
+            Duration::from_secs(60),
+            producer.produce(vec![Message {
+                key: b"a stream".to_vec(),
+                payload: b"{}".to_vec().into(),
+                event_ts_ms: 1_790_685_296_000,
+            }]),
+        )
+        .await
+        .expect("the produce finished");
+        let reason = results[0].as_ref().expect_err("dropped");
+        assert!(reason.contains("delivery"), "{reason}");
+    }
+
     async fn create_topic(brokers: &str, topic: &str) {
+        create_topic_with(brokers, topic, &[]).await
+    }
+
+    async fn create_topic_with(brokers: &str, topic: &str, configs: &[(&str, &str)]) {
         use rdkafka::admin::AdminClient;
         use rdkafka::admin::AdminOptions;
         use rdkafka::admin::NewTopic;
@@ -226,11 +404,12 @@ mod client {
             .set("bootstrap.servers", brokers)
             .create()
             .unwrap();
+        let mut new = NewTopic::new(topic, 3, TopicReplication::Fixed(1));
+        for (name, value) in configs {
+            new = new.set(name, value);
+        }
         let created = admin
-            .create_topics(
-                &[NewTopic::new(topic, 3, TopicReplication::Fixed(1))],
-                &AdminOptions::new(),
-            )
+            .create_topics(&[new], &AdminOptions::new())
             .await
             .unwrap();
         for result in created {

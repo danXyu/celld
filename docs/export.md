@@ -179,7 +179,7 @@ the settings with export still off.
 | `CELLD_ZONE` | unset | The node's zone. With `CELLD_EXPORT_ZONES` set, it picks the writer this node produces as. |
 | `CELLD_EXPORT_WRITER_ID` | the node's zone (`CELLD_ZONE`) | The zone whose writer this node produces as, when it differs from the node's zone. It must be one of `CELLD_EXPORT_ZONES`. |
 | `CELLD_EXPORT_KAFKA_BROKERS` | unset | Kafka bootstrap servers, comma-separated `host:port`. Required with the Kafka sink. |
-| `CELLD_EXPORT_KAFKA_PROPERTIES` | unset | A file of [librdkafka properties](https://github.com/confluentinc/librdkafka/blob/master/CONFIGURATION.md), one `name=value` per line, applied over the Kafka sink's own: TLS, SASL, compression, batching. It may not set `acks` below `all`. |
+| `CELLD_EXPORT_KAFKA_PROPERTIES` | unset | A file of [librdkafka properties](https://github.com/confluentinc/librdkafka/blob/master/CONFIGURATION.md), one `name=value` per line, applied over the Kafka sink's own: TLS, SASL, compression, batching. It may not set `acks` below `all`, set `message.timeout.ms` (that is `CELLD_EXPORT_RETRY_MS`), turn on `delivery.report.only.error` or `allow.auto.create.topics`, or set `message.max.bytes` below `CELLD_EXPORT_MAX_RECORD_BYTES` plus 64 KiB. |
 | `CELLD_EXPORT_RETRY_MS` | `30000` | How long the blob-stream or Kafka sink retries a record before it counts as dropped. |
 | `CELLD_EXPORT_RECONCILE` | `24h` | The interval of `celld export reconcile --schedule`, as `<n>s`, `<n>m`, `<n>h`, or `<n>d`. The node itself does not reconcile. |
 
@@ -279,7 +279,19 @@ cargo build --release --features export-kafka
 ```
 
 Create the topic first, with the partitions and replication factor you
-want; the sink does not create it. Then:
+want; the sink never asks the brokers to create it, and a missing topic
+shows up as the reason records are dropped. Set the topic's
+`max.message.bytes` to at least `CELLD_EXPORT_MAX_RECORD_BYTES` plus 64 KiB
+(`1114112` with the default record size), since Kafka's own default is
+slightly less than one record at the limit:
+
+```sh
+kafka-topics.sh --create --topic celld-changes --partitions 12 \
+  --replication-factor 3 --config max.message.bytes=1114112 \
+  --bootstrap-server kafka-0.kafka:9092
+```
+
+Then:
 
 ```sh
 CELLD_EXPORT=1

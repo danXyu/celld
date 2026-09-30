@@ -18,9 +18,15 @@
 //! missing topic or unreachable cluster shows up as the reason records are
 //! dropped rather than as librdkafka's own retries.
 //!
+//! The producer never asks the brokers to create a topic, and its message
+//! limit is `CELLD_EXPORT_MAX_RECORD_BYTES` plus [`MESSAGE_OVERHEAD`], so any
+//! record the exporter emits fits. The topic's own `max.message.bytes` must
+//! allow the same.
+//!
 //! `CELLD_EXPORT_KAFKA_PROPERTIES` names a file of librdkafka properties,
 //! applied over the sink's own: TLS, SASL, compression, batching. It may not
-//! weaken `acks`.
+//! weaken `acks`, move the delivery deadline, silence successful delivery
+//! reports, allow topic creation, or lower the message limit below a record.
 //!
 //! The client is behind the `export-kafka` Cargo feature. Without it,
 //! [`start`] refuses, and a node configured for this sink does not start.
@@ -36,6 +42,13 @@ use tokio::sync::mpsc;
 
 /// The sink's name, as outcomes and logs carry it.
 pub const NAME: &str = "kafka";
+
+/// Room in the producer's message limit beyond `CELLD_EXPORT_MAX_RECORD_BYTES`,
+/// for the key, the timestamp and Kafka's framing.
+pub const MESSAGE_OVERHEAD: usize = 64 * 1024;
+
+/// librdkafka's floor and ceiling for `message.max.bytes`.
+const MESSAGE_MAX_BYTES: std::ops::RangeInclusive<usize> = 1_000_000..=1_000_000_000;
 
 /// Start the Kafka sink for `config`. Must be called inside a Tokio runtime.
 /// Fails when the build does not carry the sink or its properties file
@@ -112,20 +125,44 @@ impl Settings {
                     .with_context(|| format!("CELLD_EXPORT_KAFKA_PROPERTIES {}", path.display()))?
             }
         };
-        Ok(Settings::new(
+        Settings::new(
             config.topic.clone(),
             brokers,
             config.retry,
+            config.max_record_bytes,
             overrides,
-        ))
+        )
     }
 
     fn new(
         topic: String,
         brokers: String,
         retry: Duration,
+        max_record_bytes: usize,
         overrides: Vec<(String, String)>,
-    ) -> Settings {
+    ) -> anyhow::Result<Settings> {
+        let message_max_bytes = max_record_bytes
+            .saturating_add(MESSAGE_OVERHEAD)
+            .clamp(*MESSAGE_MAX_BYTES.start(), *MESSAGE_MAX_BYTES.end());
+        if max_record_bytes.saturating_add(MESSAGE_OVERHEAD) > message_max_bytes {
+            bail!(
+                "CELLD_EXPORT_MAX_RECORD_BYTES ({max_record_bytes}) is more than a Kafka \
+                 message can carry"
+            );
+        }
+        for (name, value) in &overrides {
+            if name == "message.max.bytes"
+                && value
+                    .parse::<usize>()
+                    .map_or(true, |v| v < message_max_bytes)
+            {
+                bail!(
+                    "CELLD_EXPORT_KAFKA_PROPERTIES: message.max.bytes={value} is below \
+                     {message_max_bytes}, CELLD_EXPORT_MAX_RECORD_BYTES plus framing; \
+                     the largest records could never be sent"
+                );
+            }
+        }
         let own = [
             ("bootstrap.servers", brokers.clone()),
             ("client.id", "celld-export".to_string()),
@@ -137,18 +174,22 @@ impl Settings {
             ("message.timeout.ms", retry.as_millis().to_string()),
             // Records are JSON; lz4 is cheap and built into librdkafka.
             ("compression.type", "lz4".to_string()),
+            // Every record the exporter emits fits in one message.
+            ("message.max.bytes", message_max_bytes.to_string()),
+            // A missing topic is an error, not a topic with broker defaults.
+            ("allow.auto.create.topics", "false".to_string()),
         ];
         let mut properties: Vec<(String, String)> = own
             .into_iter()
             .map(|(name, value)| (name.to_string(), value))
             .collect();
         properties.extend(overrides);
-        Settings {
+        Ok(Settings {
             topic,
             brokers,
             retry,
             properties,
-        }
+        })
     }
 }
 
@@ -178,6 +219,28 @@ pub fn parse_properties(text: &str) -> anyhow::Result<Vec<(String, String)>> {
                 number + 1
             );
         }
+        // The sink waits for every record's delivery report, and
+        // CELLD_EXPORT_RETRY_MS bounds how long one takes.
+        if matches!(name, "message.timeout.ms" | "delivery.timeout.ms") {
+            bail!(
+                "line {}: {name} is set from CELLD_EXPORT_RETRY_MS",
+                number + 1
+            );
+        }
+        if name == "delivery.report.only.error" && value != "false" {
+            bail!(
+                "line {}: delivery.report.only.error must stay false; the export counts a \
+                 record delivered only when Kafka reports it",
+                number + 1
+            );
+        }
+        if name == "allow.auto.create.topics" && value != "false" {
+            bail!(
+                "line {}: allow.auto.create.topics must stay false; create the topic with \
+                 the partitions and replication you want",
+                number + 1
+            );
+        }
         properties.push((name.to_string(), value.to_string()));
     }
     Ok(properties)
@@ -204,6 +267,12 @@ mod client {
     /// How long a send waits before trying again while librdkafka's queue
     /// is full.
     const QUEUE_FULL_PAUSE: Duration = Duration::from_millis(10);
+
+    /// How long past the retry deadline a delivery report may take before
+    /// the record counts as dropped. librdkafka reports every message by
+    /// `message.timeout.ms`; this only keeps a missing report from holding
+    /// every later record.
+    const REPORT_GRACE: Duration = Duration::from_secs(10);
 
     /// Create the producer and check that the cluster answers for the topic.
     pub async fn connect(settings: &Settings) -> anyhow::Result<Arc<dyn Produce>> {
@@ -287,14 +356,20 @@ mod client {
                 for delivery in deliveries {
                     results.push(match delivery {
                         Err(refused) => Err(refused),
-                        Ok(delivery) => match delivery.await {
-                            Ok(Ok(delivered)) => Ok(Arc::from(format!(
-                                "{topic}/{}/{}",
-                                delivered.partition, delivered.offset
-                            ))),
-                            Ok(Err((error, _))) => Err(Arc::from(error.to_string())),
-                            Err(_) => Err(Arc::from("the Kafka producer went away")),
-                        },
+                        Ok(delivery) => {
+                            match tokio::time::timeout_at(deadline + REPORT_GRACE, delivery).await {
+                                Ok(Ok(Ok(delivered))) => Ok(Arc::from(format!(
+                                    "{topic}/{}/{}",
+                                    delivered.partition, delivered.offset
+                                ))),
+                                Ok(Ok(Err((error, _)))) => Err(Arc::from(error.to_string())),
+                                Ok(Err(_)) => Err(Arc::from("the Kafka producer went away")),
+                                Err(_) => Err(Arc::from(
+                                    "Kafka did not report the record's delivery by the \
+                                     retry deadline",
+                                )),
+                            }
+                        }
                     });
                 }
                 results

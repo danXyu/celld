@@ -490,8 +490,15 @@ neither duplicates nor reorders it within its partition. The properties
 file may not lower `acks`: a delivered position would otherwise certify
 records a broker failure can still lose. Kafka's default partitioner hashes
 the key, so a stream stays in one partition while the partition count does
-not change. Connecting fetches the topic's metadata, so a missing topic or
-an unreachable cluster is reported as the reason records are dropped.
+not change. Connecting fetches the topic's metadata with topic
+auto-creation off, so a missing topic or an unreachable cluster is reported
+as the reason records are dropped, never answered with a topic on broker
+defaults. The producer's `message.max.bytes` is `CELLD_EXPORT_MAX_RECORD_BYTES`
+plus 64 KiB of framing, and the topic's own `max.message.bytes` must allow
+the same, so every fragment fits in one message. `CELLD_EXPORT_RETRY_MS` is
+`message.timeout.ms`; the sink waits for each message's delivery report,
+and a report missing past the deadline drops the record, so the properties
+file may not move the timeout or turn off successful delivery reports.
 
 Kafka is at-least-once to consumers as well: the loader commits offsets
 after landing, so a crash replays a batch. Consumers dedup on the same key
