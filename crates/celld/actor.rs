@@ -3310,7 +3310,11 @@ impl Actor {
                 self.route_effect_started(&cell);
                 let interlock = self.node_log.lock().unwrap().clone();
                 let timing_cell = cell.clone();
-                out.effects.push(Box::pin(async move {
+                // Recovery decodes each witness's tail and folds the dead
+                // node's frames into bundles between its awaits. It runs on
+                // the host runtime for the same reason a restore does: the
+                // core thread polls `out` and owns the node lease timer.
+                let task = crate::asyncrt::spawn(async move {
                     let started = crate::asyncrt::mono_ms();
                     let result = match interlock {
                         // No log tier on this node (no bucket): nothing to
@@ -3332,6 +3336,9 @@ impl Actor {
                         RouteStage::NodeLeaseLookup,
                         started,
                     )
+                });
+                out.effects.push(Box::pin(async move {
+                    task.await.expect("node-log recovery task panicked")
                 }));
             }
             Effect::ReadCapacityPeers { op, cell } => {
@@ -3683,7 +3690,14 @@ impl Actor {
                         .and_then(|timing| timing.fresh)
                         .unwrap_or(false);
                     let timing_cell = cell.clone();
-                    out.effects.push(Box::pin(async move {
+                    // A start opens the cell's SQLite inside its isolate's
+                    // turn: the open, the schema DDL and the first WAL
+                    // writes are synchronous. Poll it on the host runtime:
+                    // this future lives in `out`, which the core thread
+                    // drives, and the core owns the node lease timer. Inline,
+                    // 300 fresh activations a second held the core long
+                    // enough that the lease lapsed and the node fenced.
+                    let task = crate::asyncrt::spawn(async move {
                         let started = crate::asyncrt::mono_ms();
                         let placed = runtime
                             .start_cell(cell.clone(), epoch, fresh)
@@ -3708,6 +3722,9 @@ impl Actor {
                             RouteStage::IsolateStartup,
                             started,
                         )
+                    });
+                    out.effects.push(Box::pin(async move {
+                        task.await.expect("runtime start task panicked")
                     }));
                 } else {
                     self.record_effect_timing(EffectTiming {
