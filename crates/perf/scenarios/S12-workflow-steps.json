@@ -1,0 +1,53 @@
+{
+  "name": "S12-workflow-steps",
+  "fixture": "services",
+  "description": "Workflow completion time as the step count grows: run() replays from the top on each wake, so a long workflow can cost O(steps^2). Each after step reports creation-to-completion time for all workflows so far.",
+  "phases": [
+    {
+      "name": "10-steps",
+      "duration_s": 10,
+      "rate": 5,
+      "load": [
+        {
+          "request": {
+            "path": "/wf/create",
+            "query": {
+              "steps": "10"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "100-steps",
+      "duration_s": 10,
+      "rate": 2,
+      "load": [
+        {
+          "request": {
+            "path": "/wf/create",
+            "query": {
+              "steps": "100"
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "after": [
+    {
+      "step": "sleep",
+      "ms": 20000
+    },
+    {
+      "step": "collect",
+      "request": {
+        "path": "/stats",
+        "query": {
+          "kind": "workflow"
+        }
+      }
+    }
+  ],
+  "verify": false
+}

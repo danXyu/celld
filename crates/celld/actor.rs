@@ -1559,6 +1559,7 @@ impl AppHandle {
 
     async fn gate_output_path(&self, request: u64, ticket: GateTicket) -> OutputGateOutcome {
         let started_mono_ms = crate::asyncrt::mono_ms();
+        let started_us = crate::asyncrt::mono_us();
         let (reply, receive) = oneshot::channel();
         if self
             .tx
@@ -1575,6 +1576,10 @@ impl AppHandle {
             Ok(result) => OutputGateOutcome::Returned(result),
             Err(_) => OutputGateOutcome::ReplyChannelClosed,
         };
+        crate::perf_stats::record(
+            crate::perf_stats::Hist::GateWait,
+            crate::asyncrt::mono_us().saturating_sub(started_us),
+        );
         tracing::debug!(
             target: "timing",
             event = "gate_write_timing",
@@ -2549,6 +2554,16 @@ impl Actor {
     }
 
     fn handle_message(&mut self, message: Message, out: &mut StepOutput) {
+        crate::perf_stats::count(crate::perf_stats::Counter::CoreMessages);
+        match &message {
+            Message::Request { .. } => {
+                crate::perf_stats::count(crate::perf_stats::Counter::CoreRequests);
+            }
+            Message::Output { .. } => {
+                crate::perf_stats::count(crate::perf_stats::Counter::CoreOutputs);
+            }
+            _ => {}
+        }
         match message {
             Message::BeginPreserve => {
                 self.preserving = true;
@@ -3047,6 +3062,10 @@ impl Actor {
         if phase == HandoffPhase::Adopt {
             if adopted == Some(true) {
                 if let Some(timing) = self.handoff_timings.remove(&cell) {
+                    crate::perf_stats::record(
+                        crate::perf_stats::Hist::Handoff,
+                        mono_elapsed_us(timing.nominated_mono_ms),
+                    );
                     tracing::info!(
                         event = "cell_handoff_timing",
                         %cell,
@@ -4352,6 +4371,10 @@ impl Actor {
                 .saturating_add(mono_elapsed_us(started));
         }
         let (owner_node, epoch) = owner.unwrap_or(("", 0));
+        crate::perf_stats::record(
+            crate::perf_stats::Hist::CellRoute,
+            mono_elapsed_us(timing.started_mono_ms),
+        );
         tracing::debug!(
             target: "timing",
             event = "cell_route_timing",

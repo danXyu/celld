@@ -131,6 +131,7 @@ A cell fits a workload that divides into named, stateful units:
 - [Security](security.md)
 - [Telemetry](telemetry.md)
 - [Testing](testing.md)
+- [Performance tests](performance-tests.md)
 - [WebAssembly](wasm.md)
 
 ## Services

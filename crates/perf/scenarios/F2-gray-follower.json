@@ -1,0 +1,62 @@
+{
+  "backends": [
+    "s3"
+  ],
+  "name": "F2-gray-follower",
+  "nodes": 3,
+  "description": "One node's fsync is slowed by 50 ms (CELLD_PERF_FSYNC_DELAY_US): the leaders should evict it from their ensembles, and no write should wait longer than a bucket proof would.",
+  "env": {
+    "CELLD_PERF_BUCKET_FAULTS": "read=15,write=30,list=20,tail=10"
+  },
+  "node_env": {
+    "2": {
+      "CELLD_PERF_FSYNC_DELAY_US": "50000"
+    }
+  },
+  "setup": [
+    {
+      "step": "touch",
+      "request": {
+        "path": "/do/write",
+        "query": {
+          "bytes": "100"
+        },
+        "counts_write": true
+      },
+      "cells": {
+        "count": 1000,
+        "prefix": "gray"
+      },
+      "concurrency": 16
+    }
+  ],
+  "phases": [
+    {
+      "name": "write",
+      "duration_s": 30,
+      "rate": 500,
+      "load": [
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "100"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 1000,
+            "prefix": "gray"
+          },
+          "node": 0
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    }
+  ]
+}

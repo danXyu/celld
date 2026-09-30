@@ -582,6 +582,10 @@ impl WebSocketRouteTiming {
             .runtime
             .as_ref()
             .map_or(("", ""), |runtime| (runtime.node(), runtime.region()));
+        celld::perf_stats::record(
+            celld::perf_stats::Hist::WebSocketRoute,
+            self.started.elapsed().as_micros() as u64,
+        );
         tracing::debug!(
             target: "timing",
             event = "websocket_route_timing",
@@ -2948,6 +2952,7 @@ async fn handle_internal(
                 Err(_) => response(StatusCode::INTERNAL_SERVER_ERROR, "invalid actor state"),
             }
         }
+        "/debug/metrics" => response(StatusCode::OK, celld::perf_stats::snapshot().to_string()),
         "/reload" if request.method() != hyper::Method::POST => {
             response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
         }
@@ -3514,6 +3519,9 @@ const DEFAULT_REBALANCE_BATCH_CELLS: usize = 32;
 /// remote restore, but must not grow with the lifetime population of a node.
 /// The walk is O(cached cells), so keep it off the hot maintenance cadence.
 const LOCAL_CACHE_PRUNE_PERIOD: std::time::Duration = std::time::Duration::from_secs(60);
+/// How often the main loop samples its own timer lateness
+/// (`loop.main_lag_us` in `/debug/metrics`).
+const LAG_PROBE_PERIOD: std::time::Duration = std::time::Duration::from_millis(20);
 
 fn main() -> anyhow::Result<()> {
     celld::env_vars::validate()?;
@@ -4851,6 +4859,10 @@ async fn async_main(
         LOCAL_CACHE_PRUNE_PERIOD,
     );
     local_cache_prune.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // How late this loop runs a timer is how long every future it polls
+    // itself (WebSocket pumps, DO, gate, service, and queue calls) can wait.
+    let mut main_lag = tokio::time::interval(LAG_PROBE_PERIOD);
+    main_lag.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let shutdown_mode = loop {
         celld::asyncrt::select! {
             connection = listener.accept() => {
@@ -4991,6 +5003,12 @@ async fn async_main(
                     "SELF-FENCE: the core actor exited unexpectedly"
                 );
                 exit_flushed(3);
+            }
+            due = main_lag.tick() => {
+                celld::perf_stats::record(
+                    celld::perf_stats::Hist::MainLag,
+                    due.elapsed().as_micros() as u64,
+                );
             }
             _ = replication_health.tick() => {
                 if let Some(runtime) = &app.runtime {

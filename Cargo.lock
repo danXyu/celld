@@ -1534,6 +1534,9 @@ dependencies = [
 [[package]]
 name = "celld-logic"
 version = "0.1.0"
+dependencies = [
+ "criterion",
+]
 
 [[package]]
 name = "celld-ltx"
@@ -1543,6 +1546,7 @@ dependencies = [
  "bytes",
  "chrono",
  "crc-fast",
+ "criterion",
  "futures-util",
  "http 1.5.0",
  "lz4_flex",
@@ -1554,6 +1558,25 @@ dependencies = [
  "tokio",
  "tracing",
  "ureq",
+]
+
+[[package]]
+name = "celld-perf"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "fastwebsockets",
+ "futures-util",
+ "http-body-util",
+ "hyper 1.11.1",
+ "hyper-util",
+ "libc",
+ "rand 0.8.7",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

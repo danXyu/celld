@@ -1148,6 +1148,7 @@ impl LtxRepl {
                 Arc::new(crate::local_store::LocalStore::open(&bucket)?)
             }
         };
+        let store = crate::perf_store::wrap(store);
         // Azure blob metadata names must be C# identifiers, so the standard
         // Litestream key cannot carry its hyphen there. External Litestream
         // tooling reads that key, therefore an az:// replica gives up
@@ -1714,6 +1715,7 @@ impl LtxRepl {
             !self.stop.is_stopped(),
             "LTX replication stopped before activation started"
         );
+        let activation_started_us = asyncrt::mono_us();
         let ActivationOptions {
             cell,
             epoch,
@@ -2091,6 +2093,15 @@ impl LtxRepl {
         let db_open_us = asyncrt::mono_ms()
             .saturating_sub(db_open_started_mono_ms)
             .saturating_mul(1_000);
+        crate::perf_stats::record(
+            match &remote_restore {
+                _ if fresh => crate::perf_stats::Hist::ActivationFresh,
+                Some(timing) if timing.paged => crate::perf_stats::Hist::ActivationPaged,
+                Some(_) => crate::perf_stats::Hist::ActivationDownload,
+                None => crate::perf_stats::Hist::ActivationLocal,
+            },
+            asyncrt::mono_us().saturating_sub(activation_started_us),
+        );
         if let Some(timing) = remote_restore {
             info!(
                 event = "restore_plan",
@@ -2584,6 +2595,7 @@ impl LtxRepl {
             budget_ms: self.durability_timeout_ms,
         };
         let started = wait.started_ms;
+        let started_us = asyncrt::mono_us();
         loop {
             // Register the waiter before checking, so a sync that completes
             // between the check and the await is not missed. Either proof
@@ -2599,6 +2611,14 @@ impl LtxRepl {
                 } else {
                     celld_logic::ProofSource::Bucket
                 };
+                crate::perf_stats::record(
+                    if shipped {
+                        crate::perf_stats::Hist::ProofFleet
+                    } else {
+                        crate::perf_stats::Hist::ProofBucket
+                    },
+                    asyncrt::mono_us().saturating_sub(started_us),
+                );
                 tracing::debug!(
                     target: "timing",
                     event = "durable_wait",
@@ -4106,7 +4126,15 @@ async fn bundle_loop(
             continue;
         }
         let count = entries.len();
-        if entries.is_empty() || active.put_bundle(entries).await {
+        let flush_started_us = asyncrt::mono_us();
+        let flushed = entries.is_empty() || active.put_bundle(entries).await;
+        if count > 0 {
+            crate::perf_stats::record(
+                crate::perf_stats::Hist::BundleFlush,
+                asyncrt::mono_us().saturating_sub(flush_started_us),
+            );
+        }
+        if flushed {
             if count > 0 {
                 info!(
                     event = "log_bundle_flush",
@@ -4676,6 +4704,20 @@ fn apply_round(
         // fleet sequence for this credit.
         ShipRoundCompletion::OrderedEmpty => None,
     };
+    {
+        use crate::perf_stats::{record, Hist};
+        record(
+            Hist::ShipRound,
+            asyncrt::mono_ms()
+                .saturating_sub(round.submitted)
+                .saturating_mul(1_000),
+        );
+        record(Hist::ShipRoundCells, round.credits.len() as u64);
+        record(Hist::ShipRoundBytes, round.bytes as u64);
+        record(Hist::CaptureTotal, round.capture_ms.saturating_mul(1_000));
+        record(Hist::CaptureEncode, round.sync_timing.encode_write_us);
+        record(Hist::CaptureFsync, round.sync_timing.fsync_us);
+    }
     info!(
         event = "log_ship_round",
         entries = round.entries,

@@ -1,0 +1,177 @@
+{
+  "name": "smoke",
+  "description": "A quick pass over the main paths at low rates, with count checks only: a warm read makes no bucket request for its cell and one core route and gate; a bucket-proof write makes at most one cell PUT and one ownership GET; a WebSocket ping is answered without the core. CI runs it with --quick.",
+  "setup": [
+    {
+      "step": "touch",
+      "request": {
+        "path": "/do/write",
+        "query": {
+          "bytes": "100"
+        },
+        "counts_write": true
+      },
+      "cells": {
+        "count": 20,
+        "prefix": "smoke"
+      },
+      "concurrency": 64
+    },
+    {
+      "step": "connect",
+      "cells": {
+        "count": 4,
+        "prefix": "ws"
+      },
+      "per_cell": 2
+    }
+  ],
+  "phases": [
+    {
+      "name": "stateless",
+      "duration_s": 5,
+      "rate": 50,
+      "load": [
+        {
+          "request": {
+            "path": "/noop"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "bucket:class=cell_owner+cell_data",
+          "max": 0
+        },
+        {
+          "metric": "counter:core.requests",
+          "max": 0
+        },
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "warm-read",
+      "duration_s": 5,
+      "rate": 50,
+      "load": [
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 20,
+            "prefix": "smoke"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "bucket:class=cell_owner+cell_data",
+          "per_ok": true,
+          "max": 0
+        },
+        {
+          "metric": "counter:core.requests",
+          "per_ok": true,
+          "max": 1.05
+        },
+        {
+          "metric": "counter:core.outputs",
+          "per_ok": true,
+          "max": 1.05
+        },
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "write",
+      "duration_s": 5,
+      "rate": 20,
+      "load": [
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "100"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 20,
+            "prefix": "smoke"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "bucket:class=cell_data,op=put",
+          "per_ok": true,
+          "max": 1.05
+        },
+        {
+          "metric": "bucket:class=cell_owner,op=get",
+          "per_ok": true,
+          "max": 1.05
+        },
+        {
+          "metric": "hist_count:durability.proof_bucket_us",
+          "per_ok": true,
+          "min": 0.5
+        },
+        {
+          "metric": "counter:core.requests",
+          "per_ok": true,
+          "max": 1.05
+        },
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "ws-ping",
+      "duration_s": 5,
+      "rate": 50,
+      "load": [
+        {
+          "message": "ping"
+        }
+      ],
+      "checks": [
+        {
+          "metric": "counter:core.messages",
+          "per_ok": true,
+          "max": 0.1
+        },
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "ws-echo",
+      "duration_s": 5,
+      "rate": 50,
+      "load": [
+        {
+          "message": "echo"
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    }
+  ]
+}

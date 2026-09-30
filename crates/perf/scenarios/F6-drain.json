@@ -1,0 +1,76 @@
+{
+  "backends": [
+    "s3"
+  ],
+  "name": "F6-drain",
+  "nodes": 3,
+  "description": "A node drains (SIGTERM hands its cells off) under load, then returns: handoff.total_us and the timeline show the cost.",
+  "env": {
+    "CELLD_SHUTDOWN_TOTAL_MS": "40000"
+  },
+  "setup": [
+    {
+      "step": "touch",
+      "request": {
+        "path": "/do/write",
+        "query": {
+          "bytes": "100"
+        },
+        "counts_write": true
+      },
+      "cells": {
+        "count": 1000,
+        "prefix": "dr"
+      },
+      "concurrency": 16
+    }
+  ],
+  "phases": [
+    {
+      "name": "drain",
+      "duration_s": 60,
+      "rate": 300,
+      "timeout_ms": 60000,
+      "load": [
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 1000,
+            "prefix": "dr"
+          },
+          "node": 0,
+          "weight": 3
+        },
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "100"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 1000,
+            "prefix": "dr"
+          },
+          "node": 0
+        }
+      ],
+      "during": [
+        {
+          "at_s": 10,
+          "step": "signal",
+          "node": 1,
+          "signal": "TERM"
+        },
+        {
+          "at_s": 45,
+          "step": "start",
+          "node": 1
+        }
+      ]
+    }
+  ]
+}

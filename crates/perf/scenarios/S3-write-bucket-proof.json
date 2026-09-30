@@ -1,0 +1,206 @@
+{
+  "name": "S3-write-bucket-proof",
+  "description": "Writes on a single node, which proves each through the bucket: latency is about one PUT plus one ownership GET. The bucket gets an S3-like latency (needs a perf build); variants remove it or double it. Runs on the s3 backend: the dev store fsyncs every object under one SQLite writer, which caps a lone node at a few hundred uploads per second and would be what this measured.",
+  "env": {
+    "CELLD_PERF_BUCKET_FAULTS": "read=15,write=30,list=20,tail=10"
+  },
+  "variants": [
+    {
+      "name": "s3-like",
+      "env": {}
+    },
+    {
+      "name": "local",
+      "env": {
+        "CELLD_PERF_BUCKET_FAULTS": ""
+      }
+    },
+    {
+      "name": "slow",
+      "env": {
+        "CELLD_PERF_BUCKET_FAULTS": "read=30,write=100,list=40,tail=50"
+      }
+    }
+  ],
+  "setup": [
+    {
+      "step": "touch",
+      "request": {
+        "path": "/do/write",
+        "query": {
+          "bytes": "100"
+        },
+        "counts_write": true
+      },
+      "cells": {
+        "count": 1000,
+        "prefix": "w"
+      },
+      "concurrency": 16
+    }
+  ],
+  "phases": [
+    {
+      "name": "warmup",
+      "warmup": true,
+      "duration_s": 3,
+      "rate": 100,
+      "load": [
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "100"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 1000,
+            "prefix": "w"
+          }
+        }
+      ]
+    },
+    {
+      "name": "write-100",
+      "duration_s": 15,
+      "rate": 200,
+      "load": [
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "100"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 1000,
+            "prefix": "w"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "bucket:class=cell_data,op=put",
+          "per_ok": true,
+          "max": 1.05
+        },
+        {
+          "metric": "bucket:class=cell_owner,op=get",
+          "per_ok": true,
+          "max": 1.05
+        },
+        {
+          "metric": "hist_count:durability.proof_bucket_us",
+          "per_ok": true,
+          "min": 0.95
+        },
+        {
+          "metric": "counter:core.requests",
+          "per_ok": true,
+          "max": 1.05
+        },
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "write-4096",
+      "duration_s": 15,
+      "rate": 200,
+      "load": [
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "4096"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 1000,
+            "prefix": "w"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "bucket:class=cell_data,op=put",
+          "per_ok": true,
+          "max": 1.05
+        },
+        {
+          "metric": "bucket:class=cell_owner,op=get",
+          "per_ok": true,
+          "max": 1.05
+        },
+        {
+          "metric": "hist_count:durability.proof_bucket_us",
+          "per_ok": true,
+          "min": 0.95
+        },
+        {
+          "metric": "counter:core.requests",
+          "per_ok": true,
+          "max": 1.05
+        },
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "write-65536",
+      "duration_s": 15,
+      "rate": 200,
+      "load": [
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "65536"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 1000,
+            "prefix": "w"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "bucket:class=cell_data,op=put",
+          "per_ok": true,
+          "max": 1.05
+        },
+        {
+          "metric": "bucket:class=cell_owner,op=get",
+          "per_ok": true,
+          "max": 1.05
+        },
+        {
+          "metric": "hist_count:durability.proof_bucket_us",
+          "per_ok": true,
+          "min": 0.95
+        },
+        {
+          "metric": "counter:core.requests",
+          "per_ok": true,
+          "max": 1.05
+        },
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    }
+  ],
+  "backends": [
+    "s3"
+  ]
+}

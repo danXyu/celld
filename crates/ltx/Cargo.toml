@@ -49,3 +49,10 @@ ureq = "3.4.0"
 http = "1"
 percent-encoding = "2"
 tempfile.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "ltx"
+harness = false

@@ -1,0 +1,39 @@
+{
+  "backends": [
+    "s3"
+  ],
+  "name": "F9-idle-cost",
+  "description": "Bucket requests an idle fleet makes on its own: node lease renewals, capacity samples, rebalance, waker scans. A deterministic count to compare with docs/design/dynamodb-control-plane.md. The check bounds requests per second per node.",
+  "variants": [
+    {
+      "name": "3-nodes",
+      "nodes": 3
+    },
+    {
+      "name": "10-nodes",
+      "nodes": 10
+    }
+  ],
+  "phases": [
+    {
+      "name": "idle",
+      "duration_s": 120,
+      "rate": 1,
+      "load": [
+        {
+          "request": {
+            "path": "/noop"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "bucket",
+          "per_second": true,
+          "max": 10
+        }
+      ]
+    }
+  ],
+  "verify": false
+}

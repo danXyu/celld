@@ -1,0 +1,107 @@
+{
+  "backends": [
+    "s3"
+  ],
+  "name": "F1-fleet-proof",
+  "nodes": 3,
+  "description": "Writes in a fleet are proven by followers' fsync rather than the bucket: testing.md reports ~25 ms for a fleet proof against ~600 ms for a bucket proof. Variants change the ensemble size and log transport.",
+  "env": {
+    "CELLD_PERF_BUCKET_FAULTS": "read=15,write=30,list=20,tail=10"
+  },
+  "variants": [
+    {
+      "name": "2-nodes",
+      "nodes": 2
+    },
+    {
+      "name": "3-nodes",
+      "nodes": 3
+    },
+    {
+      "name": "5-nodes",
+      "nodes": 5
+    },
+    {
+      "name": "3-nodes-stream",
+      "nodes": 3,
+      "env": {
+        "CELLD_LOG_TRANSPORT": "stream"
+      }
+    }
+  ],
+  "setup": [
+    {
+      "step": "touch",
+      "request": {
+        "path": "/do/write",
+        "query": {
+          "bytes": "100"
+        },
+        "counts_write": true
+      },
+      "cells": {
+        "count": 1000,
+        "prefix": "fp"
+      },
+      "concurrency": 16
+    }
+  ],
+  "phases": [
+    {
+      "name": "warmup",
+      "warmup": true,
+      "duration_s": 5,
+      "rate": 100,
+      "load": [
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "100"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 1000,
+            "prefix": "fp"
+          }
+        }
+      ]
+    },
+    {
+      "name": "write",
+      "duration_s": 20,
+      "rates": [
+        100,
+        300,
+        1000
+      ],
+      "load": [
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "100"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 1000,
+            "prefix": "fp"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "hist_count:durability.proof_fleet_us",
+          "per_ok": true,
+          "min": 0.9
+        },
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    }
+  ]
+}

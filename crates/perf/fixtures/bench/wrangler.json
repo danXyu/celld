@@ -1,0 +1,8 @@
+{
+  "name": "perf-bench",
+  "main": "index.js",
+  "no_bundle": true,
+  "compatibility_date": "2026-01-01",
+  "durable_objects": { "bindings": [{ "name": "BENCH", "class_name": "Bench" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Bench"] }]
+}

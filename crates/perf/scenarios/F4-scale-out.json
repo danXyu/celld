@@ -1,0 +1,77 @@
+{
+  "backends": [
+    "s3"
+  ],
+  "name": "F4-scale-out",
+  "description": "The same sharded read and write mix on 1, 2, and 4 nodes: throughput per added node.",
+  "env": {
+    "CELLD_PERF_BUCKET_FAULTS": "read=15,write=30,list=20,tail=10"
+  },
+  "variants": [
+    {
+      "name": "1-node",
+      "nodes": 1
+    },
+    {
+      "name": "2-nodes",
+      "nodes": 2
+    },
+    {
+      "name": "4-nodes",
+      "nodes": 4
+    }
+  ],
+  "setup": [
+    {
+      "step": "touch",
+      "request": {
+        "path": "/do/write",
+        "query": {
+          "bytes": "100"
+        },
+        "counts_write": true
+      },
+      "cells": {
+        "count": 4000,
+        "prefix": "so"
+      },
+      "concurrency": 16
+    }
+  ],
+  "phases": [
+    {
+      "name": "mix",
+      "duration_s": 15,
+      "rates": [
+        2000,
+        4000,
+        8000
+      ],
+      "load": [
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 4000,
+            "prefix": "so"
+          },
+          "weight": 9
+        },
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "100"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 4000,
+            "prefix": "so"
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -306,6 +306,16 @@ pub fn validate() -> anyhow::Result<()> {
     if let Some(node) = value("CELLD_NODE")? {
         crate::machine::validate_node_name(&node).map_err(|error| anyhow!("CELLD_NODE {error}"))?;
     }
+    // Injected faults exist only in a `perf` build. An ordinary build that
+    // finds one refuses to start rather than run a benchmark at full speed.
+    #[cfg(feature = "perf")]
+    crate::perf_faults::validate()?;
+    #[cfg(not(feature = "perf"))]
+    for name in ["CELLD_PERF_BUCKET_FAULTS", "CELLD_PERF_FSYNC_DELAY_US"] {
+        if std::env::var_os(name).is_some() {
+            bail!("{name} needs a celld built with the `perf` feature");
+        }
+    }
     Ok(())
 }
 

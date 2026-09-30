@@ -1,0 +1,236 @@
+name: Performance
+
+# Timed performance runs (docs/performance-tests.md): the component
+# benchmarks and the celld-perf scenarios, compared with the last successful
+# scheduled run on main. Pull requests get only the count gates and smoke
+# runs in ci.yml; timings from shared runners are too noisy to gate on.
+#
+# Set the repository variable PERF_RUNNER to a JSON runner label list, e.g.
+# ["self-hosted","perf"], to run on a dedicated machine (fixed CPU
+# frequency, nothing else running). Without it the job runs on a GitHub
+# runner: counts and failures stay meaningful, timings do not.
+on:
+  schedule:
+    # Nightly: the single-node scenarios and the fleet core.
+    - cron: "17 3 * * *"
+    # Weekly, Sunday: every scenario, including the 24-hour soak.
+    - cron: "17 5 * * 0"
+  workflow_dispatch:
+    inputs:
+      scenarios:
+        description: "Scenario names for the dev backend (default: all)"
+        default: "all"
+      fleet:
+        description: "Scenario names for the s3 backend (default: F1 F3 F5 F9 S3 S5)"
+        default: "F1 F3 F5 F9 S3 S5"
+      repeat:
+        description: "Repeats per scenario"
+        default: "3"
+
+permissions:
+  contents: read
+  actions: read
+  issues: write
+
+concurrency:
+  group: perf
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: never
+  RUST_VERSION: 1.97.1
+
+jobs:
+  perf:
+    name: Performance run
+    runs-on: ${{ vars.PERF_RUNNER && fromJSON(vars.PERF_RUNNER) || 'ubuntu-22.04' }}
+    # The weekly soak runs 24 hours; GitHub-hosted runners stop a job at six,
+    # so the weekly run needs PERF_RUNNER.
+    timeout-minutes: 1800
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: perf-lab
+
+      - name: Choose scenarios
+        id: plan
+        run: |
+          set -euo pipefail
+          weekly=false
+          if [[ "${{ github.event_name }}" == schedule && "${{ github.event.schedule }}" == "17 5 * * 0" ]]; then
+            weekly=true
+          fi
+          if [[ "${{ github.event_name }}" == workflow_dispatch ]]; then
+            echo "dev=${{ inputs.scenarios }}" >> "$GITHUB_OUTPUT"
+            echo "fleet=${{ inputs.fleet }}" >> "$GITHUB_OUTPUT"
+            echo "repeat=${{ inputs.repeat }}" >> "$GITHUB_OUTPUT"
+          elif [[ "$weekly" == true ]]; then
+            echo "dev=all S8-cold-activation-large S15-soak" >> "$GITHUB_OUTPUT"
+            echo "fleet=all" >> "$GITHUB_OUTPUT"
+            echo "repeat=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "dev=all" >> "$GITHUB_OUTPUT"
+            echo "fleet=F1 F3 F5 F9 S3 S5" >> "$GITHUB_OUTPUT"
+            echo "repeat=3" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build
+        run: cargo build --locked --profile lab -p celld -p celld-perf --features celld/perf
+
+      # MinIO's public images are gone; use its release binaries, pinned and
+      # verified the way celld-tck pins them.
+      - name: Start MinIO
+        run: |
+          set -euo pipefail
+          release=RELEASE.2025-09-07T16-13-09Z
+          mc_release=RELEASE.2025-08-13T08-35-41Z
+          case "$(uname -m)" in
+            x86_64)
+              arch=amd64
+              minio_sum=7c5bd8512c6e966455b1d198209358b2d191c77a83ab377c4073281065fb855f
+              mc_sum=01f866e9c5f9b87c2b09116fa5d7c06695b106242d829a8bb32990c00312e891 ;;
+            aarch64|arm64)
+              arch=arm64
+              minio_sum=5c83cd2cf151717ba0243f73e1c7802ff36e272b67144bdd7f1f7d684fd6f03d
+              mc_sum=14c8c9616cfce4636add161304353244e8de383b2e2752c0e9dad01d4c27c12c ;;
+          esac
+          bin="$RUNNER_TEMP/minio-bin"
+          mkdir -p "$bin"
+          curl -sSfL -o "$bin/minio" \
+            "https://github.com/minio/minio/releases/download/$release/minio.linux-$arch.$release"
+          curl -sSfL -o "$bin/mc" \
+            "https://github.com/minio/mc/releases/download/$mc_release/mc.linux-$arch.$mc_release"
+          echo "$minio_sum  $bin/minio" | sha256sum -c -
+          echo "$mc_sum  $bin/mc" | sha256sum -c -
+          chmod +x "$bin/minio" "$bin/mc"
+          export MINIO_ROOT_USER=perf MINIO_ROOT_PASSWORD=perf-disposable-password
+          nohup "$bin/minio" server "$RUNNER_TEMP/minio-data" --address 127.0.0.1:9000 \
+            > "$RUNNER_TEMP/minio.log" 2>&1 &
+          for _ in $(seq 1 60); do
+            if "$bin/mc" alias set local http://127.0.0.1:9000 perf perf-disposable-password >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          "$bin/mc" mb --ignore-existing local/perf
+          {
+            echo "AWS_ACCESS_KEY_ID=perf"
+            echo "AWS_SECRET_ACCESS_KEY=perf-disposable-password"
+          } >> "$GITHUB_ENV"
+
+      - name: Fetch the baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p baseline
+          run=$(gh run list --workflow perf.yml --branch main --status success --event schedule \
+            --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+          if [[ -n "$run" ]]; then
+            gh run download "$run" --name perf-results --dir baseline || true
+          fi
+          ls -R baseline || true
+
+      - name: Component benchmarks
+        run: |
+          set -euo pipefail
+          baseline=()
+          if [[ -d baseline/criterion ]]; then
+            mkdir -p target/criterion
+            cp -R baseline/criterion/. target/criterion/
+            baseline=(-- --baseline-lenient main)
+          fi
+          for target in "celld-ltx ltx" "celld-logic core_events" "celld-export-format export_format"; do
+            set -- $target
+            cargo bench --locked -p "$1" --bench "$2" "${baseline[@]}" | tee -a bench.txt
+          done
+          cargo bench --locked -p celld --features perf --bench perf_components "${baseline[@]}" | tee -a bench.txt
+          cargo bench --locked -p celld --features export-bench --bench export_pipeline "${baseline[@]}" | tee -a bench.txt
+
+      - name: Scenarios, single node
+        run: |
+          target/lab/celld-perf run ${{ steps.plan.outputs.dev }} \
+            --repeat ${{ steps.plan.outputs.repeat }} \
+            --celld target/lab/celld --out perf-out/dev
+
+      - name: Scenarios, fleet
+        if: always()
+        run: |
+          target/lab/celld-perf run ${{ steps.plan.outputs.fleet }} \
+            --backend s3 --bucket s3://perf --endpoint http://127.0.0.1:9000 \
+            --repeat ${{ steps.plan.outputs.repeat }} \
+            --celld target/lab/celld --out perf-out/fleet
+
+      - name: Compare with the baseline
+        id: compare
+        if: always()
+        run: |
+          set -uo pipefail
+          status=0
+          : > compare.txt
+          for kind in dev fleet; do
+            new=$(ls perf-out/$kind/*/result.json 2>/dev/null | head -1)
+            old=$(ls baseline/$kind/*/result.json 2>/dev/null | head -1)
+            if [[ -n "$new" && -n "$old" ]]; then
+              echo "== $kind" >> compare.txt
+              target/lab/celld-perf compare "$old" "$new" >> compare.txt || status=1
+            fi
+          done
+          # Criterion flags its own changes; they inform, the scenarios gate.
+          if grep -q "Performance has regressed" bench.txt 2>/dev/null; then
+            echo "== component benchmarks Criterion flagged (not gating)" >> compare.txt
+            grep -B2 "Performance has regressed" bench.txt >> compare.txt
+          fi
+          cat compare.txt
+          echo "regressed=$status" >> "$GITHUB_OUTPUT"
+          exit $status
+
+      - name: Save results
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p perf-results
+          cp -R perf-out/. perf-results/ 2>/dev/null || true
+          # Criterion's saved estimates are the next run's baseline.
+          if [[ -d target/criterion ]]; then
+            find target/criterion -name '*.json' -path '*/new/*' | while read -r file; do
+              dest="perf-results/criterion/${file#target/criterion/}"
+              dest="${dest/\/new\//\/main\/}"
+              mkdir -p "$(dirname "$dest")"
+              cp "$file" "$dest"
+            done
+          fi
+          cp bench.txt compare.txt perf-results/ 2>/dev/null || true
+          # Node working directories are large; keep their logs.
+          find perf-results -type d -name project -prune -exec rm -rf {} +
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: perf-results
+          path: perf-results
+          retention-days: 90
+
+      - name: Report a regression
+        if: failure() && github.event_name == 'schedule' && steps.compare.outputs.regressed == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          title="Performance regression in the scheduled run"
+          body=$(printf 'Run: %s/%s/actions/runs/%s\n\n```\n%s\n```\n' \
+            "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$(head -c 60000 compare.txt)")
+          existing=$(gh issue list --state open --search "\"$title\" in:title" --json number --jq '.[0].number // empty')
+          if [[ -n "$existing" ]]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi

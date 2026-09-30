@@ -1,0 +1,318 @@
+{
+  "name": "S12-services",
+  "fixture": "services",
+  "description": "Each platform service in turn: KV (one namespace is one cell), D1 run and batch, R2 by object size, Queue send (delivery lag in the after step), and Workflow creation.",
+  "setup": [
+    {
+      "step": "touch",
+      "request": {
+        "path": "/kv/put",
+        "query": {
+          "bytes": "100"
+        }
+      },
+      "cells": {
+        "count": 1000,
+        "prefix": "k"
+      },
+      "concurrency": 16
+    },
+    {
+      "step": "touch",
+      "request": {
+        "path": "/r2/put",
+        "query": {
+          "bytes": "1024"
+        }
+      },
+      "cells": {
+        "count": 200,
+        "prefix": "small"
+      },
+      "concurrency": 64
+    },
+    {
+      "step": "touch",
+      "request": {
+        "path": "/r2/put",
+        "query": {
+          "bytes": "1048576"
+        }
+      },
+      "cells": {
+        "count": 20,
+        "prefix": "large"
+      },
+      "concurrency": 8
+    }
+  ],
+  "phases": [
+    {
+      "name": "kv-get",
+      "duration_s": 10,
+      "rate": 1000,
+      "load": [
+        {
+          "request": {
+            "path": "/kv/get"
+          },
+          "cells": {
+            "count": 1000,
+            "prefix": "k"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "kv-put",
+      "duration_s": 10,
+      "rate": 200,
+      "load": [
+        {
+          "request": {
+            "path": "/kv/put",
+            "query": {
+              "bytes": "100"
+            }
+          },
+          "cells": {
+            "count": 1000,
+            "prefix": "k"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "kv-put-large",
+      "duration_s": 10,
+      "rate": 10,
+      "load": [
+        {
+          "request": {
+            "path": "/kv/put",
+            "query": {
+              "bytes": "1100000"
+            }
+          },
+          "cells": {
+            "count": 50,
+            "prefix": "kl"
+          }
+        }
+      ]
+    },
+    {
+      "name": "kv-list",
+      "duration_s": 10,
+      "rate": 50,
+      "load": [
+        {
+          "request": {
+            "path": "/kv/list",
+            "query": {
+              "limit": "100"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "d1-run",
+      "duration_s": 10,
+      "rate": 200,
+      "load": [
+        {
+          "request": {
+            "path": "/d1/run"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "d1-batch-10",
+      "duration_s": 10,
+      "rate": 100,
+      "load": [
+        {
+          "request": {
+            "path": "/d1/batch",
+            "query": {
+              "n": "10"
+            }
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "d1-read",
+      "duration_s": 10,
+      "rate": 500,
+      "load": [
+        {
+          "request": {
+            "path": "/d1/read",
+            "query": {
+              "limit": "20"
+            }
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "r2-get-1k",
+      "duration_s": 10,
+      "rate": 500,
+      "load": [
+        {
+          "request": {
+            "path": "/r2/get"
+          },
+          "cells": {
+            "count": 200,
+            "prefix": "small"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "r2-get-1m",
+      "duration_s": 10,
+      "rate": 50,
+      "load": [
+        {
+          "request": {
+            "path": "/r2/get"
+          },
+          "cells": {
+            "count": 20,
+            "prefix": "large"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "r2-list",
+      "duration_s": 10,
+      "rate": 20,
+      "load": [
+        {
+          "request": {
+            "path": "/r2/list",
+            "query": {
+              "limit": "100"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "queue-send",
+      "duration_s": 10,
+      "rate": 500,
+      "load": [
+        {
+          "request": {
+            "path": "/queue/send",
+            "query": {
+              "bytes": "100"
+            }
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "workflow-create",
+      "duration_s": 10,
+      "rate": 20,
+      "load": [
+        {
+          "request": {
+            "path": "/wf/create",
+            "query": {
+              "steps": "3"
+            }
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    }
+  ],
+  "after": [
+    {
+      "step": "sleep",
+      "ms": 5000
+    },
+    {
+      "step": "collect",
+      "request": {
+        "path": "/stats",
+        "query": {
+          "kind": "queue"
+        }
+      }
+    },
+    {
+      "step": "collect",
+      "request": {
+        "path": "/stats",
+        "query": {
+          "kind": "workflow"
+        }
+      }
+    }
+  ],
+  "verify": false
+}
