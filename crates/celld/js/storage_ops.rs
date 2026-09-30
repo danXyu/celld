@@ -1014,7 +1014,7 @@ impl v8::ValueDeserializerImpl for TransientCloneDelegate<'_> {
     }
 }
 
-fn serialize_storage_value(
+pub(crate) fn serialize_storage_value(
     scope: &mut v8::PinScope,
     value: v8::Local<v8::Value>,
 ) -> Option<Vec<u8>> {
@@ -1035,7 +1035,7 @@ fn serialize_storage_value(
     Some(bytes)
 }
 
-pub(super) fn deserialize_storage_value<'s>(
+pub(crate) fn deserialize_storage_value<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     value: storage::StoredValue,
 ) -> Option<v8::Local<'s, v8::Value>> {

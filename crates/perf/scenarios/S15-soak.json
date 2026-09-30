@@ -1,0 +1,1180 @@
+{
+  "name": "S15-soak",
+  "heavy": true,
+  "description": "24 hours of mixed traffic at a moderate rate: RSS, descriptor, local-cache, and object growth, and p99 drift. Compare the first and last hour's phases.",
+  "env": {
+    "CELLD_PERF_BUCKET_FAULTS": "read=15,write=30,list=20,tail=10",
+    "CELLD_MAX_RESIDENT_CELLS": "5000"
+  },
+  "setup": [
+    {
+      "step": "touch",
+      "request": {
+        "path": "/do/write",
+        "query": {
+          "bytes": "100"
+        },
+        "counts_write": true
+      },
+      "cells": {
+        "count": 20000,
+        "prefix": "soak"
+      },
+      "concurrency": 16
+    }
+  ],
+  "phases": [
+    {
+      "name": "hour-00",
+      "duration_s": 3600,
+      "rate": 300,
+      "load": [
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 6
+        },
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "200"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 3
+        },
+        {
+          "request": {
+            "path": "/noop"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "hour-01",
+      "duration_s": 3600,
+      "rate": 300,
+      "load": [
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 6
+        },
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "200"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 3
+        },
+        {
+          "request": {
+            "path": "/noop"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "hour-02",
+      "duration_s": 3600,
+      "rate": 300,
+      "load": [
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 6
+        },
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "200"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 3
+        },
+        {
+          "request": {
+            "path": "/noop"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "hour-03",
+      "duration_s": 3600,
+      "rate": 300,
+      "load": [
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 6
+        },
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "200"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 3
+        },
+        {
+          "request": {
+            "path": "/noop"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "hour-04",
+      "duration_s": 3600,
+      "rate": 300,
+      "load": [
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 6
+        },
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "200"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 3
+        },
+        {
+          "request": {
+            "path": "/noop"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "hour-05",
+      "duration_s": 3600,
+      "rate": 300,
+      "load": [
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 6
+        },
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "200"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 3
+        },
+        {
+          "request": {
+            "path": "/noop"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "hour-06",
+      "duration_s": 3600,
+      "rate": 300,
+      "load": [
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 6
+        },
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "200"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 3
+        },
+        {
+          "request": {
+            "path": "/noop"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "hour-07",
+      "duration_s": 3600,
+      "rate": 300,
+      "load": [
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 6
+        },
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "200"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 3
+        },
+        {
+          "request": {
+            "path": "/noop"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "hour-08",
+      "duration_s": 3600,
+      "rate": 300,
+      "load": [
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 6
+        },
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "200"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 3
+        },
+        {
+          "request": {
+            "path": "/noop"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "hour-09",
+      "duration_s": 3600,
+      "rate": 300,
+      "load": [
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 6
+        },
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "200"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 3
+        },
+        {
+          "request": {
+            "path": "/noop"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "hour-10",
+      "duration_s": 3600,
+      "rate": 300,
+      "load": [
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 6
+        },
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "200"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 3
+        },
+        {
+          "request": {
+            "path": "/noop"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "hour-11",
+      "duration_s": 3600,
+      "rate": 300,
+      "load": [
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 6
+        },
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "200"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 3
+        },
+        {
+          "request": {
+            "path": "/noop"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "hour-12",
+      "duration_s": 3600,
+      "rate": 300,
+      "load": [
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 6
+        },
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "200"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 3
+        },
+        {
+          "request": {
+            "path": "/noop"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "hour-13",
+      "duration_s": 3600,
+      "rate": 300,
+      "load": [
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 6
+        },
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "200"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 3
+        },
+        {
+          "request": {
+            "path": "/noop"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "hour-14",
+      "duration_s": 3600,
+      "rate": 300,
+      "load": [
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 6
+        },
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "200"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 3
+        },
+        {
+          "request": {
+            "path": "/noop"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "hour-15",
+      "duration_s": 3600,
+      "rate": 300,
+      "load": [
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 6
+        },
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "200"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 3
+        },
+        {
+          "request": {
+            "path": "/noop"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "hour-16",
+      "duration_s": 3600,
+      "rate": 300,
+      "load": [
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 6
+        },
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "200"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 3
+        },
+        {
+          "request": {
+            "path": "/noop"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "hour-17",
+      "duration_s": 3600,
+      "rate": 300,
+      "load": [
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 6
+        },
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "200"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 3
+        },
+        {
+          "request": {
+            "path": "/noop"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "hour-18",
+      "duration_s": 3600,
+      "rate": 300,
+      "load": [
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 6
+        },
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "200"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 3
+        },
+        {
+          "request": {
+            "path": "/noop"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "hour-19",
+      "duration_s": 3600,
+      "rate": 300,
+      "load": [
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 6
+        },
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "200"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 3
+        },
+        {
+          "request": {
+            "path": "/noop"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "hour-20",
+      "duration_s": 3600,
+      "rate": 300,
+      "load": [
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 6
+        },
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "200"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 3
+        },
+        {
+          "request": {
+            "path": "/noop"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "hour-21",
+      "duration_s": 3600,
+      "rate": 300,
+      "load": [
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 6
+        },
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "200"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 3
+        },
+        {
+          "request": {
+            "path": "/noop"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "hour-22",
+      "duration_s": 3600,
+      "rate": 300,
+      "load": [
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 6
+        },
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "200"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 3
+        },
+        {
+          "request": {
+            "path": "/noop"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "hour-23",
+      "duration_s": 3600,
+      "rate": 300,
+      "load": [
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 6
+        },
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "200"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 20000,
+            "prefix": "soak",
+            "distribution": "shifting",
+            "window": 4000,
+            "shift_per_s": 2
+          },
+          "weight": 3
+        },
+        {
+          "request": {
+            "path": "/noop"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    }
+  ]
+}

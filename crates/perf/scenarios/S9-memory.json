@@ -1,0 +1,60 @@
+{
+  "name": "S9-memory",
+  "description": "Memory per resident cell, then after every cell is evicted. Read rss_bytes_max per phase against the resident count in end_state.",
+  "setup": [
+    {
+      "step": "touch",
+      "request": {
+        "path": "/do/write",
+        "query": {
+          "bytes": "100"
+        },
+        "counts_write": true
+      },
+      "cells": {
+        "count": 10000,
+        "prefix": "mem"
+      },
+      "concurrency": 16
+    }
+  ],
+  "phases": [
+    {
+      "name": "resident",
+      "duration_s": 10,
+      "rate": 100,
+      "load": [
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 10000,
+            "prefix": "mem"
+          }
+        }
+      ]
+    },
+    {
+      "name": "evicted",
+      "before": [
+        {
+          "step": "evict_all"
+        },
+        {
+          "step": "sleep",
+          "ms": 5000
+        }
+      ],
+      "duration_s": 10,
+      "rate": 10,
+      "load": [
+        {
+          "request": {
+            "path": "/noop"
+          }
+        }
+      ]
+    }
+  ]
+}

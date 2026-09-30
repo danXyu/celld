@@ -1,0 +1,68 @@
+{
+  "name": "S1-stateless-ceiling",
+  "description": "A stateless Worker at rising rates: peak requests per second, CPU per request, and latency at fractions of the peak. Sweep CELLD_MAX_STATELESS_ISOLATES and CELLD_TOKIO_THREADS with --env.",
+  "phases": [
+    {
+      "name": "warmup",
+      "warmup": true,
+      "duration_s": 3,
+      "rate": 500,
+      "load": [
+        {
+          "request": {
+            "path": "/noop"
+          }
+        }
+      ]
+    },
+    {
+      "name": "noop",
+      "duration_s": 10,
+      "rates": [
+        1000,
+        2000,
+        4000,
+        8000,
+        16000
+      ],
+      "load": [
+        {
+          "request": {
+            "path": "/noop"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "bucket:class=cell_owner+cell_data",
+          "max": 0
+        },
+        {
+          "metric": "counter:core.requests",
+          "max": 0
+        }
+      ]
+    },
+    {
+      "name": "cpu-10k",
+      "duration_s": 10,
+      "rates": [
+        500,
+        1000,
+        2000,
+        4000
+      ],
+      "load": [
+        {
+          "request": {
+            "path": "/cpu",
+            "query": {
+              "iters": "10000"
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "verify": false
+}

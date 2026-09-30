@@ -50,12 +50,21 @@ impl ProductionDomain {
         Self {
             owner,
             services,
-            filesystem: Arc::new(celld_ltx::DirectFileSystem),
+            filesystem: node_filesystem(),
             next_core_request: AtomicU64::new(1),
             next_async_op: AtomicU64::new(1),
             process_tag: u64::from(std::process::id()),
         }
     }
+}
+
+/// The node's filesystem: the direct one, under a `perf` build's injected
+/// fsync delay when the process sets one.
+fn node_filesystem() -> Arc<dyn celld_ltx::FileSystem> {
+    let direct: Arc<dyn celld_ltx::FileSystem> = Arc::new(celld_ltx::DirectFileSystem);
+    #[cfg(feature = "perf")]
+    let direct = crate::perf_faults::filesystem(direct);
+    direct
 }
 
 fn current_domain() -> &'static ProductionDomain {

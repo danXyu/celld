@@ -1,0 +1,92 @@
+{
+  "name": "S14-overheads",
+  "description": "The warm read and write paths with optional features on: compare each variant's p99 and cpu with the base variant.",
+  "env": {
+    "CELLD_PERF_BUCKET_FAULTS": "read=15,write=30,list=20,tail=10"
+  },
+  "variants": [
+    {
+      "name": "base",
+      "env": {}
+    },
+    {
+      "name": "otel-bucket",
+      "env": {
+        "CELLD_OTEL": "1"
+      }
+    },
+    {
+      "name": "export",
+      "env": {
+        "CELLD_EXPORT": "1"
+      }
+    }
+  ],
+  "setup": [
+    {
+      "step": "touch",
+      "request": {
+        "path": "/do/write",
+        "query": {
+          "bytes": "100"
+        },
+        "counts_write": true
+      },
+      "cells": {
+        "count": 1000,
+        "prefix": "ovh"
+      },
+      "concurrency": 16
+    }
+  ],
+  "phases": [
+    {
+      "name": "read",
+      "duration_s": 15,
+      "rate": 2000,
+      "load": [
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 1000,
+            "prefix": "ovh"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "write",
+      "duration_s": 15,
+      "rate": 200,
+      "load": [
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "100"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 1000,
+            "prefix": "ovh"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    }
+  ]
+}

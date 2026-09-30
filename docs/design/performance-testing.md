@@ -1,7 +1,9 @@
 # Performance testing: a plan for measuring celld end to end
 
-Status: plan, revision 1, 2026-09-29. Nothing in this document is
-implemented except the export benchmarks it builds on.
+Status: revision 2, 2026-09-30. Tiers 0 to 3 are implemented; see
+[performance-tests.md](../performance-tests.md) for how to run them and
+[What was built](#what-was-built) for where the implementation departs
+from this plan. Tier 4 is not.
 
 celld has two Criterion targets today, and both measure change export
 ([export-benchmarks.md](../export-benchmarks.md)). They time JSON and
@@ -34,6 +36,7 @@ cadence for running each tier in CI.
 - [Bottleneck hypotheses](#bottleneck-hypotheses)
 - [Milestones](#milestones)
 - [Open questions](#open-questions)
+- [What was built](#what-was-built)
 
 ## Goals and non-goals
 
@@ -422,3 +425,89 @@ cost even if the later ones never happen.
 - **Are the lab's numbers still true?** Several were measured before
   `celld-ltx` replaced the external replicator. Milestone 3 may show that
   testing.md needs a correction before it shows a regression.
+
+## What was built
+
+Revision 2 implements milestones 1 to 4, and the fleet scenarios of
+milestone 5 in this repository. Where the implementation departs from the
+plan above:
+
+- **Metrics exposure.** It is a JSON snapshot, `GET /debug/metrics` on the
+  internal listener. There is no Prometheus endpoint. The instruments are
+  static arrays in `crates/celld/perf_stats.rs`, always on. The bucket
+  counters come from one wrapper installed where each store is built
+  (`perf_store.rs`), so no call site changed. Paged-restore page faults
+  sign their own requests and are not counted.
+- **Fault seams.** The `perf` feature exposes a slow or throttling bucket
+  (`CELLD_PERF_BUCKET_FAULTS`) and a slow fsync
+  (`CELLD_PERF_FSYNC_DELAY_US`) to a node started as a subprocess, and not
+  only to in-process tests. An ordinary build refuses both variables. The
+  `LogTransport` injector was not built; delay and loss between nodes are
+  left to `tc netem`.
+- **Count tests.** They are integration tests in `crates/celld`, where the
+  test can start the `celld` binary it was built with. They are not in the
+  harness crate. The core-round-trip gate counts `core.requests` and
+  `core.outputs`, one each per DO request. `core.messages` is three per
+  request, because the activity-finished notice is a message too.
+- **Scenario files.** They are JSON, not TOML, so the harness adds no
+  dependency. Variants, per-node environment, timed steps during a phase
+  (kill, freeze, start, redeploy), and a per-second timeline were added so
+  that the fleet scenarios fit the same format.
+- **Where the fleet scenarios live.** The fleet scenarios (F1 to F9, F11)
+  run from this repository, on the `s3` backend against MinIO. They do not
+  run in celld-tck. The harness starts every node on one machine. F10
+  (contended activation) was not built.
+- **Service time.** Each phase reports service time (from send) beside
+  latency (from schedule). On macOS the generator's timer can fire a
+  millisecond late, and this separates the generator's lateness from the
+  node's.
+- **CI.** Pull requests run the count gates, every Criterion target in test
+  mode, and `celld-perf run smoke`. `.github/workflows/perf.yml` runs
+  nightly and weekly, on a runner named by the `PERF_RUNNER` variable. It
+  compares each run with the last nightly on main, and opens an issue on a
+  regression.
+
+The first runs found one defect. `Effect::StartRuntime` runs
+`RuntimeManager::start_cell` in a future that the core thread polls, and
+`Worker::own_cell` opens the cell's SQLite database inside it: the open,
+the schema, and WAL writes. A burst of new cells therefore occupies the
+thread that renews the node lease. In a macOS `sample` of a lab-build node
+receiving 150 first activations per second, 2,064 of 2,200 core-thread
+samples were in that open. `loop.core_lag_us` reached p99 18 s. At 300 per
+second the node missed its renewal and fenced itself. `S16-activation-rate`
+reproduces it. The other scenarios activate their setup cells 16 at a
+time, so they measure what they are for.
+
+The other findings of the first runs were:
+
+- **Residency churn has a ceiling.** With `CELLD_MAX_RESIDENT_CELLS=200`
+  and S3-like bucket latency, a lone node sustained about 10 evict-and-restore
+  activations a second (restore p50 303 ms). At 25 a second requests waited
+  about 15 s for capacity and failed with `CapacityExhausted` (S8).
+- **The dev store is not a bucket.** On the dev store, 200 writes a second
+  over 1,000 cells took p50 540 ms. On MinIO, with the same injected
+  latency, they took p50 96 ms. Both made two bucket requests per write.
+  The dev store fsyncs every object under one SQLite writer.
+- **Capture fsyncs add up per round.** In a three-node fleet on macOS, a
+  ship round's captures fsync each cell's L0 file. At 300 writes a second a
+  round carried about 28 cells, and its fsyncs summed to p50 418 ms against a
+  capture of 336 ms: nearly serial. The fleet proof went from p50 76 ms at 100
+  writes a second to 1.9 s at 300. macOS fsync is slow, so confirm this on
+  Linux before acting on it.
+- **The takeover works.** A killed owner's cells answered "owner
+  unreachable" for about the lease TTL (10 s), then served again, with no
+  acknowledged write lost (F5).
+
+The runs also point at costs to look at next:
+
+- the pressure victim scan clones every candidate's cell id (about 200 ns
+  per resident cell);
+- rebalance selection clones and sorts every dormant id, even for a budget
+  of one;
+- `request_authorized` removes and reinserts each cell in the core's cell
+  map on every request, which is most of the growth from 10 to 1M known
+  cells in `core_request`.
+
+A debug build's core thread falls behind its lease renewals at 1,000
+requests per second, and the node fences itself.
+

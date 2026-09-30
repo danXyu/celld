@@ -1,0 +1,68 @@
+{
+  "backends": [
+    "s3"
+  ],
+  "name": "F8-bucket-throttle",
+  "nodes": 3,
+  "description": "The bucket answers a fraction of requests with 429: throughput may fall, but bucket requests per second must not rise (no amplification). Compare variants with celld-perf compare.",
+  "variants": [
+    {
+      "name": "none",
+      "env": {
+        "CELLD_PERF_BUCKET_FAULTS": "read=15,write=30,list=20,tail=10"
+      }
+    },
+    {
+      "name": "10pct",
+      "env": {
+        "CELLD_PERF_BUCKET_FAULTS": "read=15,write=30,list=20,tail=10,throttle=0.1"
+      }
+    },
+    {
+      "name": "50pct",
+      "env": {
+        "CELLD_PERF_BUCKET_FAULTS": "read=15,write=30,list=20,tail=10,throttle=0.5"
+      }
+    }
+  ],
+  "setup": [
+    {
+      "step": "touch",
+      "request": {
+        "path": "/do/write",
+        "query": {
+          "bytes": "100"
+        },
+        "counts_write": true
+      },
+      "cells": {
+        "count": 1000,
+        "prefix": "thr"
+      },
+      "concurrency": 16
+    }
+  ],
+  "phases": [
+    {
+      "name": "write",
+      "duration_s": 30,
+      "rate": 500,
+      "timeout_ms": 60000,
+      "load": [
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "100"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 1000,
+            "prefix": "thr"
+          }
+        }
+      ]
+    }
+  ]
+}

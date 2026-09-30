@@ -1,0 +1,101 @@
+{
+  "backends": [
+    "s3"
+  ],
+  "name": "F5-takeover",
+  "nodes": 3,
+  "description": "An owner is killed mid-load (SIGKILL), and its cells move: the timeline shows how long its cells were unavailable, and the verification sweep that no acknowledged write was lost. Traffic enters through node 0, which is never killed. A second phase kills a node and deletes its disk.",
+  "env": {
+    "CELLD_PERF_BUCKET_FAULTS": "read=15,write=30,list=20,tail=10"
+  },
+  "setup": [
+    {
+      "step": "touch",
+      "request": {
+        "path": "/do/write",
+        "query": {
+          "bytes": "100"
+        },
+        "counts_write": true
+      },
+      "cells": {
+        "count": 1000,
+        "prefix": "to"
+      },
+      "concurrency": 16
+    }
+  ],
+  "phases": [
+    {
+      "name": "kill",
+      "duration_s": 60,
+      "rate": 300,
+      "timeout_ms": 60000,
+      "load": [
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "100"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 1000,
+            "prefix": "to"
+          },
+          "node": 0
+        }
+      ],
+      "during": [
+        {
+          "at_s": 10,
+          "step": "signal",
+          "node": 1,
+          "signal": "KILL"
+        },
+        {
+          "at_s": 40,
+          "step": "start",
+          "node": 1
+        }
+      ]
+    },
+    {
+      "name": "kill-disk-loss",
+      "duration_s": 60,
+      "rate": 300,
+      "timeout_ms": 60000,
+      "load": [
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "100"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 1000,
+            "prefix": "to"
+          },
+          "node": 0
+        }
+      ],
+      "during": [
+        {
+          "at_s": 10,
+          "step": "signal",
+          "node": 2,
+          "signal": "KILL"
+        },
+        {
+          "at_s": 40,
+          "step": "start",
+          "node": 2,
+          "wipe_local": true
+        }
+      ]
+    }
+  ]
+}

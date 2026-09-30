@@ -129,3 +129,22 @@ jobs:
         run: |
           cargo test -p celld-export-format --bench export_format --locked -- --test
           cargo test -p celld --features export-bench --bench export_pipeline --locked -- --test
+
+      # The component benchmarks (docs/performance-tests.md), each case once
+      # in Criterion's test mode: fixtures and paths, never timing. The ltx
+      # and core targets build optimized (`cargo bench`): they are small and
+      # need no V8, and their largest fixtures take minutes unoptimized.
+      - name: Smoke test component benchmarks
+        run: |
+          cargo bench -p celld-ltx --bench ltx --locked -- --test
+          cargo bench -p celld-logic --bench core_events --locked -- --test
+          cargo test -p celld --features perf --bench perf_components --locked -- --test
+
+      # The celld-perf harness end to end against the debug node, at low
+      # rates: its count checks and the verification sweep fail the job;
+      # its timings are only reported. `Test` above already ran the count
+      # tests in crates/celld/tests/perf_counts.rs.
+      - name: Smoke test the performance harness
+        run: |
+          cargo build --locked -p celld -p celld-perf
+          target/debug/celld-perf run smoke --celld target/debug/celld --out "$RUNNER_TEMP/perf"

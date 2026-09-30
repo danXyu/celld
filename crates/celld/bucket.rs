@@ -645,9 +645,9 @@ impl Bucket {
     pub(crate) fn open_dev(database: &std::path::Path) -> anyhow::Result<Bucket> {
         let store = Arc::new(crate::local_store::LocalStore::open(database)?);
         Ok(Bucket {
-            store: store.clone(),
-            paginated: store.clone(),
-            cas_store: store,
+            store: crate::perf_store::wrap(store.clone()),
+            paginated: crate::perf_store::wrap_paginated(store.clone()),
+            cas_store: crate::perf_store::wrap(store),
             backend: StorageBackend::Local,
             name: database.display().to_string(),
             prefix: String::new(),
@@ -827,9 +827,9 @@ impl Bucket {
             }
         };
         Ok(Bucket {
-            store,
-            paginated,
-            cas_store,
+            store: crate::perf_store::wrap(store),
+            paginated: crate::perf_store::wrap_paginated(paginated),
+            cas_store: crate::perf_store::wrap(cas_store),
             backend,
             name: bucket.to_string(),
             prefix,

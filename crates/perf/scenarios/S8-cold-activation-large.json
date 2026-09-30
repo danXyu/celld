@@ -1,0 +1,87 @@
+{
+  "name": "S8-cold-activation-large",
+  "description": "Cold activation of large cells on a real bucket: 16 cells of 64 MiB, then 4 of 300 MiB restored through the paged VFS (CELLD_LTX_PAGED). The paged fault path signs its own S3 requests, so it needs the s3 backend. Heavy: several GiB of bucket data.",
+  "heavy": true,
+  "env": {
+    "CELLD_LTX_PAGED": "1"
+  },
+  "setup": [
+    {
+      "step": "touch",
+      "request": {
+        "path": "/do/blob",
+        "query": {
+          "kb": "65536"
+        }
+      },
+      "cells": {
+        "count": 16,
+        "prefix": "big64"
+      },
+      "concurrency": 4
+    },
+    {
+      "step": "touch",
+      "request": {
+        "path": "/do/blob",
+        "query": {
+          "kb": "307200"
+        }
+      },
+      "cells": {
+        "count": 4,
+        "prefix": "big300"
+      },
+      "concurrency": 1
+    },
+    {
+      "step": "restart",
+      "wipe_local": true
+    }
+  ],
+  "phases": [
+    {
+      "name": "64MiB",
+      "duration_s": 10,
+      "rate": 2,
+      "timeout_ms": 120000,
+      "load": [
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 16,
+            "prefix": "big64"
+          }
+        }
+      ]
+    },
+    {
+      "name": "300MiB-paged",
+      "duration_s": 10,
+      "rate": 1,
+      "timeout_ms": 120000,
+      "load": [
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 4,
+            "prefix": "big300"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "hist_count:activation.paged_us",
+          "min": 1
+        }
+      ]
+    }
+  ],
+  "backends": [
+    "s3"
+  ]
+}

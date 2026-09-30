@@ -1,0 +1,18 @@
+{
+  "name": "perf-services",
+  "main": "index.js",
+  "no_bundle": true,
+  "compatibility_date": "2026-08-18",
+  "kv_namespaces": [{ "binding": "KV", "id": "perf-kv" }],
+  "d1_databases": [
+    { "binding": "DB", "database_name": "perf-db", "database_id": "00000000-0000-0000-0000-000000000001" }
+  ],
+  "r2_buckets": [{ "binding": "FILES", "bucket_name": "perf-files" }],
+  "queues": {
+    "producers": [{ "binding": "JOBS", "queue": "perf-jobs" }],
+    "consumers": [{ "queue": "perf-jobs", "max_batch_size": 100, "max_batch_timeout": 1 }]
+  },
+  "workflows": [{ "binding": "FLOWS", "name": "perf-flow", "class_name": "Flow" }],
+  "durable_objects": { "bindings": [{ "name": "STATS", "class_name": "Stats" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Stats"] }]
+}

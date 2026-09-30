@@ -382,6 +382,13 @@ pub mod ownership_store;
 pub mod parquet_batch;
 pub mod peer_auth;
 pub mod peer_probe;
+#[cfg(feature = "perf")]
+#[doc(hidden)]
+pub mod perf_bench;
+#[cfg(feature = "perf")]
+pub mod perf_faults;
+pub mod perf_stats;
+pub mod perf_store;
 pub mod pool;
 pub mod preview_cli;
 pub mod preview_seed;

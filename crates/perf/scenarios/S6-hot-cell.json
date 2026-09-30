@@ -1,0 +1,101 @@
+{
+  "name": "S6-hot-cell",
+  "description": "One cell at rising rates, then the same cell while its isolate neighbours are busy (up to 32 cells share an isolate). Rejections past CELLD_MAX_CELL_REQUESTS show as http_5xx errors.",
+  "setup": [
+    {
+      "step": "touch",
+      "request": {
+        "path": "/do/write",
+        "query": {
+          "bytes": "10"
+        },
+        "counts_write": true
+      },
+      "cells": {
+        "count": 1,
+        "prefix": "hot"
+      },
+      "concurrency": 64
+    },
+    {
+      "step": "touch",
+      "request": {
+        "path": "/do/write",
+        "query": {
+          "bytes": "10"
+        },
+        "counts_write": true
+      },
+      "cells": {
+        "count": 31,
+        "prefix": "nb"
+      },
+      "concurrency": 64
+    }
+  ],
+  "phases": [
+    {
+      "name": "alone",
+      "duration_s": 10,
+      "rates": [
+        1000,
+        2000,
+        4000,
+        8000
+      ],
+      "load": [
+        {
+          "request": {
+            "path": "/do/noop"
+          },
+          "cells": {
+            "count": 1,
+            "prefix": "hot"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "bucket:class=cell_owner+cell_data",
+          "per_ok": true,
+          "max": 0
+        }
+      ]
+    },
+    {
+      "name": "with-neighbours",
+      "duration_s": 10,
+      "rate": 4000,
+      "load": [
+        {
+          "request": {
+            "path": "/do/noop"
+          },
+          "cells": {
+            "count": 1,
+            "prefix": "hot"
+          },
+          "label": "hot"
+        },
+        {
+          "request": {
+            "path": "/do/noop"
+          },
+          "cells": {
+            "count": 31,
+            "prefix": "nb"
+          },
+          "weight": 3,
+          "label": "neighbours"
+        }
+      ],
+      "checks": [
+        {
+          "metric": "bucket:class=cell_owner+cell_data",
+          "per_ok": true,
+          "max": 0
+        }
+      ]
+    }
+  ]
+}

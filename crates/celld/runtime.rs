@@ -2503,6 +2503,14 @@ impl StatelessTiming {
     }
 
     fn emit(&self) {
+        crate::perf_stats::record(
+            crate::perf_stats::Hist::StatelessFetch,
+            self.queued_at.elapsed().as_micros() as u64,
+        );
+        crate::perf_stats::record(
+            crate::perf_stats::Hist::StatelessQueue,
+            self.admitted.duration_since(self.queued_at).as_micros() as u64,
+        );
         if let Some(ids) = self.trace {
             let total_us = self.queued_at.elapsed().as_micros() as i64;
             let mut span = crate::telemetry::Span::new(ids, self.span_name, self.span_kind);
@@ -2754,6 +2762,7 @@ struct CellIsolateStartupTiming {
 impl CellIsolateStartupTiming {
     fn emit(&self, outcome: &str, failure_phase: &str) -> u64 {
         let total_us = self.started.elapsed().as_micros() as u64;
+        crate::perf_stats::record(crate::perf_stats::Hist::IsolateStartup, total_us);
         if let Some(ids) =
             crate::telemetry::start_trace().and_then(crate::telemetry::TraceContext::recording_ids)
         {

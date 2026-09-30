@@ -1,0 +1,66 @@
+{
+  "backends": [
+    "s3"
+  ],
+  "name": "F7-frozen-owner",
+  "nodes": 3,
+  "description": "An owner is frozen (SIGSTOP) past its lease, then thawed: its cells move, and the thawed node must fence itself rather than serve old state.",
+  "env": {
+    "CELLD_PERF_BUCKET_FAULTS": "read=15,write=30,list=20,tail=10"
+  },
+  "setup": [
+    {
+      "step": "touch",
+      "request": {
+        "path": "/do/write",
+        "query": {
+          "bytes": "100"
+        },
+        "counts_write": true
+      },
+      "cells": {
+        "count": 500,
+        "prefix": "fz"
+      },
+      "concurrency": 128
+    }
+  ],
+  "phases": [
+    {
+      "name": "freeze",
+      "duration_s": 60,
+      "rate": 200,
+      "timeout_ms": 60000,
+      "load": [
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "100"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 500,
+            "prefix": "fz"
+          },
+          "node": 0
+        }
+      ],
+      "during": [
+        {
+          "at_s": 10,
+          "step": "signal",
+          "node": 1,
+          "signal": "STOP"
+        },
+        {
+          "at_s": 35,
+          "step": "signal",
+          "node": 1,
+          "signal": "CONT"
+        }
+      ]
+    }
+  ]
+}
