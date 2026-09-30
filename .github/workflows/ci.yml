@@ -45,6 +45,18 @@ jobs:
     name: Lint and test
     runs-on: ubuntu-22.04
     timeout-minutes: 90
+    # A single-node Kafka for the export Kafka sink's tests against a real
+    # broker (CELLD_TEST_KAFKA_BROKERS); without it they skip.
+    services:
+      kafka:
+        image: apache/kafka:3.9.1
+        ports:
+          - 9092:9092
+        options: >-
+          --health-cmd "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"
+          --health-interval 5s
+          --health-timeout 10s
+          --health-retries 20
     steps:
       - uses: actions/checkout@v6
 
@@ -92,9 +104,9 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 
-      # Optional features (the ltx object-store backends, and later the
-      # export transports) must keep compiling even though the default
-      # build leaves them off.
+      # Optional features (the ltx object-store backends and the export
+      # transports) must keep compiling even though the default build leaves
+      # them off.
       - name: Clippy, all features
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
@@ -104,6 +116,13 @@ jobs:
       # The blob-stream sink's own tests, with its client compiled in.
       - name: Test, blob-stream sink
         run: cargo test --locked -p celld --features export-blob-stream --lib export_blob_stream
+
+      # The Kafka sink's own tests, with librdkafka compiled in, against the
+      # job's broker.
+      - name: Test, Kafka sink
+        env:
+          CELLD_TEST_KAFKA_BROKERS: localhost:9092
+        run: cargo test --locked -p celld --features export-kafka --lib export_kafka
 
       # Check fixtures and benchmark paths without timing gates on shared runners.
       - name: Smoke test export benchmarks

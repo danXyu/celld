@@ -10,8 +10,8 @@
 //!
 //! `repair` and `backfill` restore streams read-only from the fleet bucket
 //! and write their snapshots through the sink `CELLD_EXPORT_SINK` names, as
-//! a node would: to the blob-stream topic, where the Snowflake loader reads
-//! them like any other record, or through the bucket sink, under
+//! a node would: to the blob-stream or Kafka topic, where the Snowflake
+//! loader reads them like any other record, or through the bucket sink, under
 //! `export/changes/<node>/` of the export bucket. Both take the
 //! consumer's `EXPORT_GAPS` view unloaded as JSON lines with `--gaps`, so
 //! gaps the live path reported, links and recovered heads beyond what was
@@ -102,7 +102,8 @@ INSPECT OPTIONS:
 Snapshots go to the sink CELLD_EXPORT_SINK names, with its settings, as on
 a node: with blob-stream, CELLD_EXPORT_BROKERS, CELLD_EXPORT_PARTITIONS,
 CELLD_EXPORT_TOPIC, and the writer's zone (CELLD_EXPORT_WRITER_ID or
-CELLD_ZONE, with CELLD_EXPORT_ZONES). CELLD_EXPORT_MAX_RECORD_BYTES and
+CELLD_ZONE, with CELLD_EXPORT_ZONES); with kafka, CELLD_EXPORT_KAFKA_BROKERS,
+CELLD_EXPORT_KAFKA_PROPERTIES and CELLD_EXPORT_TOPIC. CELLD_EXPORT_MAX_RECORD_BYTES and
 CELLD_EXPORT_TABLES apply as on a node too.
   -h, --help            Show this help"#
     )
@@ -393,11 +394,14 @@ fn snapshot_sink(
     outcomes: tokio::sync::mpsc::UnboundedSender<crate::export_sink::Outcome>,
 ) -> anyhow::Result<Arc<dyn crate::export_sink::ExportSink>> {
     ensure!(
-        !(config.sinks.bucket && config.sinks.blob_stream),
-        "CELLD_EXPORT_SINK=bucket,blob-stream: choose the one sink the consumer reads"
+        config.sinks.count() == 1,
+        "CELLD_EXPORT_SINK names several sinks: choose the one the consumer reads"
     );
     if config.sinks.blob_stream {
         return crate::export_blob_stream::start(config, outcomes);
+    }
+    if config.sinks.kafka {
+        return crate::export_kafka::start(config, outcomes);
     }
     Ok(Arc::new(BucketSink::start(
         destination.clone(),

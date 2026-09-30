@@ -24,20 +24,28 @@
 //! emulator. [`consume`] batches records to land. The `sql-api` feature
 //! adds [`sql_api::SqlApi`], a Warehouse on Snowflake's SQL API,
 //! [`streaming::Streaming`], which lands batches through Snowpipe Streaming,
-//! and the `celld-export-loader` binary; the `blob-stream` feature adds
-//! [`blob_stream`], which feeds them from the export topic.
+//! and the `celld-export-loader` binary; the `blob-stream` and `kafka`
+//! features add [`source`], which feeds them from the export topic, through
+//! `blob_stream` or `kafka`.
 
 // celld's rule against tokio::select! is for its execution boundary; the
 // loader's consumer loop runs outside it, on the host's runtime. Clippy only
 // honours this lint's allow at the crate root.
-#![cfg_attr(feature = "blob-stream", allow(clippy::disallowed_macros))]
+#![cfg_attr(
+    any(feature = "blob-stream", feature = "kafka"),
+    allow(clippy::disallowed_macros)
+)]
 
 #[cfg(feature = "blob-stream")]
 pub mod blob_stream;
 pub mod consume;
 mod dynamic_table;
+#[cfg(feature = "kafka")]
+pub mod kafka;
 mod landing;
 pub mod loader;
+#[cfg(any(feature = "blob-stream", feature = "kafka"))]
+pub mod source;
 #[cfg(feature = "sql-api")]
 pub mod sql_api;
 #[cfg(feature = "sql-api")]

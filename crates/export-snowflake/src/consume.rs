@@ -1,7 +1,7 @@
 //! Batching consumed records to [`Land`].
 //!
-//! The loader reads messages, each one record's JSON, from the blob-stream
-//! topic, adds them to a [`Batch`], and lands the batch once it is full or
+//! The loader reads messages, each one record's JSON, from the export topic
+//! (blob-stream or Kafka), adds them to a [`Batch`], and lands the batch once it is full or
 //! old enough: through Snowpipe Streaming ([`crate::streaming`]), whose
 //! elastic channel acknowledges each append once the rows are durable in
 //! Snowflake, and does not order them. Only after every row of the batch is
@@ -50,9 +50,10 @@ impl Default for Limits {
 }
 
 /// Where a message was read, as a landed row's `source` says:
-/// `blob-stream/<partition>/<offset>`.
-pub fn message_source(partition: u32, offset: u64) -> String {
-    format!("blob-stream/{partition}/{offset}")
+/// `<transport>/<partition>/<offset>`, where the transport is `blob-stream`
+/// or `kafka`.
+pub fn message_source(transport: &str, partition: u32, offset: u64) -> String {
+    format!("{transport}/{partition}/{offset}")
 }
 
 /// A message that did not decode as a record.
@@ -84,16 +85,18 @@ impl Batch {
         }
     }
 
-    /// Add the message at `offset` in virtual partition `partition`. A
-    /// message that is not a record is not added, and its offset is not
-    /// covered.
+    /// Add the message at `offset` in partition `partition` of the
+    /// `transport` topic. A message that is not a record is not added, and
+    /// its offset is not covered. One batch reads one transport, so offsets
+    /// are kept by partition alone.
     pub fn push_message(
         &mut self,
+        transport: &str,
         partition: u32,
         offset: u64,
         payload: &[u8],
     ) -> Result<(), Undecodable> {
-        let source = message_source(partition, offset);
+        let source = message_source(transport, partition, offset);
         let record = Record::from_json(payload).map_err(|e| Undecodable {
             source: source.clone(),
             error: e.to_string(),
@@ -223,11 +226,19 @@ mod tests {
     fn offsets_are_returned_only_once_the_batch_lands() {
         let mut batch = Batch::default();
         let mut l = Fake::default();
-        batch.push_message(3, 10, &record(1).to_json()).unwrap();
-        batch.push_message(3, 12, &record(2).to_json()).unwrap();
+        batch
+            .push_message("blob-stream", 3, 10, &record(1).to_json())
+            .unwrap();
+        batch
+            .push_message("blob-stream", 3, 12, &record(2).to_json())
+            .unwrap();
         // Offsets need not arrive in order across calls; the highest wins.
-        batch.push_message(3, 11, &record(3).to_json()).unwrap();
-        batch.push_message(5, 7, &record(4).to_json()).unwrap();
+        batch
+            .push_message("blob-stream", 3, 11, &record(3).to_json())
+            .unwrap();
+        batch
+            .push_message("blob-stream", 5, 7, &record(4).to_json())
+            .unwrap();
         assert_eq!(batch.len(), 4);
 
         l.fail = true;
@@ -247,8 +258,8 @@ mod tests {
     #[test]
     fn an_undecodable_message_is_not_covered_unless_skipped() {
         let mut batch = Batch::default();
-        let err = batch.push_message(2, 40, b"not json").unwrap_err();
-        assert_eq!(err.source, "blob-stream/2/40");
+        let err = batch.push_message("kafka", 2, 40, b"not json").unwrap_err();
+        assert_eq!(err.source, "kafka/2/40");
         assert!(batch.is_empty(), "nothing to land and no offset to commit");
         batch.skip(2, 40);
         let mut l = Fake::default();
@@ -263,16 +274,22 @@ mod tests {
             bytes: 1 << 20,
         };
         let mut batch = Batch::default();
-        batch.push_message(0, 1, &record(1).to_json()).unwrap();
+        batch
+            .push_message("blob-stream", 0, 1, &record(1).to_json())
+            .unwrap();
         assert!(!batch.is_full(&limits));
-        batch.push_message(0, 2, &record(2).to_json()).unwrap();
+        batch
+            .push_message("blob-stream", 0, 2, &record(2).to_json())
+            .unwrap();
         assert!(batch.is_full(&limits));
         let small = Limits {
             records: 100,
             bytes: 10,
         };
         let mut batch = Batch::default();
-        batch.push_message(0, 1, &record(1).to_json()).unwrap();
+        batch
+            .push_message("blob-stream", 0, 1, &record(1).to_json())
+            .unwrap();
         assert!(batch.is_full(&small));
     }
 

@@ -14,9 +14,9 @@ code.
 
 The reference deployment is an AI assistant with one cell per customer, ten
 million customers active every day, and Snowflake as the first consumer.
-The sink is [blob-stream](https://github.com/bitdriftlabs/blob-stream), with
-the fleet bucket as a second sink for snapshots, repair, and fleets outside
-AWS.
+The sink is [blob-stream](https://github.com/bitdriftlabs/blob-stream), or
+Kafka for a fleet that already runs it, with the fleet bucket as a third
+sink for snapshots, repair, and fleets outside AWS.
 
 ## Contents
 
@@ -67,8 +67,8 @@ transaction history.
 - The whole feature is off by default and costs nothing when off.
 
 What the export does not promise: the sequence of every transaction, the
-before-image of every update, exactly-once delivery, or a Kafka-compatible
-stream. It does not export Queue message bodies, Workflow step state, or R2
+before-image of every update, or exactly-once delivery, even through the
+Kafka sink. It does not export Queue message bodies, Workflow step state, or R2
 objects.
 
 ## What celld already provides
@@ -130,6 +130,7 @@ LTX capture (replication thread)
 exporter ticket settles          ──►  release labeled commits ≤ proof
                                         └─ node buffer ──► sink.produce()
                                               ├─ blob-stream (ack = durable in S3)
+                                              ├─ Kafka (ack = every in-sync replica)
                                               └─ bucket Parquet
                                         └─ delivered position per sink
                                         └─ watermark after acks
@@ -139,7 +140,7 @@ facet delete                          deleted records (same path)
 
 reconciliation (daily)           ──►  bucket inventory heads vs consumer
 
-consumer group "snowflake"       ◄──  segments in S3
+consumer group "snowflake"       ◄──  segments in S3, or the Kafka topic
   └─ loader ──► CELL_CHANGES ──► generations, snapshots, Dynamic Tables
 ```
 
@@ -444,7 +445,15 @@ reconciler notices a consumer stream with no bucket prefix and emits it.
 ## Sinks
 
 `ExportSink` is a trait: submit records for a set of streams and report a
-terminal result per record. Two implementations ship.
+terminal result per record. Three implementations ship, and
+`CELLD_EXPORT_SINK` picks one. The blob-stream and Kafka sinks share
+everything but their client: each record is one message on the fleet's
+topic, the record's JSON keyed by its stream identity, with `committed_at`
+as the event time; submits become overlapping produce calls whose results
+are reported in submission order; the client connects in the background,
+so a broker outage at boot delays export rather than failing the node; and
+a record not acknowledged within `CELLD_EXPORT_RETRY_MS` is dropped and
+freezes its stream's delivered position with a `gap`.
 
 ### blob-stream
 
@@ -465,18 +474,51 @@ are zone-local, so a stream that fails over to another zone spans two
 virtual partitions. Consumers dedup on `(stream, position, table,
 generation, key, fragment)` and order by position.
 
+### Kafka
+
+The node runs librdkafka, through `rdkafka`, behind a Cargo feature,
+`export-kafka`, because it builds a C library (and OpenSSL, for SASL and
+TLS) that a default celld build should not carry. `CELLD_EXPORT_KAFKA_BROKERS`
+lists the bootstrap servers; `CELLD_EXPORT_KAFKA_PROPERTIES` names a file of
+librdkafka properties applied over the sink's own, for security, SASL
+credentials, compression and batching. One topic per fleet, created by the
+operator with the partition count and replication the fleet needs.
+
+The producer runs with `acks=all` and idempotence, so a produce is
+acknowledged only once every in-sync replica has the message, and a retry
+neither duplicates nor reorders it within its partition. The properties
+file may not lower `acks`: a delivered position would otherwise certify
+records a broker failure can still lose. Kafka's default partitioner hashes
+the key, so a stream stays in one partition while the partition count does
+not change. Connecting fetches the topic's metadata with topic
+auto-creation off, so a missing topic or an unreachable cluster is reported
+as the reason records are dropped, never answered with a topic on broker
+defaults. The producer's `message.max.bytes` is `CELLD_EXPORT_MAX_RECORD_BYTES`
+plus 64 KiB of framing, and the topic's own `max.message.bytes` must allow
+the same, so every fragment fits in one message. `CELLD_EXPORT_RETRY_MS` is
+`message.timeout.ms`; the sink waits for each message's delivery report,
+and a report missing past the deadline drops the record, so the properties
+file may not move the timeout or turn off successful delivery reports.
+
+Kafka is at-least-once to consumers as well: the loader commits offsets
+after landing, so a crash replays a batch. Consumers dedup on the same key
+as for blob-stream and order by position, never by offset, because a
+stream that moves nodes or a topic that gains partitions spreads a stream
+over several partitions.
+
 ### The fleet bucket
 
 The bucket sink writes Parquet under
 `export/changes/<node>/<yyyy>/<mm>/<dd>/<hh>/<unix_us>-<rand>.parquet`, one
 column per envelope field and the body as a JSON string, through the
-telemetry writer. It is the sink for a fleet that cannot run blob-stream,
+telemetry writer. It is the sink for a fleet that runs neither blob-stream
+nor Kafka,
 the output of snapshots, repair, and backfill, and the way to inspect an
 export with DuckDB. Its default flush is ten seconds, because a one-second
 flush on a hundred nodes is over eight million objects a day.
 
-The delivered position is tracked per sink. With both sinks enabled a
-consumer follows one of them.
+The delivered position is tracked per sink, and a node runs one sink, so a
+consumer follows the one the fleet chose.
 
 ## Completeness
 
@@ -562,8 +604,15 @@ lost in a gap does not get them; it gets the state after them.
 
 ## The Snowflake loader
 
-`celld-export-loader` is a Rust service on `blob-stream-consumer` in
-consumer group `snowflake`. It groups records into batches and sends each
+`celld-export-loader` is a Rust service in consumer group `snowflake` of the
+fleet's topic: on `blob-stream-consumer`, or on a librdkafka consumer for a
+Kafka fleet, chosen by `EXPORT_SOURCE`. Both are one `Source` to the same
+loop, so batching, landing and committing do not depend on the transport;
+a landed row's `source` is `blob-stream/<partition>/<offset>` or
+`kafka/<partition>/<offset>`. The Kafka consumer commits only explicitly,
+never automatically, and when the group revokes partitions it lands and
+commits what it read from them before letting go, as the blob-stream
+consumer does. It groups records into batches and sends each
 batch through the Snowpipe Streaming REST API to one pipe,
 `EXPORT_LANDING_PIPE`, whose `COPY` casts each record into a row of
 `EXPORT_LANDING`; a task routes landed rows into the tables below. There is
@@ -652,7 +701,7 @@ transaction's overshoot plus the resident stream count.
 | variable | default | effect |
 | --- | --- | --- |
 | `CELLD_EXPORT` | `0` | `0` disables export. `1` enables it. |
-| `CELLD_EXPORT_SINK` | `bucket` | `bucket`, `blob-stream`, or both. |
+| `CELLD_EXPORT_SINK` | `bucket` | `bucket`, `blob-stream`, or `kafka`. |
 | `CELLD_EXPORT_BUCKET` | the fleet bucket | A different bucket for the bucket sink, same endpoint and credentials. |
 | `CELLD_EXPORT_CLASSES` | application classes, `__D1Database`, `__KvNamespace` | Allow list. `__Queue`, `__Workflow.*`, and cron scopes are never exported. Facets follow their root's class. |
 | `CELLD_EXPORT_TABLES` | unset | Deny list of `Class.table`. |
@@ -662,10 +711,12 @@ transaction's overshoot plus the resident stream count.
 | `CELLD_EXPORT_FLUSH_MS` | `10000` | Bucket sink flush interval and watermark cadence. |
 | `CELLD_EXPORT_FLUSH_BYTES` | `8388608` | Bucket sink early flush. |
 | `CELLD_EXPORT_RETENTION` | `none` | Bucket sink sweep; `none` leaves lifecycle to the consumer. |
-| `CELLD_EXPORT_TOPIC` | `celld-changes` | blob-stream topic. |
+| `CELLD_EXPORT_TOPIC` | `celld-changes` | blob-stream or Kafka topic. |
 | `CELLD_EXPORT_BROKERS` | unset | Static brokers, or `k8s://NAMESPACE/SERVICE`. |
 | `CELLD_EXPORT_WRITER_ID` | the node's zone | blob-stream writer id. |
-| `CELLD_EXPORT_RETRY_MS` | `30000` | blob-stream retry deadline before a record counts as dropped. |
+| `CELLD_EXPORT_KAFKA_BROKERS` | unset | Kafka bootstrap servers, `host:port`. |
+| `CELLD_EXPORT_KAFKA_PROPERTIES` | unset | A file of librdkafka properties over the Kafka sink's own. |
+| `CELLD_EXPORT_RETRY_MS` | `30000` | blob-stream or Kafka delivery deadline before a record counts as dropped. |
 | `CELLD_EXPORT_RECONCILE` | `24h` | Reconciler interval, run by the loader deployment, not the node. |
 
 `celld export` subcommands: `repair`, `backfill`, `verify`, `erase`,
@@ -766,7 +817,8 @@ namespaces. It does not cover:
 3. Snapshots, `repair`, `backfill`, `verify`, `erase`, and the reconciler.
 4. Facet `deleted` records and `recovered` records from dead-node recovery.
 5. The blob-stream sink behind its Cargo feature and the loader on the
-   consumer crate.
+   consumer crate; the Kafka sink and the loader's Kafka consumer behind
+   theirs.
 6. Enable on one class in one fleet with `verify` and the reconciler
    running; then widen.
 
@@ -794,6 +846,12 @@ A fleet outside AWS stops at step four with a consumer on the bucket sink.
   ticket, which would have held a dying request's committed write out of the
   export while later requests could read it.
 - **2026-09-28, revision 2. Watermarks certify delivery, not release.**
+- **2026-09-30. Kafka is an alternative to blob-stream, chosen by
+  configuration.** A fleet that already runs Kafka should not have to run
+  blob-stream brokers to export. The Kafka sink and the loader's Kafka
+  consumer sit behind their own Cargo features, share the topic sink and
+  the consumer loop with blob-stream, and the loader still reads
+  blob-stream unless told otherwise. A node still runs one sink.
 
 ## Open questions
 

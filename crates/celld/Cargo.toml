@@ -18,6 +18,9 @@ export-blob-stream = [
     "dep:blob-stream-proto",
     "dep:blob-stream-types",
 ]
+# The Kafka sink for change export. Off by default: it builds librdkafka
+# (C) from source. Without it, `CELLD_EXPORT_SINK=kafka` refuses to start.
+export-kafka = ["dep:rdkafka"]
 
 [lib]
 path = "lib.rs"
@@ -80,6 +83,7 @@ crc.workspace = true
 dsa.workspace = true
 x25519-dalek.workspace = true
 rand.workspace = true
+rdkafka = { workspace = true, optional = true }
 regex.workspace = true
 reqwest = { workspace = true, features = ["rustls-tls", "stream", "json"] }
 rusqlite = { workspace = true, features = ["backup", "bundled", "hooks", "serialize", "session"] }

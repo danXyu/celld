@@ -4,7 +4,8 @@ The change export's Snowflake side: see `docs/design/change-export.md`,
 "The Snowflake loader" and "Erasure". This crate is the SQL, the Rust that
 renders it, and the loader that deploys it and lands records through
 Snowpipe Streaming. Without the `sql-api` feature it connects to nothing;
-`blob-stream` adds the consumer of the change-export topic.
+`blob-stream` and `kafka` add the consumers of the change-export topic, one
+per transport.
 
 | file | what |
 | --- | --- |
@@ -17,19 +18,22 @@ Snowpipe Streaming. Without the `sql-api` feature it connects to nothing;
 | `src/loader.rs` | `Loader`: deploy, Dynamic Table sync, routing, erasure, the read side |
 | `src/sql_api.rs` | (`sql-api`) a `Warehouse` on Snowflake's SQL API with key-pair auth |
 | `src/streaming.rs` | (`sql-api`) `Streaming`: appends to the landing pipe's elastic channel over Snowpipe Streaming's REST API |
-| `src/blob_stream.rs` | (`blob-stream`) the consumer loop: read the topic, land batches, commit offsets, sync the Dynamic Tables |
+| `src/source.rs` | (`blob-stream` or `kafka`) the consumer loop over any `Source`: read the topic, land batches, commit offsets, sync the Dynamic Tables |
+| `src/blob_stream.rs` | (`blob-stream`) the blob-stream consumer iterator as a `Source`, and its config file |
+| `src/kafka.rs` | (`kafka`) a librdkafka consumer-group member as a `Source` |
 | `src/bin/loader.rs` | (`sql-api`) the `celld-export-loader` binary |
 
 ## How records flow
 
-1. celld's blob-stream sink writes each record's JSON as one message to the
-   change-export topic.
+1. celld's blob-stream or Kafka sink writes each record's JSON as one
+   message to the change-export topic.
 2. `celld-export-loader run`, a member of the consumer group `snowflake`,
    batches the messages and appends each batch as JSON lines to
    `EXPORT_LANDING_PIPE` through Snowpipe Streaming's elastic channel. The
    pipe's `COPY` casts each line into a `LandingRow`: one column per
    envelope field, `body` (the kind-specific fields as a JSON string) and
-   `source` (`blob-stream/<partition>/<offset>`). Snowpipe Streaming bills
+   `source` (`blob-stream/<partition>/<offset>` or
+   `kafka/<partition>/<offset>`). Snowpipe Streaming bills
    per GB ingested; no warehouse runs for it. Once every row of a batch is
    acknowledged, which means it is durable, the loader commits the batch's
    offsets. A crash replays at most the uncommitted batches, and every reader
@@ -72,7 +76,7 @@ that never went through the topic.
 | --- | --- |
 | `deploy` | create every object that is missing, resume the two tasks (Snowflake creates a task suspended), and sync the Dynamic Tables |
 | `sync` | render each table's Dynamic Table from the union of its `schema` records in `CELL_META`, and create or replace only those whose statement changed (`EXPORT_DYNAMIC_TABLES` holds what was deployed; replacing one restarts it with a full refresh) |
-| `run [SECONDS]` | (`blob-stream`) `deploy`, then consume the topic until SIGINT or SIGTERM, landing batches through Snowpipe Streaming and running `sync` every SECONDS (default 60) |
+| `run [SECONDS]` | (`blob-stream` or `kafka`) `deploy`, then consume the topic `EXPORT_SOURCE` names until SIGINT or SIGTERM, landing batches through Snowpipe Streaming and running `sync` every SECONDS (default 60) |
 | `ingest FILE` | land the records in FILE (JSON lines as `celld export inspect` prints them; `-` for stdin) through Snowpipe Streaming, wait until queries see them all (Snowpipe Streaming acknowledges rows once they are durable, which can be before they are queryable; each run tags its rows' sources to count them, for up to `EXPORT_VISIBLE_SECONDS`, default 300), then route them by running the route task's body, which returns once they are routed (`EXECUTE TASK` only schedules a run). A line that is not a record is reported and fails the command after the rest land |
 | `erase SCRIPT CLASS CELL [--facet P] [--incarnation N] [--reason R]` | add a tombstone, unless an open one matches, and delete the stream's rows by running the erase task's body |
 | `query SQL [BIND...]` | run any statement with each `?` bound to a JSON value, as the reconciler's statements (#49) are, and print the rows |
@@ -90,17 +94,25 @@ warehouse), optionally `SNOWFLAKE_ROLE` and `SNOWFLAKE_URL`.
 (default 8 MiB; appends are split at Snowpipe Streaming's 4 MB limit), or,
 for `run`, `EXPORT_BATCH_MS` after its first record (default 5000).
 
-`run` also needs `EXPORT_BLOB_STREAM_CONFIG`, a blob-stream
+`run` reads the transport `EXPORT_SOURCE` names, `blob-stream` (the
+default) or `kafka`, and needs a member id that stays the same across
+restarts, from `EXPORT_MEMBER_ID` or else `HOSTNAME`. From blob-stream it
+needs `EXPORT_BLOB_STREAM_CONFIG`, a blob-stream
 `ConsumerIteratorBootstrapConfig` in YAML or JSON
-(`examples/consumer.yaml`), and a member id that stays the same across
-restarts, from `EXPORT_MEMBER_ID` or else `HOSTNAME`. The config's group
-defaults to `EXPORT_GROUP`, else `snowflake`. A batch that fails to land is
+(`examples/consumer.yaml`), whose group defaults to `EXPORT_GROUP`, else
+`snowflake`. From Kafka it needs `EXPORT_KAFKA_BROKERS`, and takes
+`EXPORT_KAFKA_TOPIC` (default `celld-changes`), `EXPORT_GROUP` (default
+`snowflake`) and `EXPORT_KAFKA_PROPERTIES`, a file of librdkafka consumer
+properties for TLS and SASL; the member id is its client id. The Kafka
+consumer never commits on its own, and when the group revokes partitions
+it lands and commits what it holds before letting go. A batch that fails to land is
 retried with backoff (1s doubling to 60s) and its offsets stay uncommitted,
 so a Snowflake outage stalls the consumer rather than losing records. A
 message that is not a record stops `run` with an error naming it, after
 what came before it lands; nothing at or past it in its partition is
 committed. A newer loader may read it; `EXPORT_SKIP` (comma-separated
-`blob-stream/<partition>/<offset>`) drops ones an operator has looked at.
+`blob-stream/<partition>/<offset>` or `kafka/<partition>/<offset>`) drops
+ones an operator has looked at.
 Nothing downstream would report the record a dropped message held missing.
 
 `deploy` creates objects `IF NOT EXISTS`, so it never changes one that
@@ -133,7 +145,11 @@ The consumer loop (`src/blob_stream/tests.rs`) runs against a fake
 iterator: batches land on linger or when full, a failed batch is retried
 and its offsets are not committed until it lands, stopping while the
 warehouse is down commits nothing, and revoked partitions are let go only
-after their batch lands.
+after their batch lands. `src/kafka/tests.rs` runs the same loop against a
+real Kafka broker when `CELLD_TEST_KAFKA_BROKERS` names one (CI runs one):
+records land and their offsets commit, a message that is not a record is
+named for `EXPORT_SKIP`, and a member the group rebalances away lands what
+it read before another member takes over, so nothing lands twice.
 
 What the emulator cannot tell us, and a real account has to: that the
 pipe, stream and tasks deploy as written, that Snowpipe Streaming accepts
@@ -173,4 +189,6 @@ With `real_account.py`, in the sqltest virtualenv
 8. Repeat 3 to 6 with `generations`, `deletions` and `random_1` for more
    coverage, and try `erase` on the loaded data. To try `run`, point
    `EXPORT_BLOB_STREAM_CONFIG` at a topic celld exports to, build with
-   `--features sql-api,blob-stream`, and watch `EXPORT_LANDING` fill.
+   `--features sql-api,blob-stream`, and watch `EXPORT_LANDING` fill; for
+   a Kafka fleet, set `EXPORT_SOURCE=kafka` and `EXPORT_KAFKA_BROKERS` and
+   build with `--features sql-api,kafka`.
