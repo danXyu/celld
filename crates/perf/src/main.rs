@@ -234,6 +234,12 @@ async fn run_command(arguments: &[String]) -> anyhow::Result<i32> {
             name => names.push(name.to_string()),
         }
     }
+    // A node starts in its project copy, so a relative path to the binary
+    // must be resolved here; a bare name stays a PATH lookup.
+    if celld.components().count() > 1 {
+        celld =
+            std::path::absolute(&celld).with_context(|| format!("resolve {}", celld.display()))?;
+    }
     let backend = match backend_name.as_str() {
         "dev" => Backend::Dev,
         "s3" => Backend::S3 {
