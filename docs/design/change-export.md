@@ -563,9 +563,12 @@ lost in a gap does not get them; it gets the state after them.
 ## The Snowflake loader
 
 `celld-export-loader` is a Rust service on `blob-stream-consumer` in
-consumer group `snowflake`. It groups records into batches and writes each
-batch as a Parquet file to an external stage for Snowpipe, or sends rows
-through the Snowpipe Streaming REST API for freshness under ten seconds.
+consumer group `snowflake`. It groups records into batches and sends each
+batch through the Snowpipe Streaming REST API to one pipe,
+`EXPORT_LANDING_PIPE`, whose `COPY` casts each record into a row of
+`EXPORT_LANDING`; a task routes landed rows into the tables below. There is
+no stage and no Parquet on this path, and no warehouse runs to load:
+Snowpipe Streaming bills per GB ingested, and records land within seconds.
 Elastic channels acknowledge durably but do not order, so the loader
 advances its source offsets only after every record of a batch is
 acknowledged, and it treats arrival order as meaningless: completeness comes
@@ -596,13 +599,15 @@ The model:
   findings. The repair driver polls it.
 - `EXPORT_TOMBSTONES`: see [Erasure](#erasure).
 
-Snapshot, repair, and backfill files written to the bucket load into the same
-`CELL_CHANGES` table with `COPY INTO`.
+Snapshot, repair, and backfill records go through the same sink as live
+records, so they reach the topic and the loader like any other. Records
+that only exist as bucket-sink files are landed with
+`celld-export-loader ingest`, through the same pipe.
 
 ## Erasure
 
 A purge in Snowflake is temporary if a replayed segment, a repair, a
-backfill, or a staged file can reinsert the data. Erasure therefore has a
+backfill, or an ingested file can reinsert the data. Erasure therefore has a
 durable tombstone that every ingestion path consults.
 
 `celld export erase --stream ID` writes a tombstone object under
@@ -612,8 +617,8 @@ they reach `CELL_CHANGES`; repair, backfill, and the reconciler skip
 tombstoned streams; the Dynamic Tables exclude them. A scheduled task deletes
 the stream's rows from `CELL_CHANGES` and `CELL_META`, and time-travel
 retention on the export tables is set low enough for that deletion to
-complete inside the compliance window. The bucket sink's export objects and
-the stage are covered by lifecycle rules with a retention no longer than the
+complete inside the compliance window. The bucket sink's export objects are
+covered by lifecycle rules with a retention no longer than the
 window, and blob-stream's topic retention is days. A stream recreated after
 erasure, which for a Durable Object means the same name and therefore the
 same scope, is a new incarnation and clears the tombstone by an explicit

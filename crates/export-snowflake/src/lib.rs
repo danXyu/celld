@@ -8,10 +8,10 @@
 //! - `tables.sql`: `EXPORT_LANDING`, `CELL_CHANGES`, `CELL_META`,
 //!   `EXPORT_TOMBSTONES`, `EXPORT_RECONCILER_FINDINGS`, and the loader's
 //!   `EXPORT_DYNAMIC_TABLES`;
-//! - `load.sql`: the stage, `COPY INTO EXPORT_LANDING` from the files the
-//!   bucket sink writes ([`StageRow`] is their layout), the pipe, and the
-//!   tasks that route landed records past the tombstones into the two tables
-//!   and erase tombstoned streams;
+//! - `load.sql`: the Snowpipe Streaming pipe that lands records in
+//!   `EXPORT_LANDING` ([`LandingRow`] is its row), and the tasks that route
+//!   landed records past the tombstones into the two tables and erase
+//!   tombstoned streams;
 //! - `views.sql`: `CELL_STREAMS`, `CELL_CHANGES_CURRENT`, `CELL_META_CURRENT`,
 //!   `CELL_SNAPSHOTS`, `CELL_GENERATIONS`, `CELL_CERTIFIED`, `EXPORT_GAPS`:
 //!   the reference consumer's precedence rules in SQL;
@@ -21,23 +21,39 @@
 //!
 //! [`loader`] deploys and drives these objects through a [`Warehouse`]: one
 //! statement at a time, so it runs the same against Snowflake and against the
-//! emulator. The `sql-api` feature adds [`sql_api::SqlApi`], a Warehouse on
-//! Snowflake's SQL API, and the `celld-export-loader` binary.
+//! emulator. [`consume`] batches records to land. The `sql-api` feature
+//! adds [`sql_api::SqlApi`], a Warehouse on Snowflake's SQL API,
+//! [`streaming::Streaming`], which lands batches through Snowpipe Streaming,
+//! and the `celld-export-loader` binary; the `blob-stream` feature adds
+//! [`blob_stream`], which feeds them from the export topic.
 
+// celld's rule against tokio::select! is for its execution boundary; the
+// loader's consumer loop runs outside it, on the host's runtime. Clippy only
+// honours this lint's allow at the crate root.
+#![cfg_attr(feature = "blob-stream", allow(clippy::disallowed_macros))]
+
+#[cfg(feature = "blob-stream")]
+pub mod blob_stream;
+pub mod consume;
 mod dynamic_table;
+mod landing;
 pub mod loader;
 #[cfg(feature = "sql-api")]
 pub mod sql_api;
-mod stage;
+#[cfg(feature = "sql-api")]
+pub mod streaming;
 
 pub use dynamic_table::{affinity, ColumnType, DynamicTable, ProjectedColumn};
+pub use landing::{LandingRow, LANDING_COLUMNS};
 pub use loader::{Loader, LoaderConfig, Rows, Warehouse, WarehouseError};
-pub use stage::{StageRow, STAGE_COLUMNS};
 
 pub const TABLES_SQL: &str = include_str!("../sql/tables.sql");
 pub const LOAD_SQL: &str = include_str!("../sql/load.sql");
 pub const VIEWS_SQL: &str = include_str!("../sql/views.sql");
 pub const DYNAMIC_TABLE_SQL: &str = include_str!("../sql/dynamic_table.sql");
+
+/// The Snowpipe Streaming pipe records land through (`load.sql`).
+pub const LANDING_PIPE: &str = "EXPORT_LANDING_PIPE";
 
 /// One named statement from a SQL file, without its leading comment lines
 /// or its closing `;`.
@@ -99,11 +115,6 @@ pub fn statements(file: &str) -> Vec<Statement> {
 /// [`Deployment::statements`], in order, in the export schema.
 #[derive(Clone, Debug)]
 pub struct Deployment {
-    /// The external stage URL over the bucket sink's prefix, such as
-    /// `s3://bucket/export/changes/`.
-    pub stage_url: String,
-    /// The storage integration that grants Snowflake access to the bucket.
-    pub storage_integration: String,
     /// The warehouse the route and erase tasks run on.
     pub warehouse: String,
 }
@@ -112,26 +123,16 @@ impl Deployment {
     /// Every statement that sets the export up: tables, loading, views. The
     /// statements that only exist to be inlined into a task
     /// (`route_changes`, `route_meta`, `expire_landing`, `erase_tombstoned`,
-    /// `erase_tombstoned_meta`) and the one-off `copy_into_landing` are left
-    /// out; the pipe and the tasks run them.
+    /// `erase_tombstoned_meta`) are left out; the tasks run them.
     pub fn statements(&self) -> Result<Vec<Statement>, RenderError> {
-        identifier("storage integration", &self.storage_integration)?;
         identifier("warehouse", &self.warehouse)?;
         let load = statements(LOAD_SQL);
-        let mut vars: Vec<(String, String)> = vec![
-            ("STAGE_URL".into(), escape_literal_body(&self.stage_url)),
-            (
-                "STORAGE_INTEGRATION".into(),
-                self.storage_integration.clone(),
-            ),
-            ("WAREHOUSE".into(), self.warehouse.clone()),
-        ];
+        let mut vars: Vec<(String, String)> = vec![("WAREHOUSE".into(), self.warehouse.clone())];
         vars.extend(
             load.iter()
                 .map(|s| (s.name.to_ascii_uppercase(), s.sql.clone())),
         );
-        const INLINED: [&str; 6] = [
-            "copy_into_landing",
+        const INLINED: [&str; 5] = [
             "route_changes",
             "route_meta",
             "expire_landing",
@@ -289,8 +290,6 @@ mod tests {
     #[test]
     fn deployment_fills_every_placeholder() {
         let d = Deployment {
-            stage_url: "s3://fleet-bucket/export/changes/".into(),
-            storage_integration: "CELLD_EXPORT_S3".into(),
             warehouse: "EXPORT_WH".into(),
         };
         let all = d.statements().unwrap();
@@ -316,14 +315,22 @@ mod tests {
                 .sql,
             "ALTER TASK EXPORT_ROUTE RESUME"
         );
-        let pipe = all.iter().find(|s| s.name == "export_pipe").unwrap();
+        // Records land through the pipe, into the table the route task reads.
+        let pipe = all
+            .iter()
+            .find(|s| s.name == "export_landing_pipe")
+            .unwrap();
+        assert!(pipe.sql.starts_with(&format!(
+            "CREATE PIPE IF NOT EXISTS {LANDING_PIPE} AS\nCOPY INTO EXPORT_LANDING ("
+        )));
         assert!(pipe
             .sql
-            .contains(&statement(LOAD_SQL, "copy_into_landing").unwrap().sql));
-        let stage = all.iter().find(|s| s.name == "export_stage").unwrap();
-        assert!(stage
-            .sql
-            .contains("URL = 's3://fleet-bucket/export/changes/'"));
+            .contains("FROM TABLE(DATA_SOURCE(TYPE => 'STREAMING'))"));
+        assert!(pos("export_landing") < pos("export_landing_pipe"));
+        // Every landing column comes from the row field of the same name.
+        for c in LANDING_COLUMNS {
+            assert!(pipe.sql.contains(&format!("$1:{c}::")), "{c}");
+        }
         // Tables first, then loading, then views that read both.
         assert!(pos("cell_changes") < pos("export_route_task"));
         assert!(pos("export_route_task") < pos("cell_streams"));
@@ -332,8 +339,6 @@ mod tests {
     #[test]
     fn task_bodies_are_the_deployed_tasks_bodies() {
         let d = Deployment {
-            stage_url: "s3://b/".into(),
-            storage_integration: "I".into(),
             warehouse: "W".into(),
         };
         let all = d.statements().unwrap();
@@ -352,9 +357,7 @@ mod tests {
     #[test]
     fn deployment_rejects_what_would_inject() {
         let d = Deployment {
-            stage_url: "s3://b/it's\\".into(),
-            storage_integration: "X; DROP TABLE CELL_CHANGES".into(),
-            warehouse: "W".into(),
+            warehouse: "X; DROP TABLE CELL_CHANGES".into(),
         };
         assert!(matches!(
             d.statements(),

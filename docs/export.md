@@ -27,18 +27,24 @@ today:
 - The `celld export` commands: `repair`, `backfill`, `inspect`,
   `reconcile`, `verify`, and `erase`.
 - The Snowflake tables, views, Dynamic Tables and the `celld-export-loader`
-  binary, which load the bucket sink's objects.
+  binary, which consumes the blob-stream topic and lands its records in
+  Snowflake through Snowpipe Streaming.
 
 Still to come:
 
 - **Repairing facet streams.** `repair` and `backfill` skip facet streams;
   a gap in one is reported but cannot be filled yet.
-- **A Snowflake loader for blob-stream.** The loader reads the bucket sink's
-  files. Nothing in this repository consumes the blob-stream topic yet.
+- **Loading the bucket sink into Snowflake.** The loader reads blob-stream
+  only. A fleet on the bucket sink can pipe `celld export inspect` into
+  `celld-export-loader ingest` by hand, but nothing loads it continuously.
+- **Auditing against Snowflake.** `reconcile` and `verify` compare the
+  bucket with the bucket sink's records, not with the Snowflake tables, so
+  a blob-stream fleet cannot run them yet.
 - **Both sinks at once.** A node exports through one sink:
   `CELLD_EXPORT_SINK=bucket,blob-stream` refuses to start.
-- **A real Snowflake account.** The SQL is tested against an emulator. The
-  steps to check it on a real account are in
+- **A real Snowflake account.** The SQL and the Snowpipe Streaming client
+  are tested against an emulator. The steps to check them on a real
+  account are in
   [the loader's README](../crates/export-snowflake/README.md#verifying-on-a-real-account).
 
 ## What the export promises
@@ -126,7 +132,8 @@ appear under `export/changes/` in `.celld/dev/objects.sqlite3`.
 3. Roll the nodes. Each node starts exporting the cells it activates from
    then on. Changes made before export was on are not exported; backfill
    them (step 6).
-4. Point a consumer at `export/changes/`. For Snowflake, deploy the loader
+4. Point a consumer at the export. For Snowflake, export through the
+   [blob-stream sink](#blob-stream-sink) and run the loader
    ([Loading into Snowflake](#loading-into-snowflake)).
 5. Watch the [metrics](#metrics), especially `celld.export.gaps` and
    `celld.export.dropped_records`.
@@ -208,7 +215,7 @@ With `CELLD_EXPORT_RETENTION=<n>d` the node deletes its export objects
 after `n` days. Leave it at `none` unless your consumer is sure to load
 objects well within that window: the bucket may be the only copy of a
 record the consumer has not loaded yet. Snapshots written by `repair` and
-`backfill` also land under `export/changes/`.
+`backfill` with the bucket sink also land under `export/changes/`.
 
 ### blob-stream sink
 
@@ -409,11 +416,18 @@ not affected.
 ## Loading into Snowflake
 
 The [`celld-export-snowflake`](../crates/export-snowflake/README.md) crate
-holds the Snowflake objects and `celld-export-loader`, which deploys them
-and keeps them in step. Records flow like this:
+holds the Snowflake objects and `celld-export-loader`, which deploys them,
+feeds them from the blob-stream topic, and keeps them in step. Records flow
+like this:
 
-1. The bucket sink writes Parquet under `export/changes/`.
-2. A Snowpipe with auto-ingest copies new objects into `EXPORT_LANDING`.
+1. Nodes export through the [blob-stream sink](#blob-stream-sink).
+2. The loader reads the topic as a member of the consumer group `snowflake`
+   and appends records in batches to the pipe `EXPORT_LANDING_PIPE` through
+   [Snowpipe Streaming](https://docs.snowflake.com/user-guide/snowpipe-streaming/data-load-snowpipe-streaming-overview),
+   which lands them in `EXPORT_LANDING`. It commits its topic offsets only
+   once Snowflake has acknowledged every row of a batch, so a restart
+   replays at most the batches in flight, and duplicates are dropped
+   downstream.
 3. A task running every minute routes landed rows: `rows` and `snapshot`
    into `CELL_CHANGES`, everything else into `CELL_META`, dropping
    tombstoned streams.
@@ -422,23 +436,33 @@ and keeps them in step. Records flow like this:
 5. One Dynamic Table per `(script, class, table)` holds the current rows of
    that table across every cell of the class, with typed columns.
 
+Snowpipe Streaming is billed per GB ingested, with no warehouse, so
+loading costs about the same as Snowpipe. The warehouse runs the route
+task, the erase task and the Dynamic Tables' refreshes.
+
 ### Build and deploy
 
-The loader is not in the release artifacts. Build it from the repository:
+The loader is not in the release artifacts. Build it from the repository
+with both features; like the sink, the consumer needs `protoc`:
 
 ```sh
-cargo build --release -p celld-export-snowflake --features sql-api --bin celld-export-loader
+cargo build --release -p celld-export-snowflake --features sql-api,blob-stream --bin celld-export-loader
 ```
 
-Prepare Snowflake as an administrator: a database, a warehouse, a storage
-integration allowed to read the bucket's `export/changes/` prefix, and a
-role with `USAGE` on all three, `CREATE SCHEMA` on the database and
-`EXECUTE TASK` on the account. Give the loader a user with that role and an
-RSA key pair. The
+Prepare Snowflake as an administrator: a database, a warehouse, and a role
+with `USAGE` on both, `CREATE SCHEMA` on the database and `EXECUTE TASK` on
+the account. Give the loader a user with that role and an RSA key pair. The
 [loader README](../crates/export-snowflake/README.md#verifying-on-a-real-account)
 has the exact statements.
 
-Then configure and deploy:
+The loader reads blob-stream's own storage, S3 and DynamoDB, and asks the
+brokers for recent data, so it needs the consumer settings blob-stream's
+brokers use: a YAML or JSON file in the form of
+[`examples/consumer.yaml`](../crates/export-snowflake/examples/consumer.yaml),
+with the topic, blob store, metadata store and broker discovery your
+brokers use, and AWS credentials that can read them.
+
+Then configure and run:
 
 ```sh
 export SNOWFLAKE_ACCOUNT=myorg-myaccount
@@ -447,20 +471,17 @@ export SNOWFLAKE_PRIVATE_KEY_FILE=rsa_key.p8
 export SNOWFLAKE_DATABASE=CELLD
 export SNOWFLAKE_SCHEMA=EXPORT
 export SNOWFLAKE_WAREHOUSE=CELLD_EXPORT_WH
-export EXPORT_STAGE_URL=s3://acme-celld-export/export/changes/
-export EXPORT_STORAGE_INTEGRATION=CELLD_EXPORT_S3
+export EXPORT_BLOB_STREAM_CONFIG=consumer.yaml
+export EXPORT_MEMBER_ID=loader-0
 
-celld-export-loader deploy
-```
-
-`deploy` creates every missing object, resumes the tasks, and prints the
-pipe's notification channel. Point the bucket's object-created
-notifications for `export/changes/` at that channel. Then keep the loader
-running so new tables and columns reach the Dynamic Tables:
-
-```sh
 celld-export-loader run 60
 ```
+
+`run` deploys every missing object, resumes the tasks, then consumes the
+topic until it gets `SIGINT` or `SIGTERM`, syncing the Dynamic Tables every
+60 seconds. On a stop it lands what it has read and gives up its
+partitions. Several loaders with different member ids share the topic's
+partitions between them.
 
 | setting | required | meaning |
 | --- | --- | --- |
@@ -469,23 +490,52 @@ celld-export-loader run 60
 | `SNOWFLAKE_DATABASE`, `SNOWFLAKE_SCHEMA` | yes | Where the objects live. |
 | `SNOWFLAKE_WAREHOUSE` | yes | Runs the loader's statements, the tasks and the Dynamic Tables. |
 | `SNOWFLAKE_ROLE`, `SNOWFLAKE_URL` | no | A role other than the user's default; an API URL other than the account's. |
-| `EXPORT_STAGE_URL`, `EXPORT_STORAGE_INTEGRATION` | `deploy`, `run` | The stage over `export/changes/` and the integration that reads it. |
+| `EXPORT_BLOB_STREAM_CONFIG` | `run` | The blob-stream consumer config, `.yaml`, `.yml` or `.json`. |
+| `EXPORT_MEMBER_ID` | `run` | This loader's member id in the consumer group, stable across restarts. Default: `HOSTNAME`. |
+| `EXPORT_GROUP` | no | The consumer group. Default `snowflake`, or the config file's. |
+| `EXPORT_BATCH_RECORDS`, `EXPORT_BATCH_BYTES`, `EXPORT_BATCH_MS` | no | A batch lands at 10000 records, 8 MiB, or 5 seconds after its first record, whichever comes first. |
+| `EXPORT_SKIP` | no | Messages to drop, comma-separated, as `blob-stream/<partition>/<offset>`. See below. |
 | `EXPORT_TARGET_LAG` | no | The Dynamic Tables' target lag. Default `1 minute`. |
 | `EXPORT_DYNAMIC_TABLE_PREFIX` | no | The Dynamic Tables' name prefix. Default `CF`. |
 
+A batch that fails to land is retried, with backoff, until it lands;
+nothing more is read meanwhile. A message on the topic that is not a
+record stops the loader with an error naming it, once everything before it
+has landed; its offset and everything after it in its partition stay
+uncommitted, so a restart reads it again. The usual cause is a record from
+a newer celld, which a newer loader reads. To drop a message you have
+looked at, add its name from the error to `EXPORT_SKIP` and restart; the
+record it held is then missing, and nothing reports that, so repair or
+backfill its cell.
+
 `deploy` creates objects `IF NOT EXISTS` and never changes one that exists.
 When an upgrade changes a table, the pipe, the stream or a task, drop that
-object and deploy again. Dropping the pipe loses its load history, so it may
-load files again; every view drops duplicates.
+object and deploy again. Upgrading from a loader that read the bucket
+sink's files takes these statements, then `deploy`, which recreates the
+route task with the new column and resumes it:
+
+```sql
+ALTER TASK EXPORT_ROUTE SUSPEND;
+DROP TASK EXPORT_ROUTE;       -- its body still names FILE_NAME
+DROP PIPE EXPORT_PIPE;
+DROP STAGE EXPORT_STAGE;
+DROP FILE FORMAT EXPORT_PARQUET;
+ALTER TABLE EXPORT_LANDING RENAME COLUMN FILE_NAME TO SOURCE;
+ALTER TABLE CELL_CHANGES RENAME COLUMN FILE_NAME TO SOURCE;
+ALTER TABLE CELL_META RENAME COLUMN FILE_NAME TO SOURCE;
+```
+
+Rows landed but not yet routed stay in the `EXPORT_LANDING_NEW` stream, and
+the recreated task routes them.
 
 ### Loader commands
 
 | command | what it does |
 | --- | --- |
-| `deploy` | Create what is missing, resume the tasks, print the pipe's notification channel, and sync the Dynamic Tables. |
+| `deploy` | Create what is missing, resume the tasks, and sync the Dynamic Tables. |
 | `sync` | Create or replace each Dynamic Table whose schema changed. Replacing one restarts it with a full refresh. |
-| `run [SECONDS]` | `deploy`, then `sync` every SECONDS (default 60) until stopped. |
-| `load PREFIX` | Copy the stage files under PREFIX into `EXPORT_LANDING` and route them now, without waiting for the pipe and the task. Files already loaded are skipped. |
+| `run [SECONDS]` | `deploy`, then land the blob-stream topic through Snowpipe Streaming and `sync` every SECONDS (default 60) until stopped. Needs the `blob-stream` feature. |
+| `ingest FILE` | Land the records in FILE, JSON lines as `celld export inspect` prints them (`-` for stdin), through Snowpipe Streaming, wait until queries see them (up to `EXPORT_VISIBLE_SECONDS`, default 300), and route them. A line that is not a record fails the command after the rest land. |
 | `erase SCRIPT CLASS CELL [--facet P] [--incarnation N] [--reason R]` | Tombstone a stream in Snowflake and delete its rows. |
 | `query SQL [BIND...]` | Run a statement with each `?` bound to a JSON value, and print the rows. |
 | `gaps`, `certified` | Print `EXPORT_GAPS` or `CELL_CERTIFIED`. |
@@ -543,17 +593,17 @@ celld-export-loader query \
   "SELECT TO_JSON(OBJECT_CONSTRUCT(*)) FROM EXPORT_GAPS" | tail -n +2 > gaps.jsonl
 
 # Snapshot every stream it names, through the highest position its rows name.
+# With CELLD_EXPORT_SINK=blob-stream and the nodes' blob-stream settings, the
+# snapshots go to the topic, and the running loader lands them.
 celld export repair --gaps gaps.jsonl
-
-# Load the snapshots now instead of waiting for the pipe.
-celld-export-loader load export-cli/
 ```
 
 `repair` reads the rows' `script`, `class`, `cell`, `facet`, `incarnation`,
 `gap_kind`, `bound_epoch` and `bound_txid`, in any letter case.
 
 Repair does not recover the lost transactions. It restores the stream from
-the bucket, read-only, and writes a `schema` record per table generation, a
+the bucket, read-only, and writes, through the sink `CELLD_EXPORT_SINK`
+names, a `schema` record per table generation, a
 `snapshot` of every exported table and a `snapshot_end`, all with
 `origin: repair`. The snapshot replaces the consumer's copy of the stream,
 including rows the consumer has and the cell no longer does.
@@ -566,7 +616,11 @@ access to it. Every subcommand takes the fleet flags (`--bucket` or
 and `--export-bucket` (or `CELLD_EXPORT_BUCKET`) when the export writes
 somewhere else. A scope is a cell scope as records carry it in `cell`,
 `Class:id`. `CELLD_EXPORT_MAX_RECORD_BYTES` and `CELLD_EXPORT_TABLES` apply
-to the snapshots these commands write, as on a node.
+to the snapshots these commands write, as on a node, and so do
+`CELLD_EXPORT_SINK` and its settings: with `blob-stream`, `repair` and
+`backfill` produce to the topic with `CELLD_EXPORT_BROKERS`,
+`CELLD_EXPORT_PARTITIONS`, `CELLD_EXPORT_TOPIC` and the writer's zone
+(`CELLD_EXPORT_WRITER_ID`, or `CELLD_ZONE` with `CELLD_EXPORT_ZONES`).
 
 #### repair
 
@@ -654,14 +708,17 @@ A difference counts only once the evidence it rests on is older than
 consumer lacks reached the bucket, not the cell's latest write, so a busy
 cell cannot defer an old gap. Findings go to `export/reconcile/<ms>.json`,
 and `gap` and `deleted` records with `origin: repair` and `node: reconciler`
-go to `export/changes/reconciler/`, where the loader picks them up and they
-reach `EXPORT_GAPS`. `--dry-run` writes nothing. `--schedule` runs forever,
-every `CELLD_EXPORT_RECONCILE` (default `24h`).
+go to `export/changes/reconciler/`, where a consumer of the bucket sink
+picks them up. To bring them into Snowflake, pipe them into the loader:
+`celld export inspect --node reconciler | celld-export-loader ingest -`.
+`--dry-run` writes nothing. `--schedule` runs forever, every
+`CELLD_EXPORT_RECONCILE` (default `24h`).
 
 The consumer `reconcile` and `verify` compare against today is the
 reference consumer over the records under `export/changes/`, not the
 Snowflake tables. They answer "does the bucket sink's output cover the
-cells", which is what the loader then loads.
+cells", so they do not yet work for a fleet that exports through
+blob-stream.
 
 These commands index export objects in SQLite on local disk. Use
 `--cache /path/to/export-audit.sqlite` to reuse unchanged objects across
@@ -716,8 +773,9 @@ Snowflake and deletes its rows: routing drops its records from then on, the
 views hide it at once, an hourly task deletes rows that arrive later, and
 deleted rows stay in time travel for a day. The
 bucket sink's objects already under `export/changes/` stay until
-`CELLD_EXPORT_RETENTION` or your bucket's lifecycle rules remove them, so
-keep that retention within your erasure window.
+`CELLD_EXPORT_RETENTION` or your bucket's lifecycle rules remove them, and
+records on the blob-stream topic until its retention expires, so keep both
+within your erasure window.
 
 ## Dead-node recovery
 

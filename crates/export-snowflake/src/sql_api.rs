@@ -40,7 +40,7 @@ pub struct Connection {
 }
 
 impl Connection {
-    fn base_url(&self) -> String {
+    pub(crate) fn base_url(&self) -> String {
         match &self.url {
             Some(u) => u.trim_end_matches('/').to_string(),
             None => format!(
@@ -120,11 +120,29 @@ impl KeyPair {
     }
 }
 
-const TOKEN_LIFETIME: u64 = 3600;
+pub(crate) const TOKEN_LIFETIME: u64 = 3600;
 /// A token is replaced this long before it expires.
-const TOKEN_MARGIN: u64 = 300;
-const ATTEMPTS: u32 = 6;
-const MAX_BODY: u64 = 1 << 30;
+pub(crate) const TOKEN_MARGIN: u64 = 300;
+pub(crate) const ATTEMPTS: u32 = 6;
+pub(crate) const MAX_BODY: u64 = 1 << 30;
+
+/// A random (version 4) UUID, as the SQL API and Snowpipe Streaming take a
+/// request id.
+pub(crate) fn request_id() -> Result<String, WarehouseError> {
+    let mut id = [0u8; 16];
+    getrandom::fill(&mut id).map_err(|e| WarehouseError::other(e.to_string()))?;
+    id[6] = (id[6] & 0x0f) | 0x40;
+    id[8] = (id[8] & 0x3f) | 0x80;
+    let h: String = id.iter().map(|b| format!("{b:02x}")).collect();
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..32]
+    ))
+}
 
 /// Seconds since the Unix epoch.
 pub type Clock = Box<dyn Fn() -> u64 + Send>;
@@ -338,19 +356,7 @@ impl Warehouse for SqlApi {
         if !binds.is_empty() {
             body["bindings"] = bindings(binds)?;
         }
-        let mut id = [0u8; 16];
-        getrandom::fill(&mut id).map_err(|e| WarehouseError::other(e.to_string()))?;
-        id[6] = (id[6] & 0x0f) | 0x40;
-        id[8] = (id[8] & 0x3f) | 0x80;
-        let h: String = id.iter().map(|b| format!("{b:02x}")).collect();
-        let request_id = format!(
-            "{}-{}-{}-{}-{}",
-            &h[0..8],
-            &h[8..12],
-            &h[12..16],
-            &h[16..20],
-            &h[20..32]
-        );
+        let request_id = request_id()?;
         let url = format!("{base}/api/v2/statements?requestId={request_id}");
         let mut reply = self.request(&url, Some(&body.to_string()))?;
         let mut delay = Duration::from_millis(250);

@@ -1,16 +1,16 @@
-//! The row layout of a stage file: what `COPY INTO EXPORT_LANDING` reads.
+//! The row layout `insert_landing` reads: one per record the loader lands.
 //!
-//! The bucket sink writes Parquet with one column per envelope field, named
-//! as the record's JSON fields are, and `body`: the record's other fields as
-//! a JSON object string. `kind` is its own column, so a reader can route a
-//! record without parsing the body.
+//! One field per envelope field, named as the record's JSON fields are,
+//! `body`: the record's other fields as a JSON object string, and `source`:
+//! where the loader read the record. `kind` is its own column, so routing
+//! never parses the body.
 
 use celld_export_format::{DecodeError, Record};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value as Json};
 
-/// The stage file's columns, in order.
-pub const STAGE_COLUMNS: [&str; 16] = [
+/// `EXPORT_LANDING`'s record columns, in order.
+pub const LANDING_COLUMNS: [&str; 17] = [
     "kind",
     "script",
     "class",
@@ -27,11 +27,12 @@ pub const STAGE_COLUMNS: [&str; 16] = [
     "fragment",
     "fragments",
     "body",
+    "source",
 ];
 
-/// One record as one stage-file row.
+/// One record as one `EXPORT_LANDING` row.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StageRow {
+pub struct LandingRow {
     pub kind: String,
     pub script: String,
     pub class: String,
@@ -50,10 +51,13 @@ pub struct StageRow {
     pub fragments: u32,
     /// The kind-specific fields as a JSON object.
     pub body: String,
+    /// Where the record was read, such as `blob-stream/7/1234` (virtual
+    /// partition 7, offset 1234). Only for tracing a row back.
+    pub source: String,
 }
 
-impl StageRow {
-    pub fn from_record(record: &Record) -> Self {
+impl LandingRow {
+    pub fn from_record(record: &Record, source: impl Into<String>) -> Self {
         let Json::Object(mut fields) =
             serde_json::to_value(record).expect("export records always encode")
         else {
@@ -69,7 +73,7 @@ impl StageRow {
             Json::String(s) => Some(s),
             other => unreachable!("envelope field is a string: {other}"),
         };
-        let row = StageRow {
+        let row = LandingRow {
             kind: string(take("kind")),
             script: string(take("script")),
             class: string(take("class")),
@@ -86,6 +90,7 @@ impl StageRow {
             fragment: record.envelope.fragment,
             fragments: record.envelope.fragments,
             body: String::new(),
+            source: source.into(),
         };
         for k in [
             "incarnation",
@@ -98,7 +103,7 @@ impl StageRow {
         ] {
             fields.remove(k);
         }
-        StageRow {
+        LandingRow {
             body: Json::Object(fields).to_string(),
             ..row
         }

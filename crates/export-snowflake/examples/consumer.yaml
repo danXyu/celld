@@ -1,0 +1,44 @@
+# An example EXPORT_BLOB_STREAM_CONFIG for `celld-export-loader run`:
+# blob-stream's ConsumerIteratorBootstrapConfig
+# (blob-stream-proto/proto/blobstream/v1/config.proto), in the same YAML form
+# as the brokers' config. The topic, the blob store and the metadata store
+# must be the brokers' own. The loader fills in the group id (`snowflake`, or
+# EXPORT_GROUP), the member id (EXPORT_MEMBER_ID) and both topics from
+# `topic.name` when they are left out, as here.
+runtime:
+  read:
+    idle_poll_delay: "0.5s"
+  group:
+    lease_duration: "30s"
+    heartbeat_interval: "10s"
+    rebalance_interval: "10s"
+
+# celld's CELLD_EXPORT_TOPIC, CELLD_EXPORT_PARTITIONS, and the number of zones
+# in CELLD_EXPORT_ZONES (one writer when unset).
+topic:
+  name: "celld-changes"
+  partition_count: 16
+  num_writers: 3
+  retention: "259200s"
+  metadata_window_size: "60s"
+  max_metadata_publication_lag: "15s"
+
+blob_store:
+  s3:
+    bucket: "blob-stream-segments"
+    prefix: "celld-changes/"
+    region: "us-east-1"
+
+metadata_store:
+  dynamo:
+    region: "us-east-1"
+    segment_metadata_table_name: "blob_stream_segments"
+    producer_partition_lease_table_name: "blob_stream_producer_leases"
+    consumer_group_lease_table_name: "blob_stream_consumer_leases"
+    consumer_group_membership_table_name: "blob_stream_consumer_membership"
+
+# The same brokers as celld's CELLD_EXPORT_BROKERS.
+broker_discovery:
+  k8s_service:
+    namespace: "streams"
+    service_name: "blob-stream"

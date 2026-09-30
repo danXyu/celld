@@ -8,9 +8,10 @@
 -- plain equality.
 
 -- statement: export_landing
--- Every record as the stage file carries it, before routing. COPY INTO lands
--- here because a COPY transformation cannot filter or split, and records go
--- to two tables and past the tombstones. The route task reads it through an
+-- Every record as the loader lands it, before routing. The loader lands here
+-- rather than in the two tables so that landing a batch is one statement
+-- that never reads another table, and routing records to two tables and past
+-- the tombstones happens in one place. The route task reads it through an
 -- append-only stream and deletes rows older than a week.
 CREATE TRANSIENT TABLE IF NOT EXISTS EXPORT_LANDING (
     kind STRING NOT NULL,
@@ -29,7 +30,7 @@ CREATE TRANSIENT TABLE IF NOT EXISTS EXPORT_LANDING (
     fragment NUMBER(10, 0) NOT NULL,
     fragments NUMBER(10, 0) NOT NULL,
     body STRING NOT NULL,
-    file_name STRING,
+    source STRING,
     landed_at TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP()
 )
 DATA_RETENTION_TIME_IN_DAYS = 0;
@@ -61,7 +62,7 @@ CREATE TABLE IF NOT EXISTS CELL_CHANGES (
     key_columns ARRAY NOT NULL,
     -- [[op, key, row], ...] exactly as the record carries it.
     row_changes ARRAY NOT NULL,
-    file_name STRING,
+    source STRING,
     loaded_at TIMESTAMP_LTZ NOT NULL
 )
 CLUSTER BY (TO_DATE(committed_at))
@@ -88,7 +89,7 @@ CREATE TABLE IF NOT EXISTS CELL_META (
     fragments NUMBER(10, 0) NOT NULL,
     kind STRING NOT NULL,
     body VARIANT NOT NULL,
-    file_name STRING,
+    source STRING,
     loaded_at TIMESTAMP_LTZ NOT NULL
 )
 DATA_RETENTION_TIME_IN_DAYS = 1;

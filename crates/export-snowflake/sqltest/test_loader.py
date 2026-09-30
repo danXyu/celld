@@ -1,11 +1,14 @@
 """Run the celld-export-loader binary against the SQL API emulator.
 
-Each scenario deploys from nothing with `deploy`, delivers half its records
-through the pipe and the route task and the other half with `load`, syncs
-the Dynamic Tables with `sync`, and checks everything the SQL derives
-against the reference consumer, exactly as test_sql.py does. The loader's
-own statements are what run: the emulator only stands in for what fakesnow
-lacks (see sqlapi.py).
+Each scenario deploys from nothing with `deploy`, lands its records through
+Snowpipe Streaming with `ingest` (half from a file, half from stdin as
+`celld export inspect` prints them, then the first half again as a replay
+would), syncs the Dynamic Tables with `sync`, and checks everything the SQL
+derives against the reference consumer, exactly as test_sql.py does.
+`ingest` lands through the same `Batch` and Snowpipe Streaming client as
+`run`, whose blob-stream loop the crate's Rust tests cover. The loader's own
+statements and requests are what run: the emulator only stands in for what
+fakesnow lacks (see sqlapi.py).
 """
 
 import json
@@ -19,9 +22,9 @@ import fakesnow
 import pytest
 
 from conftest import CRATE
-from sqlapi import NOTIFICATION_CHANNEL, Emulator, serve
-from real_account import files, sink_row, verify
-from test_sql import Warehouse, scenario_names, tombstone
+from sqlapi import Emulator, serve
+from real_account import EDGE, files, verify, write_jsonl
+from test_sql import Warehouse, emulate, pipe_as_insert, scenario_names, tombstone
 
 ROOT = CRATE.parent.parent
 ACCOUNT, USER = "xy12345.us-east-2.aws", "celld_loader"
@@ -78,12 +81,13 @@ def loader(binary, key, emulator):
         "SNOWFLAKE_SCHEMA": "CELLS",
         "SNOWFLAKE_WAREHOUSE": "EXPORT_WH",
         "SNOWFLAKE_URL": emulator.url,
-        "EXPORT_STAGE_URL": "s3://fleet-bucket/export/changes/",
-        "EXPORT_STORAGE_INTEGRATION": "CELLD_EXPORT_S3",
+        # Small batches, so a scenario lands in several appends.
+        "EXPORT_BATCH_RECORDS": "7",
     }
 
-    def run(*args, ok=True):
-        p = subprocess.run([str(binary), *args], env=env, capture_output=True, text=True, timeout=120)
+    def run(*args, ok=True, stdin=None, extra=None):
+        p = subprocess.run([str(binary), *args], env=dict(env, **(extra or {})), capture_output=True,
+                           text=True, timeout=120, input=stdin)
         if ok:
             assert p.returncode == 0, p.stderr
         return p
@@ -91,40 +95,52 @@ def loader(binary, key, emulator):
     return run
 
 
-def stage(emu, path, rows):
-    """Stage `rows` as one file, as the bucket sink writes them."""
-    for row in rows:
-        emu.cur.execute("INSERT INTO EXPORT_TEST_STAGE SELECT %s, PARSE_JSON(%s)", (path, json.dumps(sink_row(row))))
+def inspect_lines(records):
+    """`records` as `celld export inspect` prints them: each with its object."""
+    return "".join(json.dumps(dict(r, object=f"export/changes/node-b/{i}.parquet")) + "\n"
+                   for i, r in enumerate(records))
 
 
 @pytest.mark.parametrize("name", scenario_names())
-def test_loader_end_to_end(emulator, loader, scenarios, name):
+def test_loader_end_to_end(emulator, loader, scenarios, tmp_path, name):
     s = scenarios[name]
-    out = loader("deploy").stdout
-    assert NOTIFICATION_CHANNEL in out
+    loader("deploy")
     assert {t: v["state"] for t, v in emulator.tasks.items()} == {
         "EXPORT_ROUTE": "started",
         "EXPORT_ERASE": "started",
     }
+    assert list(emulator.pipes) == ["EXPORT_LANDING_PIPE"]
     w = Warehouse(emulator.cur)
     for t in s["tombstones"]:
         tombstone(w, t)
 
-    # Half the records arrive as files the pipe ingests and the route task
-    # routes on its schedule, the rest as repair files `load` copies.
-    rows = s["stage_rows"]
-    half = len(rows) // 2
-    stage(emulator, "node-a/2026/09/29/02/1790000000000000-a.parquet", rows[:half])
-    emulator.ingest()
-    emulator.run_task("EXPORT_ROUTE")
-    stage(emulator, "repair/node-b/1790000000000001-b.parquet", rows[half:])
-    stage(emulator, "repair/node-b/1790000000000002-b.json", rows[half:])
-    out = loader("load", "repair/").stdout
-    assert "repair/node-b/1790000000000001-b.parquet\tLOADED" in out
-    assert ".json" not in out
-    # A file already loaded is not loaded again.
-    assert "LOADED" not in loader("load", "repair/").stdout
-    assert emulator.ingest()[1] == [["Copy executed with 0 files processed."]]
+    records = s["records"]
+    half = len(records) // 2
+    first = tmp_path / "first.jsonl"
+    write_jsonl(records[:half], first)
+    out = loader("ingest", str(first)).stdout
+    assert f"landed and routed {half} records" in out
+    loader("ingest", "-", stdin=inspect_lines(records[half:]))
+    # A replayed batch changes nothing the views derive.
+    loader("ingest", str(first))
+    landed = w.rows("SELECT source FROM EXPORT_LANDING")
+    assert len(landed) == len(records) + half
+    if half:
+        sources = [r["source"] for r in landed]
+        # Each run tags its rows' sources, to count them once queries see them.
+        assert any(x.startswith("export/changes/node-b/0.parquet (ingest ") for x in sources)
+        assert any(x.startswith(f"{first}:1 (ingest ") for x in sources)
+    # Every append carried at most one batch, and the one that failed was
+    # sent again under its request id.
+    ok = [a for a in emulator.appends if a[4] == 200]
+    assert all(len(a[3]) <= 7 for a in ok)
+    assert sum(len(a[3]) for a in ok) == len(records) + half
+    failed = [a for a in emulator.appends if a[4] != 200]
+    assert [(a[4], a[2]) for a in failed] == ([(503, 0)] if records else [])
+    if failed:
+        assert any(a[1] == failed[0][1] and a[2] == 1 and a[4] == 200 for a in emulator.appends)
+    # `ingest` routes before it returns; the task was never asked to.
+    assert emulator.scheduled == []
 
     out = loader("sync").stdout
     assert "failed" not in out
@@ -139,12 +155,24 @@ def test_loader_end_to_end(emulator, loader, scenarios, name):
     verify(w, s)
 
 
-def test_erase(emulator, loader, scenarios):
+def test_the_route_task_routes_what_lands(emulator, loader, scenarios):
+    """What `run` lands reaches the tables on the route task's schedule."""
     s = scenarios["basic"]
     loader("deploy")
-    stage(emulator, "node-a/1.parquet", s["stage_rows"])
-    emulator.ingest()
+    w = Warehouse(emulator.cur)
+    emulator.cur.execute(emulate(pipe_as_insert(emulator.pipes["EXPORT_LANDING_PIPE"])),
+                         (json.dumps(s["landing_rows"]),))
+    assert not w.rows("SELECT * FROM CELL_CHANGES")
     emulator.run_task("EXPORT_ROUTE")
+    loader("sync")
+    verify(w, s)
+
+
+def test_erase(emulator, loader, scenarios):
+    s = scenarios["basic"]
+    lines = "".join(json.dumps(r) + "\n" for r in s["records"])
+    loader("deploy")
+    loader("ingest", "-", stdin=lines)
     loader("sync")
     w = Warehouse(emulator.cur)
     cells = {r["cell"] for r in w.rows("SELECT DISTINCT cell FROM CELL_CHANGES")}
@@ -157,23 +185,37 @@ def test_erase(emulator, loader, scenarios):
     assert not w.rows(f"SELECT * FROM CELL_CHANGES WHERE cell = '{victim}'")
     assert not w.rows(f"SELECT * FROM CELL_META WHERE cell = '{victim}'")
     assert not w.rows(f"SELECT * FROM CELL_STREAMS WHERE cell = '{victim}' AND NOT removed")
-    # A reloaded file does not bring the erased stream back.
-    stage(emulator, "repair/again.parquet", s["stage_rows"])
-    loader("load", "repair/")
+    # Records replayed from the topic do not bring the erased stream back.
+    loader("ingest", "-", stdin=lines)
     assert not w.rows(f"SELECT * FROM CELL_CHANGES WHERE cell = '{victim}'")
 
 
-def test_read_side_and_errors(emulator, loader):
+def test_read_side_and_errors(emulator, loader, scenarios):
     loader("deploy")
     gaps = loader("gaps").stdout.splitlines()
     assert gaps[0].split("\t")[:5] == ["SCRIPT", "CLASS", "CELL", "FACET", "INCARNATION"]
     assert loader("certified").stdout.splitlines()[0].startswith("SCRIPT\t")
-    p = loader("load", "../outside", ok=False)
-    assert p.returncode != 0 and "stage path" in p.stderr
+    # A line that is not a record is reported and fails the command, after
+    # the records around it land.
+    good = json.dumps(scenarios["basic"]["records"][0])
+    p = loader("ingest", "-", stdin=f"{good}\nnot json\n{good}\n", ok=False)
+    assert p.returncode != 0 and "-:2: not a record" in p.stderr
+    assert "landed and routed 2 records" in p.stdout
+    # Rows Snowpipe Streaming acknowledged but queries do not see yet are
+    # waited for; past EXPORT_VISIBLE_SECONDS the command says so and fails.
+    p = loader("ingest", "-", stdin=good + "\n", ok=False, extra={"EXPORT_VISIBLE_SECONDS": "0"})
+    assert p.returncode != 0 and "only 0 were visible" in p.stderr
+    # This binary has no blob-stream consumer, and says how to get one.
+    p = loader("run", ok=False)
+    assert p.returncode != 0 and "blob-stream feature" in p.stderr
     # A statement Snowflake rejects surfaces its message.
     emulator.cur.execute("DROP VIEW EXPORT_GAPS")
     p = loader("gaps", ok=False)
     assert p.returncode != 0 and "EXPORT_GAPS" in p.stderr
+    # So does an append Snowpipe Streaming rejects.
+    emulator.pipes.clear()
+    p = loader("ingest", "-", stdin=good + "\n", ok=False)
+    assert p.returncode != 0 and "Snowpipe Streaming answered 404" in p.stderr
 
 
 def test_a_wrong_key_is_refused(emulator, loader, key, tmp_path, binary):
@@ -188,18 +230,16 @@ def test_a_wrong_key_is_refused(emulator, loader, key, tmp_path, binary):
 
 
 
-def test_real_account_files_have_the_sinks_layout(tmp_path):
-    import pyarrow.parquet as pq
-
+def test_real_account_files_land_and_keep_their_unsigned_values(emulator, loader, tmp_path):
     files(tmp_path)
-    schema = pq.ParquetFile(tmp_path / "edge.parquet").schema
-    types = {schema.column(i).name: str(schema.column(i).logical_type) for i in range(len(schema))}
-    assert types["incarnation"] == "Int(bitWidth=64, isSigned=false)"
-    assert types["fragment"] == "Int(bitWidth=32, isSigned=false)"
-    assert types["committed_at"].startswith("Timestamp(isAdjustedToUTC=true, timeUnit=milliseconds")
-    assert types["body"] == "String"
-    row = pq.read_table(tmp_path / "basic.parquet").to_pylist()[0]
-    assert json.loads(row["body"])["kind"] == row["kind"]
+    for line in (tmp_path / "basic.jsonl").read_text().splitlines():
+        assert "kind" in json.loads(line)
+    loader("deploy")
+    loader("ingest", str(tmp_path / "edge.jsonl"))
+    w = Warehouse(emulator.cur)
+    row = w.rows("SELECT * FROM CELL_META WHERE script = 'edge'")[0]
+    assert (int(row["incarnation"]), int(row["txid"]), int(row["fragment"])) == (
+        EDGE["incarnation"], EDGE["txid"], EDGE["fragment"])
 
 
 def test_bound_statements_as_the_reconciler_runs_them(emulator, loader):

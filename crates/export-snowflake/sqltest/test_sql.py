@@ -2,17 +2,18 @@
 
 The records, the rendered Dynamic Tables, and what the reference consumer
 (crates/export-format) derives from the same records come from the
-`scenarios` example. Each scenario loads its records into a fresh fakesnow
-database (Snowflake SQL translated onto DuckDB) through the same COPY
+`scenarios` example. Each scenario lands its records in a fresh fakesnow
+database (Snowflake SQL translated onto DuckDB) through the same pipe
 transformation and routing statements a deployment runs, creates the views
 and the Dynamic Tables, and checks that every derived answer equals the
 consumer's.
 
 What fakesnow cannot run is replaced, and nothing else:
 
-- stages, pipes, streams, tasks: the COPY's SELECT reads a table of stage
-  rows instead of @EXPORT_STAGE, and EXPORT_LANDING_NEW is a view over
-  EXPORT_LANDING instead of a stream;
+- Snowpipe Streaming: the pipe's COPY runs as an INSERT whose SELECT reads
+  the appended rows, a JSON array, through FLATTEN instead of DATA_SOURCE;
+- streams and tasks: EXPORT_LANDING_NEW is a view over EXPORT_LANDING
+  instead of a stream, and the tests run the route statements themselves;
 - a Dynamic Table is created as a view over the same query;
 - ARRAY_POSITION and TRY_BASE64_DECODE_BINARY, which fakesnow does not
   translate, and TO_VARCHAR, which it translates keeping a JSON string's
@@ -80,18 +81,6 @@ def dynamic_table_as_view(sql):
     )
 
 
-def copy_as_insert(sql):
-    m = re.match(r"COPY INTO (\w+) \((.*?)\)\s*FROM \((.*)\)\s*PATTERN = '[^']*'$", sql, re.S)
-    assert m, sql
-    table, columns, select = m.groups()
-    select = (
-        select.replace("@EXPORT_STAGE", "EXPORT_TEST_STAGE")
-        .replace("$1:", "c1:")
-        .replace("METADATA$FILENAME", "'test.parquet'")
-    )
-    return f"INSERT INTO {table} ({columns}) {select}"
-
-
 class Warehouse:
     def __init__(self, cur):
         self.cur = cur
@@ -147,13 +136,30 @@ def tombstone(w, t, cleared=False):
     )
 
 
+def pipe_as_insert(pipe):
+    """The streaming pipe's COPY as an INSERT reading its rows from one
+    parameter: a JSON array of them."""
+    m = re.match(
+        r"CREATE PIPE IF NOT EXISTS \w+ AS\s*COPY INTO (\w+) \((.*?)\)\s*FROM \((.*)"
+        r"FROM TABLE\(DATA_SOURCE\(TYPE => 'STREAMING'\)\)\s*\)$",
+        pipe,
+        re.S,
+    )
+    assert m, pipe
+    table, columns, select = m.groups()
+    select = select.replace("$1:", "r.value:")
+    return f"INSERT INTO {table} ({columns}) {select} FROM TABLE(FLATTEN(INPUT => PARSE_JSON(%s))) r"
+
+
+def land(w, rows):
+    """Append `rows` as Snowpipe Streaming would, through the pipe."""
+    w.run(pipe_as_insert(LOAD["export_landing_pipe"]), (json.dumps(rows),))
+
+
 def load(w, scenario):
     for t in scenario["tombstones"]:
         tombstone(w, t)
-    w.run("CREATE TABLE EXPORT_TEST_STAGE (c1 VARIANT)")
-    for row in scenario["stage_rows"]:
-        w.run("INSERT INTO EXPORT_TEST_STAGE SELECT PARSE_JSON(%s)", (json.dumps(row),))
-    w.run(copy_as_insert(LOAD["copy_into_landing"]))
+    land(w, scenario["landing_rows"])
     w.run("CREATE VIEW EXPORT_LANDING_NEW AS SELECT * FROM EXPORT_LANDING")
     w.run(LOAD["route_changes"])
     w.run(LOAD["route_meta"])
@@ -238,13 +244,13 @@ def test_sql_matches_reference_consumer(warehouse, scenarios, name):
 def test_loading_twice_changes_nothing(warehouse, scenarios):
     s = scenarios["random_1"]
     load(warehouse, s)
-    # The same files again, as a replayed segment or a retried COPY would.
-    warehouse.run(copy_as_insert(LOAD["copy_into_landing"]))
+    # The same batch again, as a replayed segment or a retried insert would.
+    land(warehouse, s["landing_rows"])
     warehouse.run("DELETE FROM CELL_CHANGES")
     warehouse.run("DELETE FROM CELL_META")
     warehouse.run(LOAD["route_changes"])
     warehouse.run(LOAD["route_meta"])
-    assert warehouse.run("SELECT COUNT(*) FROM EXPORT_LANDING")[0][0] == 2 * len(s["stage_rows"])
+    assert warehouse.run("SELECT COUNT(*) FROM EXPORT_LANDING")[0][0] == 2 * len(s["landing_rows"])
     check(warehouse, s)
 
 
@@ -299,8 +305,9 @@ def test_bulk_only_generation_needs_repair(warehouse):
         "epoch": 1, "txid": 1, "commit": 1, "committed_at": 1790000000000,
         "node": "node-a", "origin": "live", "fragment": 1, "fragments": 1,
         "body": json.dumps({"tables": [{"table": "items", "generation": 1}]}),
+        "source": "test",
     }
-    load(warehouse, {"tombstones": [], "stage_rows": [bulk], "dynamic_tables": []})
+    load(warehouse, {"tombstones": [], "landing_rows": [bulk], "dynamic_tables": []})
     assert warehouse.run("SELECT kind FROM CELL_META") == [("bulk",)]
     gaps = warehouse.rows("SELECT * FROM EXPORT_GAPS")
     assert [(g["gap_kind"], g["cell"], g["table_name"], int(g["generation"])) for g in gaps] == [

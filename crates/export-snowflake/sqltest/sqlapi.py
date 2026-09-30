@@ -16,12 +16,14 @@ signature; the loader's unit tests do.
 What fakesnow cannot run is emulated, on top of the replacements test_sql.py
 makes:
 
-- a stage is EXPORT_TEST_STAGE (path, c1): one row per record, `path` the
-  file's path under the stage URL. COPY INTO reads the rows under the stage
-  path it names whose path matches PATTERN and keeps a load history, so a
-  file loads once, as COPY's does;
-- the pipe runs its COPY when the test calls `ingest()`, standing in for a
-  bucket notification;
+- Snowpipe Streaming: GET /v2/streaming/hostname answers this server's own
+  address, POST /oauth/token trades the key-pair JWT for a scoped token,
+  and an append to a pipe's elastic channel runs the pipe's COPY (as
+  test_sql.py does) over the NDJSON rows. The first attempt of the first
+  append fails with 503 and must come back with the same request id and
+  retryCount 1; `appends` records every attempt. As on an elastic channel,
+  an acknowledged append is not queryable at once: its rows land only when
+  VISIBLE_AFTER more statements have run;
 - the stream EXPORT_LANDING_NEW is a view over EXPORT_LANDING's rows past an
   offset, advanced when a task that read it commits;
 - an EXECUTE IMMEDIATE block runs its statements one by one, a transaction's
@@ -29,8 +31,7 @@ makes:
 - a task is its EXECUTE IMMEDIATE block, run by `run_task()`, standing in
   for the schedule. EXECUTE TASK only records that a run was asked for,
   since in Snowflake it only schedules one, so nothing may rely on it having
-  run. ALTER TASK RESUME and SUSPEND set a task's state;
-- SHOW PIPES answers one row with a made-up notification channel.
+  run. ALTER TASK RESUME and SUSPEND set a task's state.
 """
 
 import base64
@@ -41,10 +42,11 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from test_sql import connect, dynamic_table_as_view, emulate
+from test_sql import connect, dynamic_table_as_view, emulate, pipe_as_insert
 
 PARTITION_ROWS = 3
-NOTIFICATION_CHANNEL = "arn:aws:sqs:us-east-1:000000000000:sf-snowpipe-emulator"
+# Statements that run before an acknowledged append's rows are queryable.
+VISIBLE_AFTER = 2
 
 
 class Emulator:
@@ -58,10 +60,12 @@ class Emulator:
         self.requests = {}  # requestId -> handle
         self.pending = set()  # handles answered 202 and not yet polled
         self.failed_once = set()  # requestIds already failed with 503
-        self.stage_url = None
-        self.pipe_copy = None
         self.stream_offset = None
-        self.loaded_files = set()
+        self.pipes = {}  # name -> CREATE PIPE statement
+        self.scoped_tokens = set()
+        self.appends = []  # (pipe, requestId, retryCount, rows, status)
+        self.buffered = []  # [statements still to wait, pipe, rows], acknowledged, not yet queryable
+        self.host = None  # this server's host:port, set by serve()
         self.tasks = {}  # name -> {"statements": [...], "state": ...}
         self.scheduled = []  # tasks EXECUTE TASK asked to run
         self.log = []  # every statement received, in order
@@ -83,36 +87,6 @@ class Emulator:
         if upper is not None:
             where += f" AND rowid <= {upper}"
         self.cur.execute(f"CREATE OR REPLACE VIEW EXPORT_LANDING_NEW AS SELECT * FROM EXPORT_LANDING WHERE {where}")
-
-    def copy(self, sql):
-        m = re.match(
-            r"COPY INTO (\w+) \((.*?)\)\s*FROM \((.*)FROM @EXPORT_STAGE(/[^\s)]*)?\s*\)\s*PATTERN = '([^']*)'$",
-            sql,
-            re.S,
-        )
-        assert m, sql
-        table, columns, select, path, pattern = m.groups()
-        prefix = (path or "/")[1:]
-        _, rows = self.query("SELECT DISTINCT path FROM EXPORT_TEST_STAGE")
-        files = sorted(
-            p for (p,) in rows
-            if p.startswith(prefix) and re.fullmatch(pattern, p) and p not in self.loaded_files
-        )
-        out = []
-        for f in files:
-            select_f = select.replace("$1:", "c1:").replace("METADATA$FILENAME", "path")
-            self.cur.execute(
-                emulate(f"INSERT INTO {table} ({columns}) {select_f} FROM EXPORT_TEST_STAGE WHERE path = %s"),
-                (f,),
-            )
-            n = self.cur.fetchall()[0][0]
-            self.loaded_files.add(f)
-            out.append([f, "LOADED", n, n, 1, 0, None, None, None, None])
-        if not files:
-            return ["status"], [["Copy executed with 0 files processed."]]
-        columns = ["file", "status", "rows_parsed", "rows_loaded", "error_limit", "errors_seen",
-                   "first_error", "first_error_line", "first_error_character", "first_error_column_name"]
-        return columns, out
 
     def run_task(self, name):
         self.run_block(self.tasks[name]["statements"])
@@ -137,23 +111,11 @@ class Emulator:
                 self.stream_offset = upper
                 self.stream_view()
 
-    def ingest(self):
-        """The pipe's COPY, as a bucket notification would run it."""
-        with self.lock:
-            return self.copy(self.pipe_copy)
-
     def execute(self, sql):
         self.log.append(sql)
         s = sql.strip()
-        if re.match(r"CREATE FILE FORMAT\b", s):
-            return ["status"], [["File format created."]]
-        if m := re.match(r"CREATE STAGE IF NOT EXISTS EXPORT_STAGE\s+URL = '([^']*)'", s):
-            if self.stage_url is None:
-                self.stage_url = m.group(1)
-                self.cur.execute("CREATE TABLE EXPORT_TEST_STAGE (path STRING, c1 VARIANT)")
-            return ["status"], [["Stage created."]]
-        if m := re.match(r"CREATE PIPE IF NOT EXISTS EXPORT_PIPE AUTO_INGEST = TRUE AS\s*(.*)$", s, re.S):
-            self.pipe_copy = self.pipe_copy or m.group(1)
+        if m := re.match(r"CREATE PIPE IF NOT EXISTS (\w+) AS", s):
+            self.pipes.setdefault(m.group(1), s)
             return ["status"], [["Pipe created."]]
         if re.match(r"CREATE STREAM IF NOT EXISTS EXPORT_LANDING_NEW\s+ON TABLE EXPORT_LANDING APPEND_ONLY = TRUE$", s):
             if self.stream_offset is None:
@@ -179,15 +141,6 @@ class Emulator:
         if m := re.match(r"EXECUTE IMMEDIATE \$\$\s*BEGIN\s*(.*)END;\s*\$\$$", s, re.S):
             self.run_block(self.block_statements(m.group(1)))
             return ["anonymous block"], [[None]]
-        if re.match(r"SHOW PIPES LIKE 'EXPORT_PIPE'$", s):
-            columns = ["created_on", "name", "database_name", "schema_name", "definition", "owner",
-                       "notification_channel", "comment"]
-            if self.pipe_copy is None:
-                return columns, []
-            return columns, [[None, "EXPORT_PIPE", "EXPORT", "CELLS", self.pipe_copy, "LOADER",
-                              NOTIFICATION_CHANNEL, ""]]
-        if s.startswith("COPY INTO "):
-            return self.copy(s)
         if s.startswith("CREATE OR REPLACE DYNAMIC TABLE"):
             return self.query(dynamic_table_as_view(s))
         return self.query(s)
@@ -206,9 +159,11 @@ class Emulator:
 
     # ------------------------------------------------------------ HTTP
 
-    def check_auth(self, headers):
+    def check_auth(self, headers, token_type=True):
         auth = headers.get("Authorization", "")
-        if headers.get("X-Snowflake-Authorization-Token-Type") != "KEYPAIR_JWT" or not auth.startswith("Bearer "):
+        if token_type and headers.get("X-Snowflake-Authorization-Token-Type") != "KEYPAIR_JWT":
+            return "missing key-pair token type"
+        if not auth.startswith("Bearer "):
             return "missing key-pair token"
         parts = auth[len("Bearer "):].split(".")
         if len(parts) != 3:
@@ -269,6 +224,7 @@ class Emulator:
             return 503, {"message": "Service Unavailable"}
         handle = str(uuid.uuid4())
         with self.lock:
+            self.make_visible()
             try:
                 if "bindings" in body:
                     columns, rows = self.execute_bound(sql, body["bindings"])
@@ -291,6 +247,55 @@ class Emulator:
             }
         return 200, self.result(handle)
 
+    # ------------------------------------------------------- streaming
+
+    def hostname(self):
+        return 200, self.host
+
+    def scoped_token(self, form):
+        if form.get("grant_type") != ["urn:ietf:params:oauth:grant-type:jwt-bearer"]:
+            return 400, {"message": f"bad grant_type {form.get('grant_type')}"}
+        if form.get("scope") != [self.host]:
+            return 400, {"message": f"scope {form.get('scope')} is not {self.host}"}
+        token = f"scoped-{uuid.uuid4()}"
+        self.scoped_tokens.add(token)
+        return 200, token
+
+    def append(self, db, schema, pipe, query, body):
+        request_id = query.get("requestId", [None])[0]
+        retry = int(query.get("retryCount", ["0"])[0])
+        rows = [json.loads(line) for line in body.decode().splitlines() if line.strip()]
+        seen = [a for a in self.appends if a[1] == request_id]
+        # retryCount counts the requests sent before under this id, and a
+        # request the emulator never received (the client gave up waiting
+        # before it arrived, say) is one the emulator did not see.
+        if request_id is None or retry < len(seen):
+            status = 400
+        elif not self.appends:
+            status = 503
+        elif (db, schema) != ("EXPORT", "CELLS") or pipe not in self.pipes:
+            status = 404
+        else:
+            status = 200
+        self.appends.append((pipe, request_id, retry, rows, status))
+        if status == 200:
+            with self.lock:
+                self.buffered.append([VISIBLE_AFTER, pipe, rows])
+            return 200, {"message": "OK"}
+        return status, {"code": "EMULATED", "message": f"append answered {status}"}
+
+    def make_visible(self, everything=False):
+        """Count a statement against each buffered append, and land the
+        rows of those whose wait is over."""
+        waiting = []
+        for b in self.buffered:
+            b[0] -= 1
+            if b[0] <= 0 or everything:
+                self.cur.execute(emulate(pipe_as_insert(self.pipes[b[1]])), (json.dumps(b[2]),))
+            else:
+                waiting.append(b)
+        self.buffered = waiting
+
     def get(self, handle, query):
         if handle not in self.results:
             return 404, {"message": "no such statement"}
@@ -305,24 +310,40 @@ def serve(emulator):
 
     class Handler(BaseHTTPRequestHandler):
         def reply(self, status, doc):
-            data = json.dumps(doc).encode()
+            text = isinstance(doc, str)
+            data = doc.encode() if text else json.dumps(doc).encode()
             self.send_response(status)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", "text/plain" if text else "application/json")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
 
         def do_POST(self):
             url = urlparse(self.path)
+            raw = self.rfile.read(int(self.headers["Content-Length"]))
+            if m := re.fullmatch(
+                r"/v2/streaming/data/databases/(\w+)/schemas/(\w+)/pipes/(\w+)/channels/ELASTIC/rows",
+                url.path,
+            ):
+                if self.headers.get("Authorization", "")[len("Bearer "):] not in emulator.scoped_tokens:
+                    return self.reply(401, {"message": "not a scoped token"})
+                if self.headers.get("Content-Type") != "application/x-ndjson":
+                    return self.reply(415, {"message": "not NDJSON"})
+                return self.reply(*emulator.append(*m.groups(), parse_qs(url.query), raw))
+            if err := emulator.check_auth(self.headers, token_type=url.path != "/oauth/token"):
+                return self.reply(401, {"code": "390144", "message": err})
+            if url.path == "/oauth/token":
+                return self.reply(*emulator.scoped_token(parse_qs(raw.decode())))
             if url.path != "/api/v2/statements":
                 return self.reply(404, {"message": "not found"})
-            if err := emulator.check_auth(self.headers):
-                return self.reply(401, {"code": "390144", "message": err})
-            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            self.reply(*emulator.post(parse_qs(url.query), body))
+            self.reply(*emulator.post(parse_qs(url.query), json.loads(raw)))
 
         def do_GET(self):
             url = urlparse(self.path)
+            if url.path == "/v2/streaming/hostname":
+                if err := emulator.check_auth(self.headers):
+                    return self.reply(401, {"code": "390144", "message": err})
+                return self.reply(*emulator.hostname())
             m = re.fullmatch(r"/api/v2/statements/([\w-]+)", url.path)
             if not m:
                 return self.reply(404, {"message": "not found"})
@@ -334,5 +355,6 @@ def serve(emulator):
             pass
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    emulator.host = f"127.0.0.1:{server.server_address[1]}"
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server

@@ -55,10 +55,15 @@ celld-export-format = { path = "crates/export-format" }
 # The change-export blob-stream sink (`export-blob-stream` feature). The
 # crates are not published, so they are pinned to one revision of the
 # repository; their own git dependencies are pinned by Cargo.lock.
+blob-stream-consumer = { git = "https://github.com/bitdriftlabs/blob-stream", rev = "5c7bec508978f62bc3efdde884293f0a42b0dae9" }
 blob-stream-producer = { git = "https://github.com/bitdriftlabs/blob-stream", rev = "5c7bec508978f62bc3efdde884293f0a42b0dae9" }
 blob-stream-proto = { git = "https://github.com/bitdriftlabs/blob-stream", rev = "5c7bec508978f62bc3efdde884293f0a42b0dae9" }
 blob-stream-types = { git = "https://github.com/bitdriftlabs/blob-stream", rev = "5c7bec508978f62bc3efdde884293f0a42b0dae9" }
 bd-server-stats = { git = "https://github.com/bitdriftlabs/shared-core.git" }
+# The Snowflake loader reads blob-stream's consumer config the way its broker
+# reads its own: YAML or protobuf JSON, through the same protobuf fork.
+protobuf-json-mapping = { git = "https://github.com/bitdriftlabs/rust-protobuf.git", branch = "patch-stack" }
+serde_yaml = "0.9"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 ed25519-dalek = { version = "2", features = ["pkcs8"] }
 encoding_rs = "0.8"

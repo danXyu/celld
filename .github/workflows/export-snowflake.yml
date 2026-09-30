@@ -1,8 +1,9 @@
 name: Export Snowflake
 
 # The change export's Snowflake side: the crate's Rust (with the loader's
-# `sql-api` feature), then its SQL and the celld-export-loader binary
-# against the Snowflake emulator in crates/export-snowflake/sqltest. The
+# `sql-api` and `blob-stream` features), then its SQL and the
+# celld-export-loader binary against the Snowflake emulator in
+# crates/export-snowflake/sqltest. The
 # emulator tests need Python and fakesnow, which the main CI job does not
 # install, so they run here, and only when the crates they test change.
 on:
@@ -45,6 +46,16 @@ jobs:
           set -euo pipefail
           rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy,rustfmt
           rustup default "$RUST_VERSION"
+
+      # The blob-stream feature's consumer generates its protobuf code at
+      # build time; the same pinned protoc as the main CI job.
+      - name: Install protoc
+        run: |
+          set -euo pipefail
+          curl -sSfL -o "$RUNNER_TEMP/protoc.zip" \
+            https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-linux-x86_64.zip
+          sudo unzip -q -o "$RUNNER_TEMP/protoc.zip" -d /usr/local bin/protoc 'include/*'
+          protoc --version
 
       - uses: actions/setup-python@v6
         with:

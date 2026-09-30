@@ -9,9 +9,10 @@
 //! bucket").
 //!
 //! `repair` and `backfill` restore streams read-only from the fleet bucket
-//! and write their snapshots through the bucket sink, under
-//! `export/changes/<node>/` of the export bucket, where the loader's
-//! `COPY INTO` picks them up like any other export object. Both take the
+//! and write their snapshots through the sink `CELLD_EXPORT_SINK` names, as
+//! a node would: to the blob-stream topic, where the Snowflake loader reads
+//! them like any other record, or through the bucket sink, under
+//! `export/changes/<node>/` of the export bucket. Both take the
 //! consumer's `EXPORT_GAPS` view unloaded as JSON lines with `--gaps`, so
 //! gaps the live path reported, links and recovered heads beyond what was
 //! certified, tables a `bulk` record left unknown, and reconciler findings
@@ -74,12 +75,13 @@ Both print one JSON report per stream and exit non-zero when any failed.
 
 OPTIONS:
 {FLEET_HELP}
-  --export-bucket NAME  Where snapshots are written (or CELLD_EXPORT_BUCKET;
+  --export-bucket NAME  Where erasure tombstones are read, and where the
+                        bucket sink writes snapshots (or CELLD_EXPORT_BUCKET;
                         default: the fleet bucket)
   --script NAME         The stream's script (default: the fleet's current
                         deployment). Ignored with --gaps, whose rows name it
-  --node NAME           The node recorded on snapshots, and their object
-                        prefix (default: {DEFAULT_NODE})
+  --node NAME           The node recorded on snapshots, and the bucket
+                        sink's object prefix (default: {DEFAULT_NODE})
   --concurrency N       Streams restored at once (default: {DEFAULT_CONCURRENCY})
   --rate N              Bucket reads per second across all streams, 0 for
                         no limit (default: {DEFAULT_RATE})
@@ -97,7 +99,11 @@ INSPECT OPTIONS:
   --origin ORIGIN       Only records of this origin: live, snapshot, repair
   --summary             One line per stream instead of every record
 
-CELLD_EXPORT_MAX_RECORD_BYTES and CELLD_EXPORT_TABLES apply as on a node.
+Snapshots go to the sink CELLD_EXPORT_SINK names, with its settings, as on
+a node: with blob-stream, CELLD_EXPORT_BROKERS, CELLD_EXPORT_PARTITIONS,
+CELLD_EXPORT_TOPIC, and the writer's zone (CELLD_EXPORT_WRITER_ID or
+CELLD_ZONE, with CELLD_EXPORT_ZONES). CELLD_EXPORT_MAX_RECORD_BYTES and
+CELLD_EXPORT_TABLES apply as on a node too.
   -h, --help            Show this help"#
     )
 }
@@ -351,16 +357,7 @@ async fn run_snapshots(mode: Mode, arguments: Vec<String>) -> anyhow::Result<()>
         )?,
     };
     let (outcomes_tx, outcomes) = tokio::sync::mpsc::unbounded_channel();
-    let sink = BucketSink::start(
-        destination.clone(),
-        options.node.clone(),
-        BucketSinkConfig {
-            flush: config.flush,
-            flush_bytes: config.flush_bytes as u64,
-            ..BucketSinkConfig::default()
-        },
-        outcomes_tx,
-    );
+    let sink = snapshot_sink(&config, &destination, &options.node, outcomes_tx)?;
     let settings = Settings {
         node: options.node.clone(),
         max_record_bytes: config.max_record_bytes,
@@ -372,7 +369,7 @@ async fn run_snapshots(mode: Mode, arguments: Vec<String>) -> anyhow::Result<()>
     let reports = export_repair::run(
         &source,
         &destination,
-        Arc::new(sink),
+        sink,
         outcomes,
         jobs,
         &settings,
@@ -385,6 +382,33 @@ async fn run_snapshots(mode: Mode, arguments: Vec<String>) -> anyhow::Result<()>
     )
     .await;
     summarize(total, &reports)
+}
+
+/// The sink snapshots go to: the one `CELLD_EXPORT_SINK` names, as on a
+/// node. The bucket sink writes under `node`'s prefix of `destination`.
+fn snapshot_sink(
+    config: &crate::export::Config,
+    destination: &Bucket,
+    node: &str,
+    outcomes: tokio::sync::mpsc::UnboundedSender<crate::export_sink::Outcome>,
+) -> anyhow::Result<Arc<dyn crate::export_sink::ExportSink>> {
+    ensure!(
+        !(config.sinks.bucket && config.sinks.blob_stream),
+        "CELLD_EXPORT_SINK=bucket,blob-stream: choose the one sink the consumer reads"
+    );
+    if config.sinks.blob_stream {
+        return crate::export_blob_stream::start(config, outcomes);
+    }
+    Ok(Arc::new(BucketSink::start(
+        destination.clone(),
+        node.to_string(),
+        BucketSinkConfig {
+            flush: config.flush,
+            flush_bytes: config.flush_bytes as u64,
+            ..BucketSinkConfig::default()
+        },
+        outcomes,
+    )))
 }
 
 /// The jobs of a run, in the order they will be reported.
