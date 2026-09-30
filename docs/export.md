@@ -802,4 +802,6 @@ the local disk problem, then reconcile and repair.
 ## Performance benchmarks
 
 See [export benchmarks](export-benchmarks.md) for the Criterion suites, timing
-boundaries, local baseline comparisons and CI smoke checks.
+boundaries, local baseline comparisons and CI smoke checks. The overhead of
+export on the request path is scenario `S14-overheads` in
+[performance tests](performance-tests.md).

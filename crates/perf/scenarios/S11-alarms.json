@@ -1,0 +1,89 @@
+{
+  "name": "S11-alarms",
+  "description": "2,000 alarms due at nearly one instant while reads continue. The collect step reports how late each alarm fired (alarm_late_* in ms, summed and maxed over cells).",
+  "env": {
+    "CELLD_PERF_BUCKET_FAULTS": "read=15,write=30,list=20,tail=10"
+  },
+  "setup": [
+    {
+      "step": "touch",
+      "request": {
+        "path": "/do/write",
+        "query": {
+          "bytes": "10"
+        },
+        "counts_write": true
+      },
+      "cells": {
+        "count": 2000,
+        "prefix": "alarm"
+      },
+      "concurrency": 16
+    },
+    {
+      "step": "touch",
+      "request": {
+        "path": "/do/write",
+        "query": {
+          "bytes": "10"
+        },
+        "counts_write": true
+      },
+      "cells": {
+        "count": 100,
+        "prefix": "reader"
+      },
+      "concurrency": 64
+    },
+    {
+      "step": "touch",
+      "request": {
+        "path": "/do/alarm",
+        "query": {
+          "in": "15000"
+        }
+      },
+      "cells": {
+        "count": 2000,
+        "prefix": "alarm"
+      },
+      "concurrency": 16
+    }
+  ],
+  "phases": [
+    {
+      "name": "during-storm",
+      "duration_s": 30,
+      "rate": 200,
+      "load": [
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 100,
+            "prefix": "reader"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    }
+  ],
+  "after": [
+    {
+      "step": "collect",
+      "request": {
+        "path": "/do/alarmstat"
+      },
+      "cells": {
+        "count": 2000,
+        "prefix": "alarm"
+      }
+    }
+  ]
+}

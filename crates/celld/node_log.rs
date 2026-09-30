@@ -2190,6 +2190,13 @@ impl FollowerStore {
         };
         let state_ok = state_persist.is_ok();
         let state_timing = state_persist.unwrap_or_default();
+        if entry_write_us > 0 || entry_fsync_us > 0 {
+            crate::perf_stats::record(crate::perf_stats::Hist::FollowerWrite, entry_write_us);
+            crate::perf_stats::record(
+                crate::perf_stats::Hist::FollowerFsync,
+                entry_fsync_us.saturating_add(entry_directory_us),
+            );
+        }
         info!(
             event = "log_append_serve",
             leader,

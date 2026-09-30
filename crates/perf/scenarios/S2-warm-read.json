@@ -1,0 +1,138 @@
+{
+  "name": "S2-warm-read",
+  "description": "Reads of resident cells. A warm read makes no bucket request for its cell and exactly one core route and one output gate; testing.md quotes p50 ~1.1 ms and p99 ~7 ms on a fixed host.",
+  "setup": [
+    {
+      "step": "touch",
+      "request": {
+        "path": "/do/write",
+        "query": {
+          "bytes": "100"
+        },
+        "counts_write": true
+      },
+      "cells": {
+        "count": 1,
+        "prefix": "hot"
+      }
+    },
+    {
+      "step": "touch",
+      "request": {
+        "path": "/do/write",
+        "query": {
+          "bytes": "100"
+        },
+        "counts_write": true
+      },
+      "cells": {
+        "count": 1000,
+        "prefix": "warm"
+      },
+      "concurrency": 16
+    }
+  ],
+  "phases": [
+    {
+      "name": "warmup",
+      "warmup": true,
+      "duration_s": 5,
+      "rate": 500,
+      "load": [
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 1000,
+            "prefix": "warm"
+          }
+        }
+      ]
+    },
+    {
+      "name": "one-cell",
+      "duration_s": 20,
+      "rate": 1000,
+      "load": [
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 1,
+            "prefix": "hot"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "bucket:class=cell_owner+cell_data",
+          "per_ok": true,
+          "max": 0
+        },
+        {
+          "metric": "counter:core.requests",
+          "per_ok": true,
+          "max": 1.05
+        },
+        {
+          "metric": "counter:core.outputs",
+          "per_ok": true,
+          "max": 1.05
+        },
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        },
+        {
+          "metric": "client:p99_us",
+          "max": 7000,
+          "timing": true
+        }
+      ]
+    },
+    {
+      "name": "1k-cells",
+      "duration_s": 20,
+      "rate": 1000,
+      "load": [
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 1000,
+            "prefix": "warm"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "bucket:class=cell_owner+cell_data",
+          "per_ok": true,
+          "max": 0
+        },
+        {
+          "metric": "counter:core.requests",
+          "per_ok": true,
+          "max": 1.05
+        },
+        {
+          "metric": "counter:core.outputs",
+          "per_ok": true,
+          "max": 1.05
+        },
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        },
+        {
+          "metric": "client:p99_us",
+          "max": 7000,
+          "timing": true
+        }
+      ]
+    }
+  ]
+}

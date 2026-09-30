@@ -1,0 +1,110 @@
+{
+  "name": "S5-upload-slots",
+  "description": "Writes spread over many cells at once, in bucket mode: each cell's upload waits for one of the node's 64 slots. durability.rs notes 4,000 cells committing together took ~9 s on a c3-standard-4. Runs on the s3 backend: the dev store fsyncs every object under one SQLite writer, which caps a lone node at a few hundred uploads per second and would be what this measured.",
+  "env": {
+    "CELLD_PERF_BUCKET_FAULTS": "read=15,write=30,list=20,tail=10"
+  },
+  "setup": [
+    {
+      "step": "touch",
+      "request": {
+        "path": "/do/write",
+        "query": {
+          "bytes": "100"
+        },
+        "counts_write": true
+      },
+      "cells": {
+        "count": 4000,
+        "prefix": "slot"
+      },
+      "concurrency": 16
+    }
+  ],
+  "phases": [
+    {
+      "name": "burst-100",
+      "duration_s": 2,
+      "rate": 100,
+      "timeout_ms": 60000,
+      "load": [
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "100"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 100,
+            "prefix": "slot"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "burst-1000",
+      "duration_s": 2,
+      "rate": 1000,
+      "timeout_ms": 60000,
+      "load": [
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "100"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 1000,
+            "prefix": "slot"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "burst-4000",
+      "duration_s": 2,
+      "rate": 4000,
+      "timeout_ms": 60000,
+      "load": [
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "100"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 4000,
+            "prefix": "slot"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    }
+  ],
+  "backends": [
+    "s3"
+  ]
+}

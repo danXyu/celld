@@ -1,0 +1,70 @@
+{
+  "name": "S13-deploy-under-load",
+  "backends": [
+    "s3"
+  ],
+  "nodes": 2,
+  "description": "A new version deployed and reloaded mid-phase under reads and writes: the timeline shows the cutover's error and latency spike.",
+  "setup": [
+    {
+      "step": "touch",
+      "request": {
+        "path": "/do/write",
+        "query": {
+          "bytes": "100"
+        },
+        "counts_write": true
+      },
+      "cells": {
+        "count": 1000,
+        "prefix": "dep"
+      },
+      "concurrency": 16
+    }
+  ],
+  "phases": [
+    {
+      "name": "cutover",
+      "duration_s": 30,
+      "rate": 300,
+      "load": [
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 1000,
+            "prefix": "dep"
+          },
+          "weight": 3
+        },
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "100"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 1000,
+            "prefix": "dep"
+          }
+        }
+      ],
+      "during": [
+        {
+          "at_s": 10,
+          "step": "redeploy",
+          "reload": true
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.01
+        }
+      ]
+    }
+  ]
+}

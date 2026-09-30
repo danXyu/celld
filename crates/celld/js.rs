@@ -5785,6 +5785,16 @@ impl Worker {
     }
 
     pub fn load_config(config: Arc<WorkerConfig>) -> Result<Worker> {
+        let started_us = crate::asyncrt::mono_us();
+        let worker = Self::load_config_inner(config);
+        crate::perf_stats::record(
+            crate::perf_stats::Hist::WorkerLoad,
+            crate::asyncrt::mono_us().saturating_sub(started_us),
+        );
+        worker
+    }
+
+    fn load_config_inner(config: Arc<WorkerConfig>) -> Result<Worker> {
         let src = config.src.as_str();
         let script_name = config.script_name.as_str();
         let do_classes = config.do_classes.as_slice();
@@ -9977,7 +9987,7 @@ fn op_test_queue_rearm_bounded(
 // calls the very functions the ops call rather than a second implementation
 // of the object record.
 pub(crate) mod r2_ops;
-mod storage_ops;
+pub(crate) mod storage_ops;
 use storage_ops::{actor_runtime_state, throw_storage_error};
 
 /// $$urlParse(input, base?) -> {protocol,username,password,host,port,pathname,search,hash,href}

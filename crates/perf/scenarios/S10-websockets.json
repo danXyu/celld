@@ -1,0 +1,99 @@
+{
+  "name": "S10-websockets",
+  "description": "2,000 hibernatable sockets on 200 cells: echo at rising rates, auto-response pings (which must not reach the core), writes, and a 10-member broadcast. The main thread polls every socket pump, so watch loop.main_lag_us.",
+  "setup": [
+    {
+      "step": "touch",
+      "request": {
+        "path": "/do/write",
+        "query": {
+          "bytes": "10"
+        },
+        "counts_write": true
+      },
+      "cells": {
+        "count": 200,
+        "prefix": "room"
+      },
+      "concurrency": 64
+    },
+    {
+      "step": "connect",
+      "cells": {
+        "count": 200,
+        "prefix": "room"
+      },
+      "per_cell": 10,
+      "rate": 1000
+    }
+  ],
+  "phases": [
+    {
+      "name": "echo",
+      "duration_s": 10,
+      "rates": [
+        1000,
+        5000,
+        10000
+      ],
+      "load": [
+        {
+          "message": "echo"
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "ping",
+      "duration_s": 10,
+      "rate": 5000,
+      "load": [
+        {
+          "message": "ping"
+        }
+      ],
+      "checks": [
+        {
+          "metric": "counter:core.messages",
+          "per_ok": true,
+          "max": 0.05
+        },
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "write",
+      "duration_s": 10,
+      "rate": 500,
+      "load": [
+        {
+          "message": "write"
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "broadcast",
+      "duration_s": 10,
+      "rate": 100,
+      "load": [
+        {
+          "message": "broadcast"
+        }
+      ]
+    }
+  ]
+}

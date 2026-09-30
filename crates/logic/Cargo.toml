@@ -13,3 +13,10 @@ test = false
 [lints.rust.unexpected_cfgs]
 level = "warn"
 check-cfg = ["cfg(celld_internal_tests)"]
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "core_events"
+harness = false

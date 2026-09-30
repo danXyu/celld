@@ -9,6 +9,10 @@ license = "Apache-2.0"
 [features]
 # Internal fixtures for the export Criterion target; absent from ordinary builds.
 export-bench = []
+# Performance-run faults (an injected slow or throttling bucket, a slow
+# fsync) and the fixtures the `perf` Criterion targets use; absent from
+# ordinary builds.
+perf = []
 # The blob-stream sink for change export. Off by default: it pulls in the
 # bitdrift client crates and a patched protobuf that a default build does not
 # carry. Without it, `CELLD_EXPORT_SINK=blob-stream` refuses to start.
@@ -119,3 +123,8 @@ proptest.workspace = true
 name = "export_pipeline"
 harness = false
 required-features = ["export-bench"]
+
+[[bench]]
+name = "perf_components"
+harness = false
+required-features = ["perf"]

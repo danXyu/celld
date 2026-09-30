@@ -152,6 +152,16 @@ that arrives while both places are taken. It counts the drop in
 `celld.metrics.shed`, and it reports that count in the next export that
 goes out.
 
+## Performance counters
+
+Apart from OTLP, every node keeps counters and latency histograms for its
+hot paths. These cover bucket requests by operation, key class and outcome;
+output gates; durability proofs by source; activations by restore path;
+and core and main-loop lag. It serves them as one JSON snapshot on its
+internal listener, at `GET /debug/metrics`. They need no collector and
+cost one atomic add per observation. The benchmark harness reads them; see
+[performance tests](performance-tests.md#what-a-node-counts).
+
 ## Query the bucket with DuckDB
 
 ```sql

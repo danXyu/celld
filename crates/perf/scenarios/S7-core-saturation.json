@@ -1,0 +1,52 @@
+{
+  "name": "S7-core-saturation",
+  "description": "Small DO calls spread over 10,000 resident cells at rising rates, to find whether the serial core thread (loop.core_lag_us) or the V8 isolates saturate first.",
+  "setup": [
+    {
+      "step": "touch",
+      "request": {
+        "path": "/do/write",
+        "query": {
+          "bytes": "10"
+        },
+        "counts_write": true
+      },
+      "cells": {
+        "count": 10000,
+        "prefix": "core"
+      },
+      "concurrency": 16
+    }
+  ],
+  "phases": [
+    {
+      "name": "noop",
+      "duration_s": 10,
+      "rates": [
+        1000,
+        2000,
+        4000,
+        8000,
+        16000
+      ],
+      "load": [
+        {
+          "request": {
+            "path": "/do/noop"
+          },
+          "cells": {
+            "count": 10000,
+            "prefix": "core"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "bucket:class=cell_owner+cell_data",
+          "per_ok": true,
+          "max": 0
+        }
+      ]
+    }
+  ]
+}

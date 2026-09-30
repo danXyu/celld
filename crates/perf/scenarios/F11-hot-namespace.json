@@ -1,0 +1,57 @@
+{
+  "backends": [
+    "s3"
+  ],
+  "name": "F11-hot-namespace",
+  "fixture": "services",
+  "description": "One KV namespace read through 1 and 3 nodes: a namespace is one cell with one owner, so throughput should stay flat as nodes are added.",
+  "variants": [
+    {
+      "name": "1-node",
+      "nodes": 1
+    },
+    {
+      "name": "3-nodes",
+      "nodes": 3
+    }
+  ],
+  "setup": [
+    {
+      "step": "touch",
+      "request": {
+        "path": "/kv/put",
+        "query": {
+          "bytes": "100"
+        }
+      },
+      "cells": {
+        "count": 100,
+        "prefix": "hk"
+      },
+      "concurrency": 64
+    }
+  ],
+  "phases": [
+    {
+      "name": "kv-get",
+      "duration_s": 15,
+      "rates": [
+        1000,
+        4000,
+        8000
+      ],
+      "load": [
+        {
+          "request": {
+            "path": "/kv/get"
+          },
+          "cells": {
+            "count": 100,
+            "prefix": "hk"
+          }
+        }
+      ]
+    }
+  ],
+  "verify": false
+}

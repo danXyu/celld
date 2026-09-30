@@ -1,0 +1,103 @@
+{
+  "name": "S16-activation-rate",
+  "description": "Fresh cells activated at fixed rates. Each activation opens its cell's SQLite database inside the core thread's StartRuntime effect (RuntimeManager::start_cell -> Worker::own_cell -> storage::open_at_epoch), so a burst of activations delays the core's timers, node lease renewal among them; on a 16-core Mac a lone dev node's core lag reached 18 s at 150 activations/s and the node fenced itself at 300/s. The error-rate check fails until activation leaves the core thread.",
+  "phases": [
+    {
+      "name": "fresh@50",
+      "duration_s": 20,
+      "rate": 50,
+      "timeout_ms": 60000,
+      "load": [
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "10"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 100000,
+            "prefix": "a50"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        },
+        {
+          "metric": "hist_p99:loop.core_lag_us",
+          "max": 1000000,
+          "timing": true
+        }
+      ]
+    },
+    {
+      "name": "fresh@150",
+      "duration_s": 20,
+      "rate": 150,
+      "timeout_ms": 60000,
+      "load": [
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "10"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 100000,
+            "prefix": "a150"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        },
+        {
+          "metric": "hist_p99:loop.core_lag_us",
+          "max": 1000000,
+          "timing": true
+        }
+      ]
+    },
+    {
+      "name": "fresh@300",
+      "duration_s": 20,
+      "rate": 300,
+      "timeout_ms": 60000,
+      "load": [
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "10"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 100000,
+            "prefix": "a300"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        },
+        {
+          "metric": "hist_p99:loop.core_lag_us",
+          "max": 1000000,
+          "timing": true
+        }
+      ]
+    }
+  ],
+  "verify": false
+}

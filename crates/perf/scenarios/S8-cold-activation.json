@@ -1,0 +1,94 @@
+{
+  "name": "S8-cold-activation",
+  "description": "Restores from the bucket: the node restarts with its local state deleted, then reads touch a working set ten times the residency cap, so nearly every read evicts one cell and restores another. The ladder finds the churn a lone node sustains; beyond it, requests wait for residency capacity and fail with CapacityExhausted (about 38 per second on a 16-core Mac with S3-like bucket latency). Reports activations by restore path and bucket LISTs per download.",
+  "env": {
+    "CELLD_MAX_RESIDENT_CELLS": "200",
+    "CELLD_PERF_BUCKET_FAULTS": "read=15,write=30,list=20,tail=10"
+  },
+  "setup": [
+    {
+      "step": "touch",
+      "request": {
+        "path": "/do/write",
+        "query": {
+          "bytes": "4000"
+        },
+        "counts_write": true
+      },
+      "cells": {
+        "count": 2000,
+        "prefix": "cold"
+      },
+      "concurrency": 16
+    },
+    {
+      "step": "restart",
+      "wipe_local": true
+    }
+  ],
+  "phases": [
+    {
+      "name": "cold-reads",
+      "duration_s": 20,
+      "timeout_ms": 60000,
+      "load": [
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 2000,
+            "prefix": "cold"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "hist_count:activation.download_us",
+          "min": 1
+        },
+        {
+          "metric": "bucket:class=cell_data,op=list+list_delimited+list_paginated",
+          "per": "hist_count:activation.download_us",
+          "max": 20
+        },
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ],
+      "rates": [
+        10,
+        25
+      ]
+    },
+    {
+      "name": "overload",
+      "duration_s": 20,
+      "timeout_ms": 60000,
+      "load": [
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 2000,
+            "prefix": "cold"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "hist_count:activation.download_us",
+          "min": 1
+        },
+        {
+          "metric": "bucket:class=cell_data,op=list+list_delimited+list_paginated",
+          "per": "hist_count:activation.download_us",
+          "max": 20
+        }
+      ],
+      "rate": 50
+    }
+  ]
+}

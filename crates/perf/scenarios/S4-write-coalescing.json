@@ -1,0 +1,88 @@
+{
+  "name": "S4-write-coalescing",
+  "description": "Many concurrent writes to one cell share one upload: PUTs per acknowledged write fall as concurrency rises.",
+  "env": {
+    "CELLD_PERF_BUCKET_FAULTS": "read=15,write=30,list=20,tail=10"
+  },
+  "setup": [
+    {
+      "step": "touch",
+      "request": {
+        "path": "/do/write",
+        "query": {
+          "bytes": "100"
+        },
+        "counts_write": true
+      },
+      "cells": {
+        "count": 1,
+        "prefix": "hot"
+      },
+      "concurrency": 64
+    }
+  ],
+  "phases": [
+    {
+      "name": "one-cell",
+      "duration_s": 15,
+      "rates": [
+        20,
+        200,
+        1000
+      ],
+      "load": [
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "100"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 1,
+            "prefix": "hot"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "bucket:class=cell_data,op=put",
+          "per_ok": true,
+          "max": 1.05
+        },
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "one-cell-coalesced",
+      "duration_s": 15,
+      "rate": 1000,
+      "load": [
+        {
+          "request": {
+            "path": "/do/write",
+            "query": {
+              "bytes": "100"
+            },
+            "counts_write": true
+          },
+          "cells": {
+            "count": 1,
+            "prefix": "hot"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "bucket:class=cell_data,op=put",
+          "per_ok": true,
+          "max": 0.5
+        }
+      ]
+    }
+  ]
+}

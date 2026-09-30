@@ -1,0 +1,72 @@
+{
+  "backends": [
+    "s3"
+  ],
+  "name": "F3-forwarding",
+  "nodes": 3,
+  "description": "Requests sent to one node for cells spread over three: about two thirds are forwarded through the peer tunnel. Compare with the local phase.",
+  "setup": [
+    {
+      "step": "touch",
+      "request": {
+        "path": "/do/write",
+        "query": {
+          "bytes": "100"
+        },
+        "counts_write": true
+      },
+      "cells": {
+        "count": 3000,
+        "prefix": "fw"
+      },
+      "concurrency": 16
+    }
+  ],
+  "phases": [
+    {
+      "name": "spread",
+      "duration_s": 15,
+      "rate": 2000,
+      "load": [
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 3000,
+            "prefix": "fw"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    },
+    {
+      "name": "one-entry",
+      "duration_s": 15,
+      "rate": 2000,
+      "load": [
+        {
+          "request": {
+            "path": "/do/read"
+          },
+          "cells": {
+            "count": 3000,
+            "prefix": "fw"
+          },
+          "node": 0
+        }
+      ],
+      "checks": [
+        {
+          "metric": "client:error_rate",
+          "max": 0.001
+        }
+      ]
+    }
+  ]
+}
