@@ -26,7 +26,6 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
-use tokio_util::time::{delay_queue, DelayQueue};
 
 mod local_request;
 mod production;
@@ -152,14 +151,6 @@ impl<V> TimerSlots<V> {
             "an operation deadline displaced another: {slot:?}"
         );
         displaced
-    }
-
-    /// The value of this arm, only while it is still the one armed for its slot.
-    pub fn armed_value_mut(&mut self, slot: &TimerSlot, ordinal: u64) -> Option<&mut V> {
-        self.armed
-            .get_mut(slot)
-            .filter(|(armed, _)| *armed == ordinal)
-            .map(|(_, value)| value)
     }
 
     /// Removes the current arm only when both parts of its identity match.
@@ -1232,36 +1223,50 @@ pub struct StepOutput {
     pub timers: Vec<TimerArm>,
 }
 
-/// The longest delay handed to the timer queue at once.
-///
-/// tokio-util's `DelayQueue` panics on a deadline more than 2^36 - 1 ms
-/// (about 795 days) past its last wake, not past now, and a Durable Object
-/// may arm an alarm years ahead. A longer arm waits this long, comes out of
-/// the queue before its deadline, and is queued again for the rest
-/// (`Actor::run`). A day leaves the queue about 794 days to go without a wake.
-pub(crate) const MAX_QUEUED_DELAY: std::time::Duration =
-    std::time::Duration::from_millis(24 * 60 * 60 * 1000);
+/// Every armed arm in deadline order. A Durable Object may arm an alarm years
+/// ahead, past the horizon of tokio-util's `DelayQueue`, which then panics.
+#[derive(Default)]
+struct Timers {
+    slots: TimerSlots<(u64, u64)>,
+    by_deadline: BTreeMap<(u64, u64), TimerArm>,
+}
 
-/// How long `arm` waits in the timer queue from now.
-pub(crate) fn queued_delay(arm: &TimerArm) -> std::time::Duration {
-    std::time::Duration::from_millis(arm.at_mono_ms.saturating_sub(crate::asyncrt::mono_ms()))
-        .min(MAX_QUEUED_DELAY)
+impl Timers {
+    fn install(&mut self, arm: TimerArm) {
+        let key = (arm.at_mono_ms, arm.ordinal);
+        if let Some(displaced) = self.slots.install(&arm, key) {
+            self.by_deadline.remove(&displaced);
+        }
+        self.by_deadline.insert(key, arm);
+    }
+
+    fn next_deadline_ms(&self) -> Option<u64> {
+        self.by_deadline
+            .keys()
+            .next()
+            .map(|(at_mono_ms, _)| *at_mono_ms)
+    }
+
+    fn pop_due(&mut self, now_mono_ms: u64) -> Option<Timer> {
+        let due = self
+            .by_deadline
+            .first_entry()
+            .filter(|entry| entry.key().0 <= now_mono_ms)?;
+        let arm = due.remove();
+        self.slots.fire(&arm.slot, arm.ordinal).map(|_| arm.timer)
+    }
 }
 
 fn drain_step_output(
     out: &mut StepOutput,
     effects: &mut FuturesUnordered<EffectFuture>,
-    delays: &mut DelayQueue<TimerArm>,
-    timers: &mut TimerSlots<delay_queue::Key>,
+    timers: &mut Timers,
 ) {
     for effect in out.effects.drain(..) {
         effects.push(effect);
     }
     for arm in out.timers.drain(..) {
-        let key = delays.insert(arm.clone(), queued_delay(&arm));
-        if let Some(displaced) = timers.install(&arm, key) {
-            delays.remove(&displaced);
-        }
+        timers.install(arm);
     }
 }
 
