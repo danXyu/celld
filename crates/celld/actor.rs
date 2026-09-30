@@ -154,6 +154,13 @@ impl<V> TimerSlots<V> {
         displaced
     }
 
+    /// Whether this arm is still the one armed for its slot.
+    pub fn is_armed(&self, slot: &TimerSlot, ordinal: u64) -> bool {
+        self.armed
+            .get(slot)
+            .is_some_and(|(armed, _)| *armed == ordinal)
+    }
+
     /// Removes the current arm only when both parts of its identity match.
     pub fn fire(&mut self, slot: &TimerSlot, ordinal: u64) -> Option<V> {
         if self
@@ -1224,6 +1231,21 @@ pub struct StepOutput {
     pub timers: Vec<TimerArm>,
 }
 
+/// The longest delay handed to the timer queue at once.
+///
+/// tokio-util's `DelayQueue` panics on a delay past 2^36 - 1 ms (about 795
+/// days), aborting the node, and a Durable Object may arm an alarm years
+/// ahead. A longer arm waits this long, comes out of the queue before its
+/// deadline, and is queued again for the rest (`Actor::run`).
+pub(crate) const MAX_QUEUED_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(365 * 24 * 60 * 60 * 1000);
+
+/// How long `arm` waits in the timer queue from now.
+pub(crate) fn queued_delay(arm: &TimerArm) -> std::time::Duration {
+    std::time::Duration::from_millis(arm.at_mono_ms.saturating_sub(crate::asyncrt::mono_ms()))
+        .min(MAX_QUEUED_DELAY)
+}
+
 fn drain_step_output(
     out: &mut StepOutput,
     effects: &mut FuturesUnordered<EffectFuture>,
@@ -1234,10 +1256,7 @@ fn drain_step_output(
         effects.push(effect);
     }
     for arm in out.timers.drain(..) {
-        let delay = std::time::Duration::from_millis(
-            arm.at_mono_ms.saturating_sub(crate::asyncrt::mono_ms()),
-        );
-        let key = delays.insert(arm.clone(), delay);
+        let key = delays.insert(arm.clone(), queued_delay(&arm));
         if let Some(displaced) = timers.install(&arm, key) {
             delays.remove(&displaced);
         }
